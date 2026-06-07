@@ -1,0 +1,234 @@
+% ASCE Journal Article Template
+% Suitable for: Journal of Structural Engineering, Journal of Bridge Engineering,
+%               Journal of Computing in Civil Engineering, Journal of Engineering Mechanics,
+%               Structural Health Monitoring, Journal of Geotechnical Engineering, etc.
+% Last updated: 2024
+%
+% ASCE citation style: author-year, e.g. (Smith and Jones 2020)
+% Reference format: Author, F. M. (Year). "Title of paper." Journal Name Volume(Issue), Pages.
+%                   https://doi.org/xxxxx
+
+\documentclass[12pt]{article}
+
+% ── Core packages ─────────────────────────────────────────────────────────────
+\usepackage[margin=2.54cm]{geometry}   % 1-inch margins (ASCE requirement)
+\usepackage{times}                      % Times New Roman
+\usepackage{setspace}                   % Line spacing
+\usepackage{graphicx}                   % Figures
+\usepackage{amsmath,amssymb}            % Math
+\usepackage{booktabs}                   % Professional tables
+\usepackage{caption}                    % Caption formatting
+\usepackage{subcaption}                 % Subfigures
+\usepackage{multirow}                   % Multi-row table cells
+\usepackage{hyperref}                   % Hyperlinks / DOI
+\usepackage{lineno}                     % Line numbers (required for review)
+\usepackage{siunitx}                    % SI units (\SI{25}{\mega\pascal})
+\usepackage[round,sort,authoryear]{natbib}  % ASCE author-year citations
+
+% ── Line numbering ─────────────────────────────────────────────────────────────
+\doublespacing
+\linenumbers
+
+% ── Caption style (ASCE: bold label, period separator) ────────────────────────
+\captionsetup{labelfont=bf, labelsep=period, font=small}
+
+% ── Hyperref options ──────────────────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=black, citecolor=black, urlcolor=blue}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\title{%
+  Insert Your Title Here: Concise, Descriptive, and Reflecting Main Contribution
+}
+
+\author{
+  First Author\textsuperscript{1},
+  Second Author\textsuperscript{2}, and
+  Corresponding Author\textsuperscript{3}
+}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+% ── Affiliations ──────────────────────────────────────────────────────────────
+\noindent
+\textsuperscript{1}Ph.D. Candidate, Dept.\ of Civil and Structural Engineering,
+University Name, City, State/Province Postal Code, Country.
+E-mail: \href{mailto:first@university.edu}{first@university.edu} \\[2pt]
+\textsuperscript{2}Associate Professor, Dept.\ of Civil Engineering,
+University Name, City, Country. \\[2pt]
+\textsuperscript{3}Professor, Dept.\ of Civil Engineering, University Name,
+City, Country (corresponding). E-mail: \href{mailto:corresponding@university.edu}{corresponding@university.edu}
+
+\bigskip
+
+% ── Abstract ─────────────────────────────────────────────────────────────────
+% ASCE: ≤250 words, structured or unstructured depending on journal
+\begin{abstract}
+\noindent
+Write a concise abstract (≤250 words) covering: (1) motivation and research gap,
+(2) objectives, (3) methods (briefly), (4) main results with quantitative values,
+and (5) key conclusions and practical significance.
+Avoid references, abbreviations, and jargon in the abstract.
+State specific performance metrics (e.g., \SI{15}{\percent} increase in load capacity,
+$R^2 = 0.95$ prediction accuracy) rather than vague claims.
+\end{abstract}
+
+% ── Keywords ─────────────────────────────────────────────────────────────────
+\noindent\textbf{Keywords:} keyword one; keyword two; keyword three;
+keyword four; keyword five
+
+\newpage
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+% Recommended length: 600–900 words
+% Paragraph structure:
+%   (1) Broad context and engineering significance
+%   (2) Literature review — what has been done and by whom
+%   (3) Research gap — what is missing / what problem remains
+%   (4) Objectives — what this paper does
+%   (5) Paper organization (optional for longer papers)
+
+Provide engineering context and motivation.
+Review relevant prior work, citing key references using author-year style:
+\citet{Author2023} demonstrated that \ldots, while \citet{Smith2021} showed \ldots
+For parenthetical citations use \citep{Jones2022}.
+
+State the research gap clearly.
+Present your specific objectives.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Background and Literature Review}
+% Optional — merge into Introduction for shorter papers
+
+Summarize the state of knowledge relevant to this study.
+Organize thematically (not chronologically).
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Methodology}
+% Alt titles: "Numerical Model", "Experimental Program", "Analytical Framework"
+
+\subsection{Problem Description and Scope}
+Describe the structure, material, system, or phenomenon under investigation.
+Report geometry, material properties, loading conditions, and boundary conditions.
+Use SI units with \texttt{siunitx}: e.g., $f'_c = \SI{30}{\mega\pascal}$,
+$f_y = \SI{420}{\mega\pascal}$, story height $= \SI{3.5}{\meter}$.
+
+\subsection{Finite Element Model}
+% Remove/rename if not applicable
+Describe element types, mesh strategy, constitutive models, and convergence criteria.
+Report software and version (e.g., ABAQUS 2023, OpenSees 3.5.0, ANSYS 2024 R1).
+Mesh convergence must be demonstrated with at least three mesh densities.
+Validate model against experimental data before parametric study.
+
+\subsection{Experimental Setup}
+% Remove/rename if not applicable
+Describe specimen geometry, instrumentation (gauge locations, sampling rate),
+loading protocol (monotonic vs.\ cyclic, loading rate), and test matrix.
+Follow ASTM/ASCE/ACI standards for material testing procedures.
+
+\subsection{Validation}
+Compare model predictions against experimental or analytical benchmarks.
+Report error metrics: mean absolute error (MAE), root-mean-square error (RMSE),
+and coefficient of variation (CoV).
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Results}
+% Present results without interpretation; save interpretation for Discussion
+% Organize by finding, not by sub-task
+
+\subsection{Result Topic One}
+Present quantitative results.
+Refer to figures and tables using standard LaTeX references:
+see Fig.~\ref{fig:example} and Table~\ref{tab:example}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.75\columnwidth]{figures/figure_01.png}
+  \caption{Caption describing the figure. Include axis labels, units, and key observations.
+           Panels labeled (a), (b), etc.\ for multi-panel figures.}
+  \label{fig:example}
+\end{figure}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Table title. Units in column headers. Significant figures consistent.}
+  \label{tab:example}
+  \begin{tabular}{lccc}
+    \toprule
+    Specimen & $f'_c$ (\si{\mega\pascal}) & $V_n$ (\si{\kilo\newton}) & Failure mode \\
+    \midrule
+    S1       & 30.2 & 245.6 & Flexure \\
+    S2       & 40.5 & 312.1 & Shear    \\
+    S3       & 50.0 & 380.4 & Flexure  \\
+    \bottomrule
+  \end{tabular}
+  \begin{tablenotes}
+    \small
+    \item Note: $V_n$ = nominal shear strength; failure mode per ACI 318-19 definitions.
+  \end{tablenotes}
+\end{table}
+
+\subsection{Result Topic Two}
+Continue presenting results.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+% Interpret results in the context of research objectives and prior literature
+% Address: (1) mechanism explanation, (2) comparison with literature,
+%           (3) practical implications, (4) limitations
+
+Interpret the findings.
+Compare with results from the literature \citep{Author2020}.
+Discuss practical implications for engineering design or practice.
+Acknowledge limitations of the study.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Conclusions}
+% Numbered list of conclusions is STRONGLY preferred by ASCE
+% Each item should be concise, specific, and quantitative where possible
+
+The following conclusions are drawn based on the results of this study:
+\begin{enumerate}
+  \item First conclusion — state the main finding with specific numbers.
+  \item Second conclusion — relate to practical design implications.
+  \item Third conclusion — note limitations or conditions of applicability.
+  \item Future work recommendation (optional).
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% Data Availability Statement (required by ASCE since 2022)
+\section*{Data Availability Statement}
+All data, models, and code that support the findings of this study are available
+from the corresponding author upon reasonable request.
+% OR:
+% Data are available in the repository: [repository name and DOI/URL].
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section*{Acknowledgments}
+The authors acknowledge financial support from [funding agency] under
+Grant No.\ [grant number]. The authors declare no conflicts of interest.
+
+% ══════════════════════════════════════════════════════════════════════════════
+% ASCE REFERENCE FORMAT:
+% Author, F. M. (Year). "Title of paper." Journal Name Volume(Issue), Pages.
+%   https://doi.org/xxxxx
+%
+% Example BibTeX entries for ASCE format:
+% @article{Smith2021,
+%   author  = {Smith, John A. and Jones, Mary B.},
+%   title   = {Seismic Performance of RC Shear Walls with Boundary Elements},
+%   journal = {J. Struct. Eng.},
+%   year    = {2021},
+%   volume  = {147},
+%   number  = {3},
+%   pages   = {04021010},
+%   doi     = {10.1061/(ASCE)ST.1943-541X.0002934}
+% }
+
+\bibliographystyle{abbrvnat}   % Author-year, abbreviated journal names
+\bibliography{../references/references}
+
+\end{document}

@@ -1,0 +1,57 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.egg-info/
+dist/
+build/
+*.egg
+
+# Virtual environment
+.venv/
+venv/
+env/
+
+# Environment variables (contains API keys)
+.env
+
+# Debug and logs
+*.log
+debug*.log
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# pytest
+.pytest_cache/
+
+# Writing outputs (generated at runtime)
+writing_outputs/
+
+# User data files (local only)
+data/
+existing_figures/
+
+# LaTeX intermediate files
+*.aux
+*.bbl
+*.blg
+*.fdb_latexmk
+*.fls
+*.out
+*.toc
+*.synctex.gz
+
+# Claude Code local state
+.claude/plans/
+.claude/memory/
+.claude/settings.local.json
+.claude/skills.zip

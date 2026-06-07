@@ -1,0 +1,245 @@
+% Elsevier Engineering Journal Template
+% Suitable for: Engineering Structures, Applied Energy, Energy and Buildings,
+%               Building and Environment, Construction and Building Materials,
+%               Automation in Construction, Renewable Energy, Journal of Cleaner Production,
+%               Computer Methods in Applied Mechanics and Engineering,
+%               Mechanical Systems and Signal Processing, Structural Safety, etc.
+% Last updated: 2024
+%
+% Uses Elsevier's official `elsarticle` document class (available on CTAN).
+% Citation style: numbered [1][2] using \cite{} commands.
+% Install: texlive-publishers or MiKTeX package manager.
+
+\documentclass[preprint,12pt,3p]{elsarticle}
+% Options:
+%   preprint  — double-spaced, single column (use for submission)
+%   review    — same as preprint but with line numbers
+%   1p,2p,3p  — final 1/2/3-column layout (do NOT use for submission)
+
+% ── Core packages ─────────────────────────────────────────────────────────────
+\usepackage{amsmath,amssymb}
+\usepackage{graphicx}
+\usepackage{booktabs}
+\usepackage{caption}
+\usepackage{subcaption}
+\usepackage{multirow}
+\usepackage{siunitx}           % SI units
+\usepackage{hyperref}
+\usepackage{lineno}            % Line numbers for review
+\modulolinenumbers[5]
+
+% ── Hyperref ──────────────────────────────────────────────────────────────────
+\hypersetup{colorlinks=true, linkcolor=blue, citecolor=blue, urlcolor=blue}
+
+% ── SI units setup ────────────────────────────────────────────────────────────
+\sisetup{separate-uncertainty=true, range-phrase=--}
+
+% ══════════════════════════════════════════════════════════════════════════════
+\journal{Engineering Structures}   % ← Change to target journal name
+
+\begin{document}
+
+\begin{frontmatter}
+
+% ── Title ─────────────────────────────────────────────────────────────────────
+\title{Insert Your Title Here: Concise, Specific, and Reflecting Main Contribution}
+
+% ── Authors and Affiliations ──────────────────────────────────────────────────
+\author[inst1]{First Author}
+\author[inst2]{Second Author}
+\author[inst1,inst3]{Corresponding Author\corref{cor1}}
+\ead{corresponding@university.edu}
+
+\cortext[cor1]{Corresponding author. Tel.: +XX-XXX-XXXX-XXXX.}
+
+\affiliation[inst1]{organization={Department of Civil Engineering},
+             city={City},
+             country={Country}}
+
+\affiliation[inst2]{organization={Department of Building Science},
+             city={City},
+             country={Country}}
+
+\affiliation[inst3]{organization={Research Institute for Sustainable Infrastructure},
+             city={City},
+             country={Country}}
+
+% ── Abstract ─────────────────────────────────────────────────────────────────
+% Elsevier engineering journals: typically ≤200–250 words, unstructured
+% Highlight: background (1–2 sentences), objectives (1 sentence),
+%            methods (1–2 sentences), results (2–3 sentences with numbers),
+%            conclusions (1 sentence)
+\begin{abstract}
+Write a concise abstract (200–250 words).
+State the engineering problem and motivation in 1–2 sentences.
+Define the specific objectives of this study.
+Briefly describe the methodology (e.g., experimental program, FEM, LCA, ML model).
+Present quantitative key results (e.g., \SI{23}{\percent} reduction in embodied carbon,
+RMSE of \SI{0.045}{\kilo\watt\hour\per\meter\squared} for energy prediction).
+Conclude with the significance and practical implications.
+\end{abstract}
+
+% ── Keywords ─────────────────────────────────────────────────────────────────
+% Elsevier: 4–8 keywords, comma-separated; avoid words already in title
+\begin{keyword}
+keyword one \sep keyword two \sep keyword three \sep keyword four \sep keyword five
+\end{keyword}
+
+\end{frontmatter}
+
+% ── Line numbers (activate for review submission) ─────────────────────────────
+\linenumbers
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Introduction}
+% Recommended: 600–1000 words
+% Structure: (1) broad context, (2) review of prior work with citations,
+%            (3) identified research gap, (4) objectives of this study,
+%            (5) paper organization overview
+
+Provide engineering motivation and context~\cite{Author2023}.
+Review prior work systematically, highlighting advances and remaining gaps~\cite{Smith2021,Jones2022}.
+
+State the research gap and objectives clearly.
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:methods} describes \ldots
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Methodology}
+\label{sec:methods}
+% Alternate section titles depending on study type:
+%   "Experimental Program", "Numerical Framework", "Life-Cycle Assessment Framework",
+%   "Machine Learning Model", "Energy Simulation Methodology"
+
+\subsection{Study Scope and System Description}
+Describe the system, material, structure, or process under investigation.
+Report key parameters with SI units using \verb|\SI{}{}|:
+e.g., floor area $= \SI{500}{\meter\squared}$,
+concrete strength $f'_c = \SI{35}{\mega\pascal}$.
+
+\subsection{Data Sources and Materials}
+Describe data collection, material characterization, or input databases.
+For LCA studies: declare functional unit, system boundaries,
+LCI database (ecoinvent \cite{Wernet2016}, GaBi \cite{Sphera2024}),
+and impact assessment method (ReCiPe 2016 \cite{Huijbregts2017}, IPCC 2021).
+For ML studies: describe dataset origin, size ($n = $), features, and preprocessing.
+
+\subsection{Analysis Method}
+Describe numerical, simulation, experimental, or statistical approach.
+Report software and version. For FEM: element types, mesh size, convergence criteria.
+For building energy simulation: software (EnergyPlus v23.1 \cite{EnergyPlus2023}),
+weather file (TMY3/EPW), HVAC system model.
+For ML: architecture, training/validation/test split, hyperparameter tuning strategy.
+
+\subsection{Validation}
+Validate the method against experimental data, published benchmarks, or analytical solutions.
+Report error metrics: $R^2$, RMSE (\si{\kilo\watt\hour\per\meter\squared}),
+MAE, or coefficient of variation (CV).
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Results}
+\label{sec:results}
+% Present findings without interpretation; save for Discussion
+% Use subsections to organize by finding or by parameter
+
+\subsection{Result Subsection One}
+Present quantitative results.
+Refer to Fig.~\ref{fig:example} and Table~\ref{tab:example}.
+
+\begin{figure}[htbp]
+  \centering
+  \includegraphics[width=0.85\textwidth]{figures/figure_01.png}
+  \caption{Figure caption. Describe axes, units, key trends.
+           (a) Condition A; (b) Condition B.}
+  \label{fig:example}
+\end{figure}
+
+\begin{table}[htbp]
+  \centering
+  \caption{Table title. Units stated in column headers.}
+  \label{tab:example}
+  \begin{tabular}{lcccc}
+    \toprule
+    Case & EUI (\si{\kilo\watt\hour\per\meter\squared}) & CO$_2$e (\si{\kilo\gram\per\meter\squared}) & $\Delta$EUI (\%) & $\Delta$CO$_2$e (\%) \\
+    \midrule
+    Baseline           & 120.4 & 58.2 & ---   & ---   \\
+    Scenario A         &  98.1 & 47.5 & -18.5 & -18.4 \\
+    Scenario B         &  85.3 & 41.3 & -29.2 & -29.0 \\
+    Net-zero target    &  60.0 & 29.0 & -50.2 & -50.2 \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Result Subsection Two}
+Continue with additional results.
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Discussion}
+\label{sec:discussion}
+% Interpret, compare, explain, and contextualize results
+% Structure: (1) key findings explained, (2) comparison with literature,
+%            (3) practical implications, (4) limitations and uncertainty
+
+Interpret the results in light of the research objectives.
+Compare findings with prior work~\cite{PriorWork2022}.
+Discuss practical implications for engineering design, policy, or practice.
+Acknowledge limitations (system boundary, dataset size, model assumptions).
+
+% ══════════════════════════════════════════════════════════════════════════════
+\section{Conclusions}
+\label{sec:conclusions}
+% Elsevier engineering: numbered list strongly preferred; concise and quantitative
+
+The following conclusions are drawn from this study:
+\begin{enumerate}
+  \item First conclusion — quantitative result and its significance.
+  \item Second conclusion — design implication or policy recommendation.
+  \item Third conclusion — conditions of applicability or generalizability.
+  \item Recommendation for future work.
+\end{enumerate}
+
+% ══════════════════════════════════════════════════════════════════════════════
+% CRediT Author Contribution Statement (required by Elsevier since 2020)
+\section*{CRediT authorship contribution statement}
+\textbf{First Author:} Conceptualization, Methodology, Software, Formal analysis,
+Writing -- original draft.
+\textbf{Second Author:} Validation, Data curation, Visualization.
+\textbf{Corresponding Author:} Conceptualization, Supervision, Funding acquisition,
+Writing -- review \& editing.
+
+% Declaration of Competing Interest
+\section*{Declaration of competing interest}
+The authors declare that they have no known competing financial interests or personal
+relationships that could have appeared to influence the work reported in this paper.
+
+% Data Availability Statement (required)
+\section*{Data availability}
+Data will be made available on request.
+% OR: The data and code are publicly available at [DOI/URL].
+
+% Acknowledgements
+\section*{Acknowledgements}
+This work was supported by [Funding Agency] under Grant [No.\ XXXXXX].
+The authors thank [collaborators/facilities] for [contribution].
+
+% ══════════════════════════════════════════════════════════════════════════════
+% ELSEVIER REFERENCE FORMAT (numbered, sorted by appearance):
+% [1] A. Smith, B. Jones, "Title of article," J. Clean. Prod. 280 (2021) 124320.
+%     https://doi.org/10.1016/j.jclepro.2020.124320
+%
+% Example BibTeX entry:
+% @article{Smith2021,
+%   author  = {Smith, Alice and Jones, Bob},
+%   title   = {Life-cycle carbon assessment of high-performance building envelopes},
+%   journal = {J. Clean. Prod.},
+%   year    = {2021},
+%   volume  = {280},
+%   pages   = {124320},
+%   doi     = {10.1016/j.jclepro.2020.124320}
+% }
+
+\bibliographystyle{elsarticle-num}   % Numbered citations [1], [2]...
+\bibliography{../references/references}
+
+\end{document}

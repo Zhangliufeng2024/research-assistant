@@ -1,0 +1,252 @@
+% IEEE Transactions Journal Template
+% For: IEEE Transactions on [Various Topics]
+% Citation style: Numbered [1], [2], [3]
+% Format: Two-column, Times New Roman 10pt
+%
+% Applicable journals:
+%   - IEEE Transactions on Neural Networks and Learning Systems
+%   - IEEE Transactions on Signal Processing
+%   - IEEE Transactions on Image Processing
+%   - IEEE Transactions on Pattern Analysis and Machine Intelligence
+%   - IEEE Transactions on Industrial Electronics
+%   - IEEE Transactions on Power Systems
+%   - IEEE Transactions on Smart Grid
+%   - IEEE Transactions on Robotics
+%   - IEEE Transactions on Automation Science and Engineering
+%   - IEEE Access (open access, no page limit)
+%
+% Usage:
+%   pdflatex ieee_trans.tex
+%   bibtex ieee_trans
+%   pdflatex ieee_trans.tex
+%   pdflatex ieee_trans.tex
+
+\documentclass[journal]{IEEEtran}
+
+% Essential packages
+\usepackage[utf8]{inputenc}
+\usepackage{amsmath,amssymb,amsfonts}
+\usepackage{graphicx}
+\usepackage{textcomp}
+\usepackage{xcolor}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{cite}
+\usepackage{algorithmic}
+\usepackage{algorithm}
+\usepackage{url}
+\usepackage{hyperref}
+\usepackage{siunitx}
+
+% For double-column figures/tables
+\usepackage{dblfloatfix}
+
+% Correct bad hyphenation
+\hyphenation{op-ti-cal net-works semi-conduc-tor}
+
+\begin{document}
+
+% ============================================================
+% TITLE AND AUTHORS
+% ============================================================
+\title{Paper Title Here}
+
+\author{%
+  \IEEEauthorblockN{First Author\IEEEauthorrefmark{1},
+  Second Author\IEEEauthorrefmark{1},
+  Third Author\IEEEauthorrefmark{2}}\\
+  \IEEEauthorblockA{\IEEEauthorrefmark{1}Department of Electrical Engineering,
+    University Name, City, Country\\
+    Email: \{first.author, second.author\}@university.edu}
+  \IEEEauthorblockA{\IEEEauthorrefmark{2}School of Computer Science,
+    University Name, City, Country\\
+    Email: third.author@university.edu}
+}
+
+\markboth{IEEE Transactions on [Topic], Vol.~XX, No.~XX, Month~Year}%
+{Author \MakeLowercase{\textit{et al.}}: Paper Title}
+
+\maketitle
+
+% ============================================================
+% ABSTRACT (<=200 words, no references, no abbreviations)
+% ============================================================
+\begin{abstract}
+Your abstract here. The abstract should be a concise summary of the
+paper, typically 150--200 words. It should state the purpose of the
+research, the methods used, the key results, and the main conclusions.
+Do not cite references in the abstract. Define all abbreviations at
+first use or avoid them entirely.
+\end{abstract}
+
+% ============================================================
+% INDEX TERMS (IEEE controlled vocabulary)
+% ============================================================
+\begin{IEEEkeywords}
+Keyword1, keyword2, keyword3, keyword4, keyword5.
+\end{IEEEkeywords}
+
+% ============================================================
+% I. INTRODUCTION
+% ============================================================
+\section{Introduction}
+
+The introduction should provide context, motivation, and a clear
+statement of the paper's contributions. It should:
+
+\begin{itemize}
+  \item Motivate the problem and its significance
+  \item Briefly survey related work (detailed review in Section~II)
+  \item State the paper's main contributions clearly
+  \item Outline the paper organization
+\end{itemize}
+
+% ============================================================
+% II. RELATED WORK
+% ============================================================
+\section{Related Work}
+
+Review the relevant literature, organized thematically. Compare and
+contrast existing approaches, identify gaps, and position your work.
+
+% ============================================================
+% III. METHODOLOGY
+% ============================================================
+\section{Proposed Method}
+
+\subsection{Problem Formulation}
+
+Define the problem mathematically. Use IEEEeqnarray for aligned equations:
+\begin{equation}
+  \min_{x} f(x) \quad \text{subject to} \quad g(x) \leq 0
+  \label{eq:objective}
+\end{equation}
+
+\subsection{Algorithm Description}
+
+Describe the proposed algorithm. Use the algorithm environment:
+
+\begin{algorithm}[t]
+\caption{Algorithm Name}
+\label{alg:algorithm}
+\begin{algorithmic}[1]
+  \REQUIRE Input data $X$, parameters $\theta$
+  \ENSURE Output result $Y$
+  \STATE Initialize $Y_0$
+  \FOR{$t = 1$ to $T$}
+    \STATE Compute $Y_t \leftarrow \text{Update}(Y_{t-1}, X, \theta)$
+    \IF{convergence criterion met}
+      \STATE \textbf{break}
+    \ENDIF
+  \ENDFOR
+  \RETURN $Y_T$
+\end{algorithmic}
+\end{algorithm}
+
+\subsection{Complexity Analysis}
+
+Analyze the computational complexity:
+\begin{itemize}
+  \item Time complexity: $O(\cdot)$
+  \item Space complexity: $O(\cdot)$
+\end{itemize}
+
+% ============================================================
+% IV. EXPERIMENTAL SETUP
+% ============================================================
+\section{Experimental Setup}
+
+\subsection{Datasets}
+
+Describe datasets used, including size, source, and preprocessing.
+
+\subsection{Baselines}
+
+List baseline methods for comparison. Justify the selection.
+
+\subsection{Implementation Details}
+
+Report hardware, software, hyperparameters, and training details:
+\begin{itemize}
+  \item Hardware: GPU type, memory
+  \item Software: Framework, version
+  \item Hyperparameters: Learning rate, batch size, epochs
+  \item Random seeds for reproducibility
+\end{itemize}
+
+\subsection{Evaluation Metrics}
+
+Define metrics used (accuracy, precision, recall, F1, etc.).
+
+% ============================================================
+% V. RESULTS AND DISCUSSION
+% ============================================================
+\section{Results and Discussion}
+
+\subsection{Main Results}
+
+Present results in tables and figures. Use the IEEE table format:
+
+\begin{table}[t]
+  \centering
+  \caption{Comparison with Baseline Methods}
+  \label{tab:results}
+  \begin{tabular}{lcc}
+    \toprule
+    Method & Metric 1 & Metric 2 \\
+    \midrule
+    Baseline 1 & 0.85 & 0.72 \\
+    Baseline 2 & 0.88 & 0.75 \\
+    \textbf{Ours} & \textbf{0.92} & \textbf{0.81} \\
+    \bottomrule
+  \end{tabular}
+\end{table}
+
+\subsection{Ablation Study}
+
+Isolate the contribution of each component.
+
+\subsection{Computational Cost}
+
+Report training time, inference time, and memory usage.
+
+% ============================================================
+% VI. CONCLUSION
+% ============================================================
+\section{Conclusion}
+
+Summarize the main contributions and findings. Discuss limitations
+and outline directions for future work.
+
+% ============================================================
+% ACKNOWLEDGMENT
+% ============================================================
+\section*{Acknowledgment}
+
+This work was supported by [Funding Agency] under Grant [Number].
+
+% ============================================================
+% REFERENCES (IEEE style - use IEEEtran bibliography style)
+% ============================================================
+\bibliographystyle{IEEEtran}
+\bibliography{../references/references}
+
+% ============================================================
+% AUTHOR BIOGRAPHIES (required for IEEE Transactions)
+% ============================================================
+\begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{author1.jpg}}]{First Author}
+received the B.S. degree from University, City, Country, in Year,
+and the Ph.D. degree from University, City, Country, in Year.
+He/She is currently a [position] with the Department of [Field],
+University, City, Country. His/Her research interests include
+topic1, topic2, and topic3.
+\end{IEEEbiography}
+
+\begin{IEEEbiography}{Second Author}
+received the B.S. degree from University, City, Country, in Year.
+He/She is currently pursuing the Ph.D. degree with the Department
+of [Field], University, City, Country. His/Her research interests
+include topic1 and topic2.
+\end{IEEEbiography}
+
+\end{document}
