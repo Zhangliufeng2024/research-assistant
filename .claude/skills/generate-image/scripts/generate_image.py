@@ -43,6 +43,8 @@ DEFAULT_OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
 DEFAULT_IMAGE_MODEL = "agnes-2.0-flash"
 REQUEST_TIMEOUT = 120
 MAX_RETRIES = 3
+DEFAULT_IMAGE_REQUEST_INTERVAL = 4.0
+_last_image_request_time: float = 0.0
 MAX_PROMPT_LENGTH = 10000
 MAX_IMAGE_SIZE_MB = 20
 
@@ -123,6 +125,19 @@ def _load_env():
 
 
 _load_env()
+
+
+def _throttle_image() -> None:
+    """Enforce minimum interval between image generation API requests."""
+    global _last_image_request_time
+    interval = float(os.getenv("IMAGE_REQUEST_INTERVAL", DEFAULT_IMAGE_REQUEST_INTERVAL))
+    if interval <= 0:
+        return
+    now = time.monotonic()
+    elapsed = now - _last_image_request_time
+    if elapsed < interval and _last_image_request_time > 0:
+        time.sleep(interval - elapsed)
+    _last_image_request_time = time.monotonic()
 
 
 # ── Style Directives ─────────────────────────────────────────────────────────
@@ -240,6 +255,7 @@ def _generate_nvidia(
     last_exception = None
     for attempt in range(MAX_RETRIES):
         try:
+            _throttle_image()
             response = requests.post(url, headers=headers, json=payload, timeout=REQUEST_TIMEOUT)
             if response.status_code == 200:
                 break
@@ -414,6 +430,7 @@ Generate a high-quality image that follows the visual style guidelines above."""
     last_exception = None
     for attempt in range(MAX_RETRIES):
         try:
+            _throttle_image()
             response = requests.post(
                 f"{base_url}/chat/completions",
                 headers=headers,

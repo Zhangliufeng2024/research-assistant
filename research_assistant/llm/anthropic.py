@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, TokenUsage
+from .base import LLMClient, LLMResponse, ToolCall, TokenUsage, _throttle_llm
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 ANTHROPIC_API_VERSION = "2023-06-01"
@@ -115,6 +115,7 @@ class AnthropicClient(LLMClient):
         if anthropic_tools:
             body["tools"] = anthropic_tools
 
+        await _throttle_llm()
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:

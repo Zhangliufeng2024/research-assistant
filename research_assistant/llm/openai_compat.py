@@ -6,7 +6,7 @@ from typing import Any
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, TokenUsage
+from .base import LLMClient, LLMResponse, ToolCall, TokenUsage, _throttle_llm
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
@@ -104,6 +104,7 @@ class OpenAICompatClient(LLMClient):
         if openai_tools:
             body["tools"] = openai_tools
 
+        await _throttle_llm()
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:

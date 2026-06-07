@@ -1,8 +1,28 @@
 """Abstract base classes and data models for LLM clients."""
 
+import asyncio
+import os
+import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from typing import Any, AsyncIterator, Optional
+
+DEFAULT_LLM_REQUEST_INTERVAL = 2.0
+
+_last_llm_request_time: float = 0.0
+
+
+async def _throttle_llm() -> None:
+    """Enforce minimum interval between LLM API requests."""
+    global _last_llm_request_time
+    interval = float(os.getenv("LLM_REQUEST_INTERVAL", DEFAULT_LLM_REQUEST_INTERVAL))
+    if interval <= 0:
+        return
+    now = time.monotonic()
+    elapsed = now - _last_llm_request_time
+    if elapsed < interval and _last_llm_request_time > 0:
+        await asyncio.sleep(interval - elapsed)
+    _last_llm_request_time = time.monotonic()
 
 
 @dataclass
