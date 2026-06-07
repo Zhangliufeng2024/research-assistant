@@ -208,6 +208,10 @@ Runtime dependencies (minimal):
 
 No SDK dependencies — pure `httpx` HTTP calls.
 
+## Acknowledgments
+
+This project was inspired by and built upon [claude-scientific-writer](https://github.com/K-Dense-AI/claude-scientific-writer) by K-Dense-AI. We sincerely thank the original authors for their pioneering work in AI-assisted scientific writing.
+
 ## License
 
 MIT
