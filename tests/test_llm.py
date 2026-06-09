@@ -3,7 +3,8 @@
 import json
 import pytest
 
-from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall, TokenUsage
+from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
+from research_assistant.models import TokenUsage
 from research_assistant.llm.anthropic import (
     AnthropicClient,
     _convert_tools_to_anthropic,

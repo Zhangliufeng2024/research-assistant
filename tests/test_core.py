@@ -4,6 +4,8 @@ import os
 import zipfile
 from pathlib import Path
 
+import pytest
+
 from research_assistant.core import (
     get_api_key,
     load_system_instructions,
@@ -17,6 +19,7 @@ from research_assistant.core import (
     process_data_files,
     create_data_context_message,
     ensure_dotenv_loaded,
+    safe_resolve,
 )
 import pytest
 
@@ -211,3 +214,32 @@ class TestCreateDataContextMessage:
         }
         msg = create_data_context_message(info)
         assert "EDITING MODE" in msg
+
+
+# ---------------------------------------------------------------------------
+# safe_resolve
+# ---------------------------------------------------------------------------
+
+class TestSafeResolve:
+    def test_valid_child(self, tmp_path):
+        child = tmp_path / "sub" / "file.txt"
+        child.parent.mkdir(parents=True)
+        child.touch()
+        result = safe_resolve(child, tmp_path)
+        assert result == child.resolve()
+
+    def test_sandbox_itself(self, tmp_path):
+        result = safe_resolve(tmp_path, tmp_path)
+        assert result == tmp_path.resolve()
+
+    def test_escaping_raises(self, tmp_path):
+        evil = tmp_path / ".." / "etc" / "passwd"
+        with pytest.raises(ValueError, match="escapes sandbox"):
+            safe_resolve(evil, tmp_path)
+
+    def test_dotdot_within_sandbox_ok(self, tmp_path):
+        sub = tmp_path / "a" / "b"
+        sub.mkdir(parents=True)
+        dotdot = sub / ".." / "b"
+        result = safe_resolve(dotdot, tmp_path)
+        assert str(result).startswith(str(tmp_path.resolve()))

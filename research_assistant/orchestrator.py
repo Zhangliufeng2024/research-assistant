@@ -11,6 +11,7 @@ Each agent is an independent agent loop session. Coordination through filesystem
 
 import asyncio
 import json
+import re
 import time
 from pathlib import Path
 from typing import Optional, List, Dict, Any, AsyncGenerator, Callable
@@ -20,6 +21,18 @@ from .agent import run_agent, AgentResult as _AgentLoopResult
 from .llm.factory import create_llm_client
 from .tools.registry import ToolRegistry
 from .models import ProgressUpdate, TextUpdate, TokenUsage
+from .constants import OUTPUT_SUBDIRS
+
+
+def _sanitize_filename(name: str, default: str = "unnamed") -> str:
+    """Sanitize an LLM-generated filename to prevent path traversal.
+
+    Strips directory separators and ``..`` segments, keeping only the
+    basename. Falls back to *default* if nothing remains.
+    """
+    basename = Path(name).name
+    basename = re.sub(r'[^\w.\-]', '_', basename)
+    return basename or default
 
 
 @dataclass
@@ -62,7 +75,7 @@ class AgentResult:
     token_usage: Optional[TokenUsage] = None
 
 
-async def _run_sub_agent(
+async def _run_sub_agent(  # noqa: PLR0913
     agent_id: str,
     agent_role: str,
     prompt: str,
@@ -74,7 +87,7 @@ async def _run_sub_agent(
     provider: Optional[str] = None,
     auto_continue: bool = True,
     max_continuations: int = 20,
-) -> AgentResult:
+) -> "AgentResult":
     """Run a single sub-agent to completion."""
     llm_client = create_llm_client(
         api_key=api_key, base_url=base_url, model=model, provider=provider,
@@ -291,7 +304,7 @@ async def run_orchestrated_generation(
     """Run the full multi-agent orchestration pipeline."""
     total_start = time.time()
 
-    for subdir in ["drafts", "final", "references", "figures", "data", "sources"]:
+    for subdir in OUTPUT_SUBDIRS:
         (output_dir / subdir).mkdir(parents=True, exist_ok=True)
 
     total_token_usage = TokenUsage()
@@ -355,8 +368,9 @@ async def run_orchestrated_generation(
 
     research_coros = []
     for s in plan.sections:
-        output_file = sources_dir / f"bib_{s.name}.bib"
-        summary_file = sources_dir / f"summary_{s.name}.md"
+        safe_name = _sanitize_filename(s.name, default="section")
+        output_file = sources_dir / f"bib_{safe_name}.bib"
+        summary_file = sources_dir / f"summary_{safe_name}.md"
         prompt = _RESEARCH_PROMPT.format(
             section_title=s.title, paper_title=plan.paper_title,
             section_description=s.description, venue=plan.venue,
@@ -374,7 +388,8 @@ async def run_orchestrated_generation(
 
     figure_coros = []
     for fg in plan.figures:
-        output_file = figures_dir / (fg.filename or f"{fg.name}.png")
+        safe_fig = _sanitize_filename(fg.filename or f"{fg.name}.png", default="figure.png")
+        output_file = figures_dir / safe_fig
         prompt = _FIGURE_PROMPT.format(
             paper_title=plan.paper_title, figure_name=fg.name,
             figure_description=fg.description, figure_type=fg.type,

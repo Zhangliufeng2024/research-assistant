@@ -4,9 +4,29 @@ import os
 import shutil
 import sys
 import zipfile
+from collections import defaultdict
 from pathlib import Path
 from typing import Optional, List, Dict, Any
+
+from .constants import IMAGE_EXTENSIONS, MANUSCRIPT_EXTENSIONS, SOURCE_EXTENSIONS, DATA_EXTENSIONS
+
 _dotenv_loaded = False
+
+
+def safe_resolve(path: Path, sandbox: Path) -> Path:
+    """Resolve *path* and verify it stays within *sandbox*.
+
+    Raises ``ValueError`` if the resolved path escapes the sandbox.
+    Both *path* and *sandbox* are resolved before comparison so symlinks
+    and ``..`` segments cannot escape.
+    """
+    resolved = path.resolve()
+    sandbox_resolved = sandbox.resolve()
+    if not (resolved == sandbox_resolved or str(resolved).startswith(str(sandbox_resolved) + os.sep)):
+        raise ValueError(
+            f"Path escapes sandbox: {resolved} is not inside {sandbox_resolved}"
+        )
+    return resolved
 
 
 def ensure_dotenv_loaded() -> None:
@@ -107,24 +127,24 @@ def ensure_output_folder(cwd: Path, custom_dir: Optional[str] = None) -> Path:
     return output_folder
 
 
-def get_image_extensions() -> set:
+def get_image_extensions() -> frozenset[str]:
     """Return a set of common image file extensions."""
-    return {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.tiff', '.tif', '.svg', '.webp', '.ico'}
+    return IMAGE_EXTENSIONS
 
 
-def get_manuscript_extensions() -> set:
+def get_manuscript_extensions() -> frozenset[str]:
     """Return a set of manuscript file extensions that should go to drafts/ folder."""
-    return {'.tex'}
+    return MANUSCRIPT_EXTENSIONS
 
 
-def get_source_extensions() -> set:
+def get_source_extensions() -> frozenset[str]:
     """Return a set of source/context file extensions that should go to sources/ folder."""
-    return {'.md', '.docx', '.pdf'}
+    return SOURCE_EXTENSIONS
 
 
-def get_data_extensions() -> set:
+def get_data_extensions() -> frozenset[str]:
     """Return a set of data file extensions that should go to data/ folder."""
-    return {'.csv', '.json', '.txt', '.xlsx', '.xls', '.tsv', '.xml', '.yaml', '.yml', '.sql'}
+    return DATA_EXTENSIONS
 
 
 def get_data_files(cwd: Path, data_files: Optional[List[str]] = None) -> List[Path]:
@@ -390,9 +410,7 @@ def create_data_context_message(processed_info: Optional[Dict[str, Any]]) -> str
                 context_parts.append(f"    - {file_info['name']}: {file_info['path']}")
         
         if extracted_images:
-            # Group extracted images by source docx
-            from collections import defaultdict
-            images_by_docx = defaultdict(list)
+            images_by_docx: dict[str, list] = defaultdict(list)
             for img in extracted_images:
                 images_by_docx[img['source_docx']].append(img)
             

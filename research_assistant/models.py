@@ -5,6 +5,11 @@ from typing import Optional, List, Dict, Any, Literal
 from datetime import datetime, timezone
 
 
+def _utc_iso_now() -> str:
+    """Return the current UTC time as an ISO 8601 string."""
+    return datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
+
+
 @dataclass
 class ProgressUpdate:
     """Progress update during document generation.
@@ -17,7 +22,7 @@ class ProgressUpdate:
         details: Optional dictionary with additional context (tool name, files created, etc.)
     """
     type: str = "progress"
-    timestamp: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    timestamp: str = field(default_factory=lambda: _utc_iso_now())
     message: str = ""
     stage: Literal["initialization", "planning", "research", "writing", "compilation", "complete"] = "initialization"
     details: Optional[Dict[str, Any]] = None
@@ -53,7 +58,7 @@ class TextUpdate:
 class PaperMetadata:
     """Metadata about the generated paper."""
     title: Optional[str] = None
-    created_at: str = field(default_factory=lambda: datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"))
+    created_at: str = field(default_factory=lambda: _utc_iso_now())
     topic: str = ""
     word_count: Optional[int] = None
     

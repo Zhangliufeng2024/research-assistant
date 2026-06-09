@@ -1,21 +1,17 @@
 """
 Retry and heartbeat utilities for research assistant.
 
-Provides two key capabilities:
-  1. query_with_retry   – wraps an async-generator query call with exponential-backoff
-                          retry on transient network / timeout errors.
-  2. query_with_heartbeat – wraps an async-generator query call and raises
-                            HeartbeatTimeoutError if no message is received within
-                            a configurable window (detects "stuck" sessions).
+Provides error classification and configuration for the agent loop's
+built-in retry logic (see agent._llm_call_with_retry).
 
 Errors handled:
   - Transient network errors (ConnectionError, TimeoutError, HTTP 502/503/529, etc.)
     → retried up to max_retries times with exponential backoff
-  - SDK subprocess crashes ("Stream closed", "Command failed with exit code", etc.)
-    → treated as transient, retried automatically
   - Context/token limit errors (HTTP 400 "input token limit exceeded", etc.)
     → raised immediately as ContextLimitError (never retryable)
-  - HeartbeatTimeoutError (agent produces no output for heartbeat_timeout seconds)
+  - Model config errors (HTTP 400 "not supported model", etc.)
+    → raised immediately as ModelConfigError (never retryable)
+  - HeartbeatTimeoutError (LLM call exceeds heartbeat_timeout seconds)
     → retried automatically; after all retries exhausted, re-raised for user handling
 
 Environment variables
@@ -27,26 +23,44 @@ RA_HEARTBEAT_TIMEOUT float Seconds of silence before "stuck" warning (default 30
 
 import asyncio
 import os
-from typing import AsyncIterator, Callable, AsyncGenerator, TypeVar
 
-# ---------------------------------------------------------------------------
-# Public defaults (can be overridden by environment variables)
-# ---------------------------------------------------------------------------
-DEFAULT_MAX_RETRIES = 3
-DEFAULT_RETRY_BASE_DELAY = 5.0       # seconds; doubles each attempt (5 → 10 → 20)
-DEFAULT_HEARTBEAT_TIMEOUT = 300.0    # 5 minutes of silence = probably stuck
+from .constants import (
+    DEFAULT_MAX_RETRIES,
+    DEFAULT_RETRY_BASE_DELAY,
+    DEFAULT_HEARTBEAT_TIMEOUT,
+)
+
+
+def _safe_int(value: str | None, default: int) -> int:
+    """Parse an environment variable as int, falling back to *default*."""
+    if value is None:
+        return default
+    try:
+        return int(value)
+    except (ValueError, TypeError):
+        return default
+
+
+def _safe_float(value: str | None, default: float) -> float:
+    """Parse an environment variable as float, falling back to *default*."""
+    if value is None:
+        return default
+    try:
+        return float(value)
+    except (ValueError, TypeError):
+        return default
 
 
 def get_max_retries() -> int:
-    return int(os.getenv("RA_MAX_RETRIES", DEFAULT_MAX_RETRIES))
+    return _safe_int(os.getenv("RA_MAX_RETRIES"), DEFAULT_MAX_RETRIES)
 
 
 def get_retry_base_delay() -> float:
-    return float(os.getenv("RA_RETRY_BASE_DELAY", DEFAULT_RETRY_BASE_DELAY))
+    return _safe_float(os.getenv("RA_RETRY_BASE_DELAY"), DEFAULT_RETRY_BASE_DELAY)
 
 
 def get_heartbeat_timeout() -> float:
-    return float(os.getenv("RA_HEARTBEAT_TIMEOUT", DEFAULT_HEARTBEAT_TIMEOUT))
+    return _safe_float(os.getenv("RA_HEARTBEAT_TIMEOUT"), DEFAULT_HEARTBEAT_TIMEOUT)
 
 
 # ---------------------------------------------------------------------------
@@ -231,189 +245,3 @@ def _is_retryable(exc: BaseException) -> bool:
 
     return False
 
-
-# ---------------------------------------------------------------------------
-# query_with_retry
-# ---------------------------------------------------------------------------
-
-async def query_with_retry(
-    prompt: str,
-    options,
-    query_fn,
-    max_retries: int | None = None,
-    base_delay: float | None = None,
-    on_retry=None,          # optional async callback(attempt, exc, delay) for progress reporting
-) -> AsyncGenerator:
-    """
-    Async-generator wrapper that retries *query_fn* on transient network errors.
-
-    Args:
-        prompt:      The prompt to pass to query_fn.
-        options:     ClaudeAgentOptions to pass to query_fn.
-        query_fn:    The async-generator callable (e.g. claude_query or sdk.query).
-        max_retries: Max number of retries (default: RA_MAX_RETRIES env var).
-        base_delay:  Seconds before first retry; doubles each attempt.
-        on_retry:    Optional async callable(attempt, exc, delay) called before each retry.
-                     Use this to yield progress updates from the caller.
-
-    Yields:
-        All messages from query_fn on success.
-
-    Raises:
-        The last exception if all retries are exhausted.
-    """
-    if max_retries is None:
-        max_retries = get_max_retries()
-    if base_delay is None:
-        base_delay = get_retry_base_delay()
-
-    last_exc: BaseException | None = None
-
-    for attempt in range(max_retries + 1):
-        try:
-            async for message in query_fn(prompt=prompt, options=options):
-                yield message
-            return  # success — exit generator cleanly
-
-        except BaseException as exc:
-            last_exc = exc
-
-            # Context limit: convert to a clear, non-retryable exception immediately
-            if _is_context_limit(exc):
-                raise ContextLimitError(exc) from exc
-
-            # Model configuration error: convert to a clear, non-retryable exception
-            if _is_model_error(exc):
-                raise ModelConfigError(exc) from exc
-
-            # Non-retryable or we've used all attempts → re-raise immediately
-            if not _is_retryable(exc) or attempt >= max_retries:
-                raise
-
-            delay = base_delay * (2 ** attempt)  # 5 → 10 → 20 s
-
-            if on_retry is not None:
-                await on_retry(attempt + 1, exc, delay)
-
-            await asyncio.sleep(delay)
-
-    # Should not reach here, but satisfy type checker
-    if last_exc is not None:
-        raise last_exc
-
-
-# ---------------------------------------------------------------------------
-# query_with_heartbeat
-# ---------------------------------------------------------------------------
-
-async def query_with_heartbeat(
-    prompt: str,
-    options,
-    query_fn,
-    heartbeat_timeout: float | None = None,
-) -> AsyncGenerator:
-    """
-    Async-generator wrapper that raises HeartbeatTimeoutError if the underlying
-    query produces no messages for longer than *heartbeat_timeout* seconds.
-
-    This detects "stuck" sessions where the agent has stopped producing output
-    (network hang, model overload, infinite tool loop with no text output, etc.).
-
-    Args:
-        prompt:             Prompt to pass to query_fn.
-        options:            ClaudeAgentOptions.
-        query_fn:           The async-generator callable.
-        heartbeat_timeout:  Seconds of silence before raising.
-                            Defaults to RA_HEARTBEAT_TIMEOUT env var.
-
-    Yields:
-        All messages from query_fn.
-
-    Raises:
-        HeartbeatTimeoutError: If no message is received within the timeout window.
-    """
-    if heartbeat_timeout is None:
-        heartbeat_timeout = get_heartbeat_timeout()
-
-    iterator = query_fn(prompt=prompt, options=options).__aiter__()
-
-    while True:
-        try:
-            message = await asyncio.wait_for(
-                iterator.__anext__(),
-                timeout=heartbeat_timeout,
-            )
-        except StopAsyncIteration:
-            return
-        except asyncio.TimeoutError:
-            raise HeartbeatTimeoutError(heartbeat_timeout)
-
-        yield message
-
-
-# ---------------------------------------------------------------------------
-# Combined: heartbeat + retry
-# ---------------------------------------------------------------------------
-
-async def query_with_retry_and_heartbeat(
-    prompt: str,
-    options,
-    query_fn,
-    max_retries: int | None = None,
-    base_delay: float | None = None,
-    heartbeat_timeout: float | None = None,
-    on_retry=None,
-) -> AsyncGenerator:
-    """
-    Combines heartbeat detection with retry logic.
-
-    HeartbeatTimeoutError is treated as a retryable condition so that a stuck
-    session automatically restarts (up to max_retries times) before giving up.
-
-    All arguments are the same as query_with_retry / query_with_heartbeat.
-    """
-    if max_retries is None:
-        max_retries = get_max_retries()
-    if base_delay is None:
-        base_delay = get_retry_base_delay()
-    if heartbeat_timeout is None:
-        heartbeat_timeout = get_heartbeat_timeout()
-
-    last_exc: BaseException | None = None
-
-    for attempt in range(max_retries + 1):
-        try:
-            async for message in query_with_heartbeat(
-                prompt=prompt,
-                options=options,
-                query_fn=query_fn,
-                heartbeat_timeout=heartbeat_timeout,
-            ):
-                yield message
-            return  # success
-
-        except BaseException as exc:
-            last_exc = exc
-
-            # Context limit: convert to a clear, non-retryable exception immediately
-            if _is_context_limit(exc):
-                raise ContextLimitError(exc) from exc
-
-            # Model configuration error: convert to a clear, non-retryable exception
-            if _is_model_error(exc):
-                raise ModelConfigError(exc) from exc
-
-            retryable = _is_retryable(exc) or isinstance(exc, HeartbeatTimeoutError)
-
-            if not retryable or attempt >= max_retries:
-                raise
-
-            delay = base_delay * (2 ** attempt)
-
-            if on_retry is not None:
-                await on_retry(attempt + 1, exc, delay)
-
-            await asyncio.sleep(delay)
-
-    if last_exc is not None:
-        raise last_exc

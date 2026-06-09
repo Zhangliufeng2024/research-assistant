@@ -1,10 +1,9 @@
 """Human-readable formatting for real-time agent activity display."""
 
-import os
-import sys
 from pathlib import Path
 
 from .models import TokenUsage
+from .constants import DISPLAY_TRUNCATION_LENGTH, DISPLAY_TOKEN_THRESHOLD
 
 
 def _is_error(result: str) -> bool:
@@ -12,7 +11,7 @@ def _is_error(result: str) -> bool:
     return result.startswith("Error") or result.startswith("Exit code:")
 
 
-def _truncate(text: str, max_len: int = 60) -> str:
+def _truncate(text: str, max_len: int = DISPLAY_TRUNCATION_LENGTH) -> str:
     text = text.replace("\n", " ").strip()
     if len(text) > max_len:
         return text[:max_len] + "..."
@@ -75,7 +74,7 @@ def format_tool_result_tag(result: str) -> str:
 def format_status_line(turn: int, elapsed: float, usage: TokenUsage) -> str:
     """Format a turn/time/token status line."""
     total = usage.input_tokens + usage.output_tokens
-    if total >= 1000:
+    if total >= DISPLAY_TOKEN_THRESHOLD:
         token_str = f"{total:,}"
     else:
         token_str = str(total)

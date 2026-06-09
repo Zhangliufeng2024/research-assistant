@@ -1,12 +1,15 @@
 """OpenAI-compatible Chat Completions API client using httpx."""
 
+import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, TokenUsage, _throttle_llm
+from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback, _throttle_llm
+from ..models import TokenUsage
+from ..constants import DEFAULT_OPENAI_MODEL, HTTP_TIMEOUT_SECONDS, HTTP_CONNECT_TIMEOUT_SECONDS
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
@@ -73,11 +76,13 @@ def _build_openai_messages(messages: list[dict], system: str = "") -> list[dict]
 class OpenAICompatClient(LLMClient):
     """OpenAI-compatible Chat Completions API client."""
 
-    def __init__(self, api_key: str, base_url: str = "", model: str = "gpt-4o"):
+    def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_OPENAI_MODEL):
         self.api_key = api_key
         self.base_url = (base_url or OPENAI_DEFAULT_BASE_URL).rstrip("/")
         self.model = model
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
+        )
 
     async def chat(
         self,
@@ -87,8 +92,12 @@ class OpenAICompatClient(LLMClient):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 16384,
+        on_chunk: Optional[OnChunkCallback] = None,
     ) -> LLMResponse:
-        url = f"{self.base_url}/v1/chat/completions"
+        base = self.base_url
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        url = f"{base}/chat/completions"
         headers = {
             "Authorization": f"Bearer {self.api_key}",
             "Content-Type": "application/json",
@@ -105,6 +114,11 @@ class OpenAICompatClient(LLMClient):
             body["tools"] = openai_tools
 
         await _throttle_llm()
+
+        if on_chunk is not None:
+            body["stream"] = True
+            return await self._chat_streaming(url, headers, body, on_chunk)
+
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:
@@ -112,6 +126,98 @@ class OpenAICompatClient(LLMClient):
 
         data = resp.json()
         return self._parse_response(data)
+
+    async def _chat_streaming(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        on_chunk: OnChunkCallback,
+    ) -> LLMResponse:
+        """Stream the OpenAI-compatible response via SSE, calling on_chunk for text deltas."""
+        content_text = ""
+        tool_calls_by_index: dict[int, dict] = {}
+        stop_reason = "end_turn"
+        usage = TokenUsage()
+
+        async with self._client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                raise RuntimeError(f"OpenAI-compatible API error ({resp.status_code}): {resp.text}")
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if data_str == "[DONE]":
+                    break
+                try:
+                    chunk = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                if chunk.get("usage"):
+                    u = chunk["usage"]
+                    usage.input_tokens = u.get("prompt_tokens", 0)
+                    usage.output_tokens = u.get("completion_tokens", 0)
+
+                choices = chunk.get("choices", [])
+                if not choices:
+                    continue
+
+                choice = choices[0]
+                delta = choice.get("delta", {})
+
+                text = delta.get("content")
+                if text:
+                    content_text += text
+                    result = on_chunk(text)
+                    if asyncio.iscoroutine(result):
+                        await result
+
+                for tc_delta in delta.get("tool_calls", []):
+                    idx = tc_delta.get("index", 0)
+                    if idx not in tool_calls_by_index:
+                        tool_calls_by_index[idx] = {
+                            "id": tc_delta.get("id", str(uuid.uuid4())),
+                            "name": tc_delta.get("function", {}).get("name", ""),
+                            "arguments": "",
+                        }
+                    else:
+                        fn = tc_delta.get("function", {})
+                        if fn.get("name"):
+                            tool_calls_by_index[idx]["name"] = fn["name"]
+                        if tc_delta.get("id"):
+                            tool_calls_by_index[idx]["id"] = tc_delta["id"]
+                    arg_chunk = tc_delta.get("function", {}).get("arguments", "")
+                    if arg_chunk:
+                        tool_calls_by_index[idx]["arguments"] += arg_chunk
+
+                finish = choice.get("finish_reason")
+                if finish:
+                    stop_reason_map = {
+                        "stop": "end_turn",
+                        "tool_calls": "tool_use",
+                        "length": "max_tokens",
+                        "content_filter": "end_turn",
+                    }
+                    stop_reason = stop_reason_map.get(finish, finish)
+
+        tool_calls: list[ToolCall] = []
+        for idx in sorted(tool_calls_by_index):
+            tc = tool_calls_by_index[idx]
+            try:
+                args = json.loads(tc["arguments"]) if tc["arguments"] else {}
+            except json.JSONDecodeError:
+                args = {"raw": tc["arguments"]}
+            tool_calls.append(ToolCall(id=tc["id"], name=tc["name"], arguments=args))
+
+        return LLMResponse(
+            content=content_text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage,
+        )
 
     def _parse_response(self, data: dict) -> LLMResponse:
         choices = data.get("choices", [])

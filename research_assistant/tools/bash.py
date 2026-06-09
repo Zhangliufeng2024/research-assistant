@@ -3,7 +3,23 @@
 import asyncio
 import os
 import sys
-from typing import Optional
+
+from ..constants import OUTPUT_TRUNCATION_LIMIT, OUTPUT_TRUNCATION_HALF
+
+
+async def _kill_process(proc: asyncio.subprocess.Process) -> None:
+    """Terminate a subprocess, escalating to kill if necessary."""
+    if proc.returncode is not None:
+        return
+    try:
+        proc.terminate()
+        try:
+            await asyncio.wait_for(proc.wait(), timeout=5)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.wait()
+    except ProcessLookupError:
+        pass
 
 
 async def run_bash(
@@ -27,25 +43,24 @@ async def run_bash(
             shell = "/bin/sh"
         args = [shell, "-c", command]
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             *args,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env={**os.environ},
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        if proc is not None:
+            await _kill_process(proc)
         return f"Error: Command timed out after {timeout} seconds"
     except FileNotFoundError:
         return f"Error: Shell not found: {shell}"
     except Exception as e:
+        if proc is not None:
+            await _kill_process(proc)
         return f"Error executing command: {e}"
 
     output_parts = []
@@ -59,7 +74,11 @@ async def run_bash(
     if proc.returncode != 0:
         result = f"Exit code: {proc.returncode}\n{result}"
 
-    if len(result) > 30000:
-        result = result[:15000] + "\n\n... (output truncated) ...\n\n" + result[-15000:]
+    if len(result) > OUTPUT_TRUNCATION_LIMIT:
+        result = (
+            result[:OUTPUT_TRUNCATION_HALF]
+            + "\n\n... (output truncated) ...\n\n"
+            + result[-OUTPUT_TRUNCATION_HALF:]
+        )
 
     return result or "(no output)"

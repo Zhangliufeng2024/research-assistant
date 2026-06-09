@@ -1,14 +1,15 @@
 """File operation tools: read, write, edit, glob, grep."""
 
-import fnmatch
 import os
 import re
 from pathlib import Path
 
+from ..constants import GREP_MAX_RESULTS, GLOB_MAX_RESULTS, BINARY_EXTENSIONS
+
 
 async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
     """Read a file and return its content with line numbers."""
-    p = Path(file_path)
+    p = Path(file_path).resolve()
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
     if p.is_dir():
@@ -35,7 +36,7 @@ async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
 
 async def write_file(file_path: str, content: str) -> str:
     """Write content to a file, creating parent directories if needed."""
-    p = Path(file_path)
+    p = Path(file_path).resolve()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -46,7 +47,7 @@ async def write_file(file_path: str, content: str) -> str:
 
 async def edit_file(file_path: str, old_string: str, new_string: str) -> str:
     """Replace an exact string in a file. old_string must appear exactly once."""
-    p = Path(file_path)
+    p = Path(file_path).resolve()
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
 
@@ -79,10 +80,10 @@ async def glob_files(pattern: str, path: str = ".") -> str:
     if not matches:
         return f"No files matching '{pattern}' in {path}"
 
-    lines = [str(m) for m in matches[:500]]
+    lines = [str(m) for m in matches[:GLOB_MAX_RESULTS]]
     result = "\n".join(lines)
-    if len(matches) > 500:
-        result += f"\n\n... ({len(matches) - 500} more matches)"
+    if len(matches) > GLOB_MAX_RESULTS:
+        result += f"\n\n... ({len(matches) - GLOB_MAX_RESULTS} more matches)"
     return result
 
 
@@ -98,7 +99,6 @@ async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
         return f"Error: Invalid regex pattern: {e}"
 
     results = []
-    max_results = 200
 
     if base.is_file():
         files = [base]
@@ -111,7 +111,7 @@ async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
     for fp in files:
         if not fp.is_file():
             continue
-        if fp.suffix in (".pyc", ".pyo", ".so", ".dll", ".exe", ".bin", ".png", ".jpg", ".pdf", ".zip"):
+        if fp.suffix in BINARY_EXTENSIONS:
             continue
         try:
             text = fp.read_text(encoding="utf-8", errors="replace")
@@ -120,14 +120,14 @@ async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
         for i, line in enumerate(text.splitlines(), 1):
             if regex.search(line):
                 results.append(f"{fp}:{i}: {line.rstrip()}")
-                if len(results) >= max_results:
+                if len(results) >= GREP_MAX_RESULTS:
                     break
-        if len(results) >= max_results:
+        if len(results) >= GREP_MAX_RESULTS:
             break
 
     if not results:
         return f"No matches for pattern '{pattern}'"
     output = "\n".join(results)
-    if len(results) >= max_results:
+    if len(results) >= GREP_MAX_RESULTS:
         output += "\n\n... (results truncated)"
     return output

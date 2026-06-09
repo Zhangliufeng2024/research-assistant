@@ -10,9 +10,11 @@ from research_assistant.retry import (
     _is_retryable,
     _is_context_limit,
     _is_model_error,
-    query_with_retry,
-    query_with_heartbeat,
-    query_with_retry_and_heartbeat,
+    _safe_int,
+    _safe_float,
+    get_max_retries,
+    get_retry_base_delay,
+    get_heartbeat_timeout,
 )
 
 
@@ -92,71 +94,44 @@ class TestModelConfigError:
         assert e.original is orig
 
 
-# --- Async generator tests ---
+class TestSafeEnvParsing:
+    def test_safe_int_valid(self):
+        assert _safe_int("5", 3) == 5
 
-async def _mock_query_success(prompt, options):
-    """Mock query that yields two messages."""
-    for text in ["hello", "world"]:
-        yield type("Msg", (), {"content": [type("B", (), {"text": text})()]})()
+    def test_safe_int_none(self):
+        assert _safe_int(None, 3) == 3
 
+    def test_safe_int_invalid(self):
+        assert _safe_int("abc", 3) == 3
 
-async def _mock_query_fail_then_succeed(prompt, options, _state={"calls": 0}):
-    """Mock query that fails on first call, succeeds on second."""
-    _state["calls"] += 1
-    if _state["calls"] <= 1:
-        raise ConnectionError("transient failure")
-    yield type("Msg", (), {"content": [type("B", (), {"text": "recovered"})()]})()
+    def test_safe_int_empty(self):
+        assert _safe_int("", 3) == 3
 
+    def test_safe_float_valid(self):
+        assert _safe_float("2.5", 1.0) == 2.5
 
-async def _mock_query_context_limit(prompt, options):
-    """Mock query that raises a context limit error."""
-    raise RuntimeError("input token limit exceeded")
-    yield  # pragma: no cover - makes this an async generator
+    def test_safe_float_none(self):
+        assert _safe_float(None, 1.0) == 1.0
 
+    def test_safe_float_invalid(self):
+        assert _safe_float("xyz", 1.0) == 1.0
 
-async def _mock_query_slow(prompt, options):
-    """Mock query that takes forever (for heartbeat testing)."""
-    await asyncio.sleep(999)
-    yield  # pragma: no cover
+    def test_get_max_retries_default(self, monkeypatch):
+        monkeypatch.delenv("RA_MAX_RETRIES", raising=False)
+        assert get_max_retries() == 3
 
+    def test_get_max_retries_from_env(self, monkeypatch):
+        monkeypatch.setenv("RA_MAX_RETRIES", "7")
+        assert get_max_retries() == 7
 
-@pytest.mark.asyncio
-async def test_query_with_retry_success():
-    messages = []
-    async for msg in query_with_retry(
-        prompt="test", options=None, query_fn=_mock_query_success,
-        max_retries=0, base_delay=0.01,
-    ):
-        messages.append(msg)
-    assert len(messages) == 2
+    def test_get_max_retries_bad_env(self, monkeypatch):
+        monkeypatch.setenv("RA_MAX_RETRIES", "not_a_number")
+        assert get_max_retries() == 3
 
+    def test_get_retry_base_delay_default(self, monkeypatch):
+        monkeypatch.delenv("RA_RETRY_BASE_DELAY", raising=False)
+        assert get_retry_base_delay() == 5.0
 
-@pytest.mark.asyncio
-async def test_query_with_retry_context_limit():
-    with pytest.raises(ContextLimitError):
-        async for _ in query_with_retry(
-            prompt="test", options=None, query_fn=_mock_query_context_limit,
-            max_retries=3, base_delay=0.01,
-        ):
-            pass
-
-
-@pytest.mark.asyncio
-async def test_query_with_heartbeat_timeout():
-    with pytest.raises(HeartbeatTimeoutError):
-        async for _ in query_with_heartbeat(
-            prompt="test", options=None, query_fn=_mock_query_slow,
-            heartbeat_timeout=0.05,
-        ):
-            pass
-
-
-@pytest.mark.asyncio
-async def test_query_with_heartbeat_success():
-    messages = []
-    async for msg in query_with_heartbeat(
-        prompt="test", options=None, query_fn=_mock_query_success,
-        heartbeat_timeout=5.0,
-    ):
-        messages.append(msg)
-    assert len(messages) == 2
+    def test_get_heartbeat_timeout_default(self, monkeypatch):
+        monkeypatch.delenv("RA_HEARTBEAT_TIMEOUT", raising=False)
+        assert get_heartbeat_timeout() == 300.0

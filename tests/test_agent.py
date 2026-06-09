@@ -7,7 +7,7 @@ from dataclasses import dataclass, field
 import pytest
 
 from research_assistant.agent import run_agent, _accumulate_usage, AgentResult
-from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall, TokenUsage as LLMTokenUsage
+from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
 from research_assistant.tools.registry import ToolRegistry
 from research_assistant.models import TokenUsage
 
@@ -19,12 +19,17 @@ class MockLLMClient(LLMClient):
         self._responses = list(responses)
         self._call_count = 0
 
-    async def chat(self, messages, *, system="", tools=None, temperature=0.7, max_tokens=16384):
+    async def chat(self, messages, *, system="", tools=None, temperature=0.7, max_tokens=16384, on_chunk=None):
         if self._call_count < len(self._responses):
             resp = self._responses[self._call_count]
             self._call_count += 1
-            return resp
-        return LLMResponse(content="Done.", stop_reason="end_turn")
+        else:
+            resp = LLMResponse(content="Done.", stop_reason="end_turn")
+        if on_chunk and resp.content:
+            result = on_chunk(resp.content)
+            if asyncio.iscoroutine(result):
+                await result
+        return resp
 
     async def close(self):
         pass
@@ -33,12 +38,12 @@ class MockLLMClient(LLMClient):
 class TestAccumulateUsage:
     def test_accumulates_tokens(self):
         total = TokenUsage()
-        resp = LLMResponse(usage=LLMTokenUsage(input_tokens=100, output_tokens=50))
+        resp = LLMResponse(usage=TokenUsage(input_tokens=100, output_tokens=50))
         _accumulate_usage(total, resp)
         assert total.input_tokens == 100
         assert total.output_tokens == 50
 
-        resp2 = LLMResponse(usage=LLMTokenUsage(input_tokens=200, output_tokens=100))
+        resp2 = LLMResponse(usage=TokenUsage(input_tokens=200, output_tokens=100))
         _accumulate_usage(total, resp2)
         assert total.input_tokens == 300
         assert total.output_tokens == 150
@@ -187,7 +192,7 @@ class TestRunAgent:
             LLMResponse(
                 content="Hello!",
                 stop_reason="end_turn",
-                usage=LLMTokenUsage(input_tokens=100, output_tokens=50),
+                usage=TokenUsage(input_tokens=100, output_tokens=50),
             ),
         ])
         tools = ToolRegistry()

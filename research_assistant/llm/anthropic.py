@@ -1,15 +1,22 @@
 """Anthropic Messages API client using httpx."""
 
+import asyncio
 import json
 import uuid
-from typing import Any
+from typing import Any, Optional
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, TokenUsage, _throttle_llm
+from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback, _throttle_llm
+from ..models import TokenUsage
+from ..constants import (
+    ANTHROPIC_API_VERSION,
+    DEFAULT_ANTHROPIC_MODEL,
+    HTTP_TIMEOUT_SECONDS,
+    HTTP_CONNECT_TIMEOUT_SECONDS,
+)
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
-ANTHROPIC_API_VERSION = "2023-06-01"
 
 
 def _convert_tools_to_anthropic(tools: list[dict] | None) -> list[dict]:
@@ -81,11 +88,13 @@ def _build_anthropic_messages(messages: list[dict]) -> list[dict]:
 class AnthropicClient(LLMClient):
     """Anthropic Messages API client."""
 
-    def __init__(self, api_key: str, base_url: str = "", model: str = "claude-sonnet-4-6"):
+    def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_ANTHROPIC_MODEL):
         self.api_key = api_key
         self.base_url = (base_url or ANTHROPIC_DEFAULT_BASE_URL).rstrip("/")
         self.model = model
-        self._client = httpx.AsyncClient(timeout=httpx.Timeout(300.0, connect=30.0))
+        self._client = httpx.AsyncClient(
+            timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
+        )
 
     async def chat(
         self,
@@ -95,8 +104,12 @@ class AnthropicClient(LLMClient):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 16384,
+        on_chunk: Optional[OnChunkCallback] = None,
     ) -> LLMResponse:
-        url = f"{self.base_url}/v1/messages"
+        base = self.base_url
+        if not base.endswith("/v1"):
+            base = f"{base}/v1"
+        url = f"{base}/messages"
         headers = {
             "x-api-key": self.api_key,
             "anthropic-version": ANTHROPIC_API_VERSION,
@@ -116,6 +129,11 @@ class AnthropicClient(LLMClient):
             body["tools"] = anthropic_tools
 
         await _throttle_llm()
+
+        if on_chunk is not None:
+            body["stream"] = True
+            return await self._chat_streaming(url, headers, body, on_chunk)
+
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:
@@ -123,6 +141,102 @@ class AnthropicClient(LLMClient):
 
         data = resp.json()
         return self._parse_response(data)
+
+    async def _chat_streaming(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        on_chunk: OnChunkCallback,
+    ) -> LLMResponse:
+        """Stream the Anthropic response via SSE, calling on_chunk for text deltas."""
+        content_text = ""
+        tool_calls: list[ToolCall] = []
+        stop_reason = "end_turn"
+        usage = TokenUsage()
+
+        current_tool_id = ""
+        current_tool_name = ""
+        current_tool_json = ""
+        in_tool_block = False
+
+        async with self._client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code != 200:
+                await resp.aread()
+                raise RuntimeError(f"Anthropic API error ({resp.status_code}): {resp.text}")
+
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:]
+                if not data_str or data_str.strip() == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data_str)
+                except json.JSONDecodeError:
+                    continue
+
+                etype = event.get("type", "")
+
+                if etype == "message_start":
+                    msg_usage = event.get("message", {}).get("usage", {})
+                    usage.input_tokens = msg_usage.get("input_tokens", 0)
+
+                elif etype == "content_block_start":
+                    block = event.get("content_block", {})
+                    if block.get("type") == "tool_use":
+                        in_tool_block = True
+                        current_tool_id = block.get("id", str(uuid.uuid4()))
+                        current_tool_name = block.get("name", "")
+                        current_tool_json = ""
+                    else:
+                        in_tool_block = False
+
+                elif etype == "content_block_delta":
+                    delta = event.get("delta", {})
+                    if delta.get("type") == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            content_text += text
+                            result = on_chunk(text)
+                            if asyncio.iscoroutine(result):
+                                await result
+                    elif delta.get("type") == "input_json_delta":
+                        current_tool_json += delta.get("partial_json", "")
+
+                elif etype == "content_block_stop":
+                    if in_tool_block:
+                        try:
+                            args = json.loads(current_tool_json) if current_tool_json else {}
+                        except json.JSONDecodeError:
+                            args = {"raw": current_tool_json}
+                        tool_calls.append(ToolCall(
+                            id=current_tool_id,
+                            name=current_tool_name,
+                            arguments=args,
+                        ))
+                        in_tool_block = False
+
+                elif etype == "message_delta":
+                    delta = event.get("delta", {})
+                    raw_stop = delta.get("stop_reason", "")
+                    if raw_stop:
+                        stop_reason_map = {
+                            "end_turn": "end_turn",
+                            "tool_use": "tool_use",
+                            "max_tokens": "max_tokens",
+                            "stop_sequence": "end_turn",
+                        }
+                        stop_reason = stop_reason_map.get(raw_stop, raw_stop)
+                    msg_usage = event.get("usage", {})
+                    usage.output_tokens = msg_usage.get("output_tokens", 0)
+
+        return LLMResponse(
+            content=content_text,
+            tool_calls=tool_calls,
+            stop_reason=stop_reason,
+            usage=usage,
+        )
 
     def _parse_response(self, data: dict) -> LLMResponse:
         content_text = ""

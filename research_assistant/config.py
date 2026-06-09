@@ -14,6 +14,7 @@ from dotenv import load_dotenv
 from .core import load_system_instructions
 from .llm.factory import create_llm_client
 from .llm.base import LLMClient
+from .constants import DEFAULT_ANTHROPIC_MODEL
 
 
 def generate_session_dir_name(query: str) -> str:
@@ -56,7 +57,7 @@ def resolve_model(model: str | None = None) -> str:
     """Return the writing model. Priority: explicit param -> env -> default."""
     if model:
         return model
-    return os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    return os.getenv("LLM_MODEL") or DEFAULT_ANTHROPIC_MODEL
 
 
 def build_llm_client(

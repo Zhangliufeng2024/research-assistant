@@ -8,7 +8,7 @@ import asyncio
 import sys
 import threading
 import time
-from typing import Optional
+from typing import Callable, Optional
 
 
 class SteerReader:
@@ -26,7 +26,7 @@ class SteerReader:
         self._thread: Optional[threading.Thread] = None
         self._stop = threading.Event()
 
-    def start(self, queue: asyncio.Queue, loop: asyncio.AbstractEventLoop) -> None:
+    def start(self, queue: "asyncio.Queue[str]", loop: asyncio.AbstractEventLoop) -> None:
         """Start the background stdin reader thread."""
         if self._thread is not None:
             return
@@ -55,7 +55,7 @@ class SteerReader:
         self._thread = None
 
 
-def _win_reader(put: callable, stop: threading.Event) -> None:
+def _win_reader(put: Callable[[str], None], stop: threading.Event) -> None:
     """Windows non-blocking stdin reader using msvcrt."""
     import msvcrt
 
@@ -88,7 +88,7 @@ def _win_reader(put: callable, stop: threading.Event) -> None:
             time.sleep(0.05)
 
 
-def _unix_reader(put: callable, stop: threading.Event) -> None:
+def _unix_reader(put: Callable[[str], None], stop: threading.Event) -> None:
     """Unix non-blocking stdin reader using select."""
     import select
 

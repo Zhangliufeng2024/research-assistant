@@ -1,11 +1,20 @@
-"""Tests for research_assistant.docgen — PaperBuilder and BibTeX parsing."""
+"""Tests for research_assistant.docgen — PaperBuilder, BibTeX parsing, templates, cross-refs."""
 
 from pathlib import Path
 
 import pytest
 from docx import Document
 
-from research_assistant.docgen import PaperBuilder, Reference, parse_bibtex
+from research_assistant.docgen import (
+    PaperBuilder,
+    Reference,
+    parse_bibtex,
+    DocumentTemplate,
+    CrossReferenceManager,
+    get_template,
+    list_templates,
+    TEMPLATES,
+)
 
 
 class TestReference:
@@ -303,3 +312,232 @@ class TestParseBibtex:
         texts = [p.text for p in doc.paragraphs]
         assert any("References" in t for t in texts)
         assert any("[1]" in t and "Test Author" in t for t in texts)
+
+
+# ---------------------------------------------------------------------------
+# Template system
+# ---------------------------------------------------------------------------
+
+class TestTemplateRegistry:
+    def test_list_templates_includes_defaults(self):
+        names = list_templates()
+        assert "default" in names
+        assert "ieee_journal" in names
+        assert "nature" in names
+        assert "apa7" in names
+        assert "asce" in names
+        assert "elsevier" in names
+
+    def test_get_template_known(self):
+        t = get_template("ieee_journal")
+        assert t.name == "ieee_journal"
+        assert t.columns == 2
+
+    def test_get_template_unknown_returns_default(self):
+        t = get_template("nonexistent_venue")
+        assert t.name == "default"
+
+    def test_template_fields(self):
+        t = get_template("nature")
+        assert t.body_font == "Arial"
+        assert t.heading_font == "Arial"
+        assert t.columns == 1
+
+    def test_apa7_double_spaced(self):
+        t = get_template("apa7")
+        assert t.line_spacing == 2.0
+
+
+class TestPaperBuilderTemplate:
+    def test_default_template(self, tmp_path):
+        paper = PaperBuilder("Title")
+        assert paper.template.name == "default"
+        out = paper.save(str(tmp_path / "paper.docx"))
+        assert Path(out).exists()
+
+    def test_ieee_template_string(self, tmp_path):
+        paper = PaperBuilder("IEEE Paper", template="ieee_journal")
+        assert paper.template.name == "ieee_journal"
+        paper.add_section("Introduction", "Content here.")
+        out = paper.save(str(tmp_path / "ieee.docx"))
+        assert Path(out).exists()
+
+    def test_custom_template_object(self, tmp_path):
+        custom = DocumentTemplate(
+            name="custom",
+            display_name="My Custom",
+            body_font="Arial",
+            body_font_size=14.0,
+        )
+        paper = PaperBuilder("Custom Paper", template=custom)
+        assert paper.template.name == "custom"
+        assert paper.template.body_font == "Arial"
+        out = paper.save(str(tmp_path / "custom.docx"))
+        assert Path(out).exists()
+
+    def test_available_templates_static_method(self):
+        templates = PaperBuilder.available_templates()
+        assert isinstance(templates, list)
+        assert "default" in templates
+
+    def test_numbered_headings_ieee(self, tmp_path):
+        paper = PaperBuilder("Title", template="ieee_journal")
+        paper.add_section("Introduction", "Body.")
+        paper.add_section("Methods", "Body.")
+        out = paper.save(str(tmp_path / "paper.docx"))
+        doc = Document(out)
+        headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+        assert any("1." in h for h in headings)
+        assert any("2." in h for h in headings)
+
+    def test_unnumbered_headings_nature(self, tmp_path):
+        paper = PaperBuilder("Title", template="nature")
+        paper.add_section("Introduction", "Body.")
+        out = paper.save(str(tmp_path / "paper.docx"))
+        doc = Document(out)
+        headings = [p.text for p in doc.paragraphs if p.style.name.startswith("Heading")]
+        assert any("Introduction" == h for h in headings)
+
+
+# ---------------------------------------------------------------------------
+# Cross-reference system
+# ---------------------------------------------------------------------------
+
+class TestCrossReferenceManager:
+    def test_register_and_get(self):
+        refs = CrossReferenceManager()
+        refs.register("fig:overview", "Figure", 1)
+        entry = refs.get("fig:overview")
+        assert entry is not None
+        assert entry.ref_type == "Figure"
+        assert entry.number == 1
+
+    def test_get_unknown_returns_none(self):
+        refs = CrossReferenceManager()
+        assert refs.get("nonexistent") is None
+
+    def test_format_ref_known(self):
+        refs = CrossReferenceManager()
+        refs.register("tab:results", "Table", 3)
+        assert refs.format_ref("tab:results") == "Table 3"
+
+    def test_format_ref_unknown(self):
+        refs = CrossReferenceManager()
+        assert refs.format_ref("missing") == "[??missing]"
+
+    def test_resolve_replaces_markers(self):
+        refs = CrossReferenceManager()
+        refs.register("fig:a", "Figure", 1)
+        refs.register("tab:b", "Table", 2)
+        text = "As shown in {ref:fig:a} and {ref:tab:b}, the results are clear."
+        resolved = refs.resolve(text)
+        assert resolved == "As shown in Figure 1 and Table 2, the results are clear."
+
+    def test_resolve_unknown_label(self):
+        refs = CrossReferenceManager()
+        text = "See {ref:unknown}."
+        resolved = refs.resolve(text)
+        assert resolved == "See [??unknown]."
+
+    def test_resolve_no_markers(self):
+        refs = CrossReferenceManager()
+        text = "Plain text without references."
+        assert refs.resolve(text) == text
+
+
+class TestPaperBuilderCrossRefs:
+    def _make_png(self):
+        import struct, zlib
+        sig = b"\x89PNG\r\n\x1a\n"
+        ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
+        ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF
+        ihdr = struct.pack(">I", 13) + b"IHDR" + ihdr_data + struct.pack(">I", ihdr_crc)
+        raw = b"\x00\x00\x00\x00"
+        idat_data = zlib.compress(raw)
+        idat_crc = zlib.crc32(b"IDAT" + idat_data) & 0xFFFFFFFF
+        idat = struct.pack(">I", len(idat_data)) + b"IDAT" + idat_data + struct.pack(">I", idat_crc)
+        iend_crc = zlib.crc32(b"IEND") & 0xFFFFFFFF
+        iend = struct.pack(">I", 0) + b"IEND" + struct.pack(">I", iend_crc)
+        return sig + ihdr + idat + iend
+
+    def test_figure_label_and_ref(self, tmp_path):
+        img = tmp_path / "fig.png"
+        img.write_bytes(self._make_png())
+
+        paper = PaperBuilder("Title")
+        paper.add_figure(str(img), "Overview", label="fig:overview")
+        assert paper.ref("fig:overview") == "Figure 1"
+
+    def test_table_label_and_ref(self, tmp_path):
+        paper = PaperBuilder("Title")
+        paper.add_table(["A"], [["1"]], caption="Results", label="tab:results")
+        assert paper.ref("tab:results") == "Table 1"
+
+    def test_section_label_and_ref(self, tmp_path):
+        paper = PaperBuilder("Title")
+        paper.add_section("Introduction", "Content", label="sec:intro")
+        assert paper.ref("sec:intro") == "Section 1"
+
+    def test_ref_unknown_label(self, tmp_path):
+        paper = PaperBuilder("Title")
+        assert paper.ref("nonexistent") == "[??nonexistent]"
+
+    def test_cross_refs_resolved_in_saved_doc(self, tmp_path):
+        img = tmp_path / "fig.png"
+        img.write_bytes(self._make_png())
+
+        paper = PaperBuilder("Title")
+        paper.add_figure(str(img), "Architecture", label="fig:arch")
+        paper.add_table(["X"], [["1"]], caption="Data", label="tab:data")
+        paper.add_section("Discussion", "See {ref:fig:arch} and {ref:tab:data} for details.")
+        out = paper.save(str(tmp_path / "paper.docx"))
+
+        doc = Document(out)
+        all_text = " ".join(p.text for p in doc.paragraphs)
+        assert "Figure 1" in all_text
+        assert "Table 1" in all_text
+        assert "{ref:" not in all_text
+
+    def test_cross_refs_in_tables(self, tmp_path):
+        img = tmp_path / "fig.png"
+        img.write_bytes(self._make_png())
+
+        paper = PaperBuilder("Title")
+        paper.add_figure(str(img), "Arch", label="fig:x")
+        paper.add_table(["Col"], [["{ref:fig:x}"]], caption="Refs in table")
+        out = paper.save(str(tmp_path / "paper.docx"))
+
+        doc = Document(out)
+        table_text = " ".join(
+            cell.text for table in doc.tables for row in table.rows for cell in row.cells
+        )
+        assert "Figure 1" in table_text
+        assert "{ref:" not in table_text
+
+    def test_multiple_figures_numbering(self, tmp_path):
+        img = tmp_path / "fig.png"
+        img.write_bytes(self._make_png())
+
+        paper = PaperBuilder("Title")
+        paper.add_figure(str(img), "First", label="fig:a")
+        paper.add_figure(str(img), "Second", label="fig:b")
+        paper.add_section("Text", "Comparing {ref:fig:a} and {ref:fig:b}.")
+        out = paper.save(str(tmp_path / "paper.docx"))
+
+        doc = Document(out)
+        all_text = " ".join(p.text for p in doc.paragraphs)
+        assert "Figure 1" in all_text
+        assert "Figure 2" in all_text
+
+    def test_refs_property_access(self, tmp_path):
+        paper = PaperBuilder("Title")
+        paper.add_section("Intro", "Hi", label="sec:intro")
+        entry = paper.refs.get("sec:intro")
+        assert entry is not None
+        assert entry.ref_type == "Section"
+
+
+class TestReferenceFormatNamed:
+    def test_format_numbered_is_format_apa(self):
+        ref = Reference(key="x", authors="A", title="T", year=2020)
+        assert ref.format_numbered(1) == ref.format_apa(1)

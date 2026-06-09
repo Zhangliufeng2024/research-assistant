@@ -5,6 +5,7 @@ import pytest
 from research_assistant.orchestrator import (
     _parse_plan,
     _extract_json_object,
+    _sanitize_filename,
     OrchestrationPlan,
     SectionPlan,
     FigurePlan,
@@ -116,3 +117,31 @@ class TestDataModels:
         assert p.paper_title == ""
         assert p.sections == []
         assert p.citation_target == 30
+
+
+class TestSanitizeFilename:
+    def test_normal_name(self):
+        assert _sanitize_filename("figure.png") == "figure.png"
+
+    def test_strips_directory(self):
+        assert _sanitize_filename("../../../etc/passwd") == "passwd"
+
+    def test_strips_backslash_directory(self):
+        result = _sanitize_filename("..\\..\\secret.txt")
+        assert ".." not in result
+        assert result.endswith("secret.txt")
+
+    def test_replaces_special_chars(self):
+        result = _sanitize_filename("file name (1).png")
+        assert "/" not in result
+        assert " " not in result
+
+    def test_empty_string_returns_default(self):
+        assert _sanitize_filename("") == "unnamed"
+
+    def test_custom_default(self):
+        assert _sanitize_filename("", default="fallback.png") == "fallback.png"
+
+    def test_dots_only(self):
+        result = _sanitize_filename("...")
+        assert result == "..."

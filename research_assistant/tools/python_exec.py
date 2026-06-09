@@ -1,10 +1,12 @@
 """Python code execution tool."""
 
 import asyncio
-import os
 import sys
 import uuid
 from pathlib import Path
+
+from ..constants import OUTPUT_TRUNCATION_LIMIT, OUTPUT_TRUNCATION_HALF
+from .bash import _kill_process
 
 
 async def run_python(
@@ -30,25 +32,24 @@ async def run_python(
     except Exception as e:
         return f"Error writing temp file: {e}"
 
+    proc = None
     try:
         proc = await asyncio.create_subprocess_exec(
             sys.executable, str(temp_path),
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             cwd=cwd,
-            env={**os.environ},
         )
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        try:
-            proc.kill()
-            await proc.wait()
-        except Exception:
-            pass
+        if proc is not None:
+            await _kill_process(proc)
         return f"Error: Python code timed out after {timeout} seconds"
     except FileNotFoundError:
         return f"Error: Python interpreter not found: {sys.executable}"
     except Exception as e:
+        if proc is not None:
+            await _kill_process(proc)
         return f"Error executing Python code: {e}"
     finally:
         try:
@@ -67,7 +68,11 @@ async def run_python(
     if proc.returncode != 0:
         result = f"Exit code: {proc.returncode}\n{result}"
 
-    if len(result) > 30000:
-        result = result[:15000] + "\n\n... (output truncated) ...\n\n" + result[-15000:]
+    if len(result) > OUTPUT_TRUNCATION_LIMIT:
+        result = (
+            result[:OUTPUT_TRUNCATION_HALF]
+            + "\n\n... (output truncated) ...\n\n"
+            + result[-OUTPUT_TRUNCATION_HALF:]
+        )
 
     return result or "(no output)"

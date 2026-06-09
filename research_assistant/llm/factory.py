@@ -6,6 +6,7 @@ from typing import Optional
 from .base import LLMClient
 from .anthropic import AnthropicClient
 from .openai_compat import OpenAICompatClient
+from ..constants import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
 
 
 def detect_provider(api_key: str, provider: str = "") -> str:
@@ -49,11 +50,11 @@ def create_llm_client(
         return AnthropicClient(
             api_key=key,
             base_url=url,
-            model=mdl or "claude-sonnet-4-6",
+            model=mdl or DEFAULT_ANTHROPIC_MODEL,
         )
     else:
         return OpenAICompatClient(
             api_key=key,
             base_url=url,
-            model=mdl or "gpt-4o",
+            model=mdl or DEFAULT_OPENAI_MODEL,
         )

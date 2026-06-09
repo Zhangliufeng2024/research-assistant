@@ -9,7 +9,7 @@ import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Optional, Awaitable
 
-from .llm.base import LLMClient, LLMResponse, ToolCall
+from .llm.base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
 from .tools.registry import ToolRegistry
 from .models import TokenUsage
 from .retry import (
@@ -44,7 +44,7 @@ OnTurnStartCallback = Callable[[int, float, "TokenUsage"], Awaitable[None] | Non
 OnSteerCallback = Callable[[str], Awaitable[None] | None]
 
 
-async def _maybe_await(fn: Optional[Callable], *args: Any) -> None:
+async def _maybe_await(fn: Optional[Callable[..., Any]], *args: Any) -> None:
     if fn is None:
         return
     result = fn(*args)
@@ -60,6 +60,7 @@ async def _llm_call_with_timeout(
     temperature: float,
     max_tokens: int,
     heartbeat_timeout: float,
+    on_chunk: Optional[OnChunkCallback] = None,
 ) -> LLMResponse:
     """Call the LLM with a heartbeat timeout."""
     coro = client.chat(
@@ -68,6 +69,7 @@ async def _llm_call_with_timeout(
         tools=tools,
         temperature=temperature,
         max_tokens=max_tokens,
+        on_chunk=on_chunk,
     )
     try:
         return await asyncio.wait_for(coro, timeout=heartbeat_timeout)
@@ -131,6 +133,8 @@ async def run_agent(
     base_delay = get_retry_base_delay()
     heartbeat_timeout = get_heartbeat_timeout()
 
+    streaming = on_text is not None
+
     for turn in range(max_turns):
         injected = _drain_steer_queue(steer_queue, messages)
         for s in injected:
@@ -143,13 +147,15 @@ async def run_agent(
         response = await _llm_call_with_retry(
             llm_client, messages, system_prompt, tool_schemas,
             temperature, max_tokens, heartbeat_timeout, max_retries, base_delay,
+            on_chunk=on_text if streaming else None,
         )
 
         _accumulate_usage(total_usage, response)
 
         if response.content:
             collected_text += response.content
-            await _maybe_await(on_text, response.content)
+            if not streaming:
+                await _maybe_await(on_text, response.content)
 
         if response.tool_calls:
             assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": [
@@ -227,6 +233,7 @@ async def _llm_call_with_retry(
     heartbeat_timeout: float,
     max_retries: int,
     base_delay: float,
+    on_chunk: Optional[OnChunkCallback] = None,
 ) -> LLMResponse:
     """Call the LLM with retry on transient errors and heartbeat timeout."""
     last_exc: BaseException | None = None
@@ -236,6 +243,7 @@ async def _llm_call_with_retry(
             return await _llm_call_with_timeout(
                 client, messages, system, tools,
                 temperature, max_tokens, heartbeat_timeout,
+                on_chunk=on_chunk,
             )
         except BaseException as exc:
             last_exc = exc
