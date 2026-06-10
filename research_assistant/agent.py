@@ -12,6 +12,7 @@ from typing import Any, Callable, Optional, Awaitable
 from .llm.base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
 from .tools.registry import ToolRegistry
 from .models import TokenUsage
+from .constants import TASK_COMPLETE_MARKER, DEFAULT_MAX_CONTINUATIONS
 from .retry import (
     HeartbeatTimeoutError,
     ContextLimitError,
@@ -42,6 +43,24 @@ OnToolCallback = Callable[[str, dict[str, Any], str], Awaitable[None] | None]
 OnToolStartCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 OnTurnStartCallback = Callable[[int, float, "TokenUsage"], Awaitable[None] | None]
 OnSteerCallback = Callable[[str], Awaitable[None] | None]
+
+
+def _is_completion_loop(recent_texts: list[str]) -> bool:
+    """Detect if the LLM is stuck repeating similar completion messages.
+
+    Compares the last two text-only responses (no tool calls) using
+    word-level Jaccard similarity.  A score above 0.6 means the model
+    is almost certainly saying the same thing again.
+    """
+    if len(recent_texts) < 2:
+        return False
+    a, b = recent_texts[-2], recent_texts[-1]
+    words_a = set(a.lower().split())
+    words_b = set(b.lower().split())
+    if not words_a or not words_b:
+        return False
+    jaccard = len(words_a & words_b) / len(words_a | words_b)
+    return jaccard > 0.6
 
 
 async def _maybe_await(fn: Optional[Callable[..., Any]], *args: Any) -> None:
@@ -85,7 +104,7 @@ async def run_agent(
     *,
     max_turns: int = 200,
     auto_continue: bool = True,
-    max_continuations: int = 50,
+    max_continuations: int = DEFAULT_MAX_CONTINUATIONS,
     temperature: float = 0.5,
     max_tokens: int = 16384,
     on_text: Optional[OnTextCallback] = None,
@@ -132,6 +151,7 @@ async def run_agent(
     max_retries = get_max_retries()
     base_delay = get_retry_base_delay()
     heartbeat_timeout = get_heartbeat_timeout()
+    recent_text_responses: list[str] = []
 
     streaming = on_text is not None
 
@@ -181,6 +201,7 @@ async def run_agent(
                     "tool_call_id": tc.id,
                     "content": result_text,
                 })
+            recent_text_responses.clear()
             continue
 
         if response.stop_reason == "max_tokens":
@@ -197,6 +218,17 @@ async def run_agent(
             continue
 
         if response.stop_reason == "end_turn":
+            if TASK_COMPLETE_MARKER in (response.content or ""):
+                break
+
+            if response.content and not response.tool_calls:
+                recent_text_responses.append(response.content.strip())
+                if len(recent_text_responses) > 5:
+                    recent_text_responses.pop(0)
+
+            if _is_completion_loop(recent_text_responses):
+                break
+
             if auto_continue and continuation_count < max_continuations:
                 messages.append({"role": "assistant", "content": response.content})
                 injected = _drain_steer_queue(steer_queue, messages)

@@ -2,8 +2,9 @@
 """
 Unified image generation script — single entry point for all image providers.
 
-Auto-detects provider from IMAGE_API_KEY format:
+Auto-detects provider from IMAGE_API_KEY format and model name:
   - Starts with "nvapi-" → NVIDIA NIM endpoint
+  - Model starts with "agnes-image" → Agnes Images API (/images/generations)
   - Otherwise → OpenAI-compatible chat/completions endpoint
 
 Supports both image generation and editing (with input image).
@@ -15,8 +16,8 @@ Usage:
 
 Environment variables (all IMAGE_* — fully decoupled from writing model):
     IMAGE_API_KEY        API key (required) — auto-detects NVIDIA vs OpenAI
-    IMAGE_BASE_URL       Base URL for OpenAI-compatible endpoint
-    IMAGE_MODEL          Model name (default: agnes-2.0-flash)
+    IMAGE_BASE_URL       Base URL for image API endpoint
+    IMAGE_MODEL          Model name (default: agnes-image-2.1-flash)
 """
 
 import argparse
@@ -39,8 +40,8 @@ if sys.platform == "win32":
 
 # ── Constants ────────────────────────────────────────────────────────────────
 NVIDIA_NIM_BASE_URL = "https://ai.api.nvidia.com/v1/genai"
-DEFAULT_OPENAI_BASE_URL = "https://openrouter.ai/api/v1"
-DEFAULT_IMAGE_MODEL = "agnes-2.0-flash"
+DEFAULT_OPENAI_BASE_URL = "https://apihub.agnes-ai.com/v1"
+DEFAULT_IMAGE_MODEL = "agnes-image-2.1-flash"
 REQUEST_TIMEOUT = 120
 MAX_RETRIES = 3
 DEFAULT_IMAGE_REQUEST_INTERVAL = 4.0
@@ -173,6 +174,11 @@ def _is_nvidia_key(key: str) -> bool:
     return key.startswith("nvapi-")
 
 
+def _is_images_api_model(model: str) -> bool:
+    """Detect models that use the /images/generations endpoint (DALL-E-style API)."""
+    return model.startswith("agnes-image")
+
+
 def get_image_config() -> tuple:
     """Get IMAGE_API_KEY, IMAGE_BASE_URL, IMAGE_MODEL from environment."""
     api_key = os.environ.get("IMAGE_API_KEY") or ""
@@ -183,6 +189,7 @@ def get_image_config() -> tuple:
             "  IMAGE_API_KEY=your-api-key\n\n"
             "Provider auto-detection:\n"
             '  - Key starts with "nvapi-" → NVIDIA NIM\n'
+            '  - Model starts with "agnes-image" → Agnes Images API\n'
             "  - Otherwise → OpenAI-compatible chat/completions endpoint\n"
         )
 
@@ -303,6 +310,105 @@ def _generate_nvidia(
         raise RuntimeError("[ERROR] Image filtered by NVIDIA safety system. Try a different prompt.")
 
     return base64.b64decode(image_b64)
+
+
+# ── Backend: Agnes Images API (/images/generations) ──────────────────────────
+def _generate_images_api(
+    prompt: str,
+    model: str,
+    api_key: str,
+    base_url: str,
+    size: str = "1024x1024",
+    scientific_mode: bool = True,
+) -> bytes:
+    """Generate image via /images/generations endpoint (DALL-E-style API)."""
+    try:
+        import requests
+    except ImportError:
+        raise RuntimeError("[ERROR] 'requests' library required. Install: pip install requests")
+
+    full_prompt = f"{_UNIFIED_STYLE}\n\nUSER REQUEST: {prompt}" if scientific_mode else prompt
+
+    print(f"[IMAGES API] Generating with model: {model}")
+    print(f"  Prompt: {prompt[:80]}{'...' if len(prompt) > 80 else ''}")
+
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+    }
+
+    payload: Dict[str, Any] = {
+        "model": model,
+        "prompt": full_prompt,
+        "n": 1,
+        "size": size,
+        "response_format": "b64_json",
+    }
+
+    last_exception = None
+    for attempt in range(MAX_RETRIES):
+        try:
+            _throttle_image()
+            response = requests.post(
+                f"{base_url}/images/generations",
+                headers=headers,
+                json=payload,
+                timeout=REQUEST_TIMEOUT,
+            )
+
+            if response.status_code == 200:
+                break
+            elif response.status_code == 429:
+                retry_after = response.headers.get("Retry-After")
+                delay = float(retry_after) if retry_after else 2 ** attempt + random.uniform(0, 1)
+                print(f"[WARN] Rate limited. Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                last_exception = RuntimeError(f"Rate limited: {response.text[:200]}")
+            elif response.status_code >= 500:
+                delay = 2 ** attempt + random.uniform(0, 1)
+                print(f"[WARN] Server error ({response.status_code}). Retrying in {delay:.1f}s...")
+                time.sleep(delay)
+                last_exception = RuntimeError(f"Server error: {response.text[:200]}")
+            else:
+                raise RuntimeError(f"[ERROR] API Error ({response.status_code}): {response.text}")
+        except requests.exceptions.Timeout:
+            delay = 2 ** attempt + random.uniform(0, 1)
+            print(f"[WARN] Timeout. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            last_exception = RuntimeError("[ERROR] Request timed out")
+        except requests.exceptions.RequestException as e:
+            delay = 2 ** attempt + random.uniform(0, 1)
+            print(f"[WARN] Request failed: {e}. Retrying in {delay:.1f}s...")
+            time.sleep(delay)
+            last_exception = RuntimeError(f"[ERROR] Request failed: {e}")
+    else:
+        raise last_exception  # type: ignore[misc]
+
+    if response.status_code != 200:
+        raise RuntimeError(f"[ERROR] API Error ({response.status_code}): {response.text}")
+
+    result = response.json()
+
+    if "error" in result:
+        error_msg = result["error"]
+        if isinstance(error_msg, dict):
+            error_msg = error_msg.get("message", str(error_msg))
+        raise RuntimeError(f"[ERROR] API Error: {error_msg}")
+
+    data_list = result.get("data", [])
+    if not data_list:
+        raise RuntimeError("[ERROR] No image data in response.")
+
+    first = data_list[0]
+    if "b64_json" in first:
+        return base64.b64decode(first["b64_json"])
+    elif "url" in first:
+        img_resp = requests.get(first["url"], timeout=60)
+        if img_resp.status_code != 200:
+            raise RuntimeError(f"[ERROR] Failed to download image from URL: {img_resp.status_code}")
+        return img_resp.content
+
+    raise RuntimeError(f"[ERROR] Unexpected response format: {json.dumps(result)[:500]}")
 
 
 # ── Backend: OpenAI-compatible (chat/completions) ────────────────────────────
@@ -508,6 +614,7 @@ def generate_image(
 
     Provider detection:
       - IMAGE_API_KEY starts with "nvapi-" → NVIDIA NIM endpoint
+      - Model starts with "agnes-image" → Agnes /images/generations endpoint
       - Otherwise → OpenAI-compatible chat/completions endpoint
 
     Args:
@@ -549,6 +656,14 @@ def generate_image(
             negative_prompt=negative_prompt,
             scientific_mode=scientific_mode,
         )
+    elif _is_images_api_model(model):
+        # Agnes /images/generations path
+        url = base_url or DEFAULT_OPENAI_BASE_URL
+        image_data = _generate_images_api(
+            prompt=prompt, model=model, api_key=api_key,
+            base_url=url, size=f"{width}x{height}",
+            scientific_mode=scientific_mode,
+        )
     else:
         # OpenAI-compatible chat/completions path
         url = base_url or DEFAULT_OPENAI_BASE_URL
@@ -571,7 +686,7 @@ def generate_image(
     return {
         "model": model,
         "output_path": output_path,
-        "provider": "nvidia" if _is_nvidia_key(api_key) else "openai-compat",
+        "provider": "nvidia" if _is_nvidia_key(api_key) else ("agnes-images" if _is_images_api_model(model) else "openai-compat"),
         "size_bytes": len(image_data),
     }
 
@@ -584,18 +699,19 @@ def main():
         epilog=f"""
 Examples:
   python generate_image.py "Neural network architecture" -o nn.png
-  python generate_image.py "Flowchart" -o flow.png --model agnes-2.0-flash
+  python generate_image.py "Flowchart" -o flow.png --model agnes-image-2.1-flash
   python generate_image.py "Add a hat" -o edited.png --input original.png
   python generate_image.py "Circuit" -o circuit.png --no-scientific
 
 Environment variables (all IMAGE_* — fully decoupled from writing model):
   IMAGE_API_KEY       API key (required) — auto-detects provider
-  IMAGE_BASE_URL      Base URL for OpenAI-compatible endpoint
+  IMAGE_BASE_URL      Base URL for image API endpoint
   IMAGE_MODEL         Model name (default: {DEFAULT_IMAGE_MODEL})
 
 Provider auto-detection:
-  - API key starts with "nvapi-"  → NVIDIA NIM
-  - Otherwise                     → OpenAI-compatible chat/completions
+  - API key starts with "nvapi-"    → NVIDIA NIM
+  - Model starts with "agnes-image" → Agnes Images API (/images/generations)
+  - Otherwise                       → OpenAI-compatible chat/completions
         """,
     )
 

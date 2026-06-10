@@ -18,9 +18,10 @@ ANTHROPIC_API_VERSION: str = "2023-06-01"
 # Agent loop
 # ---------------------------------------------------------------------------
 DEFAULT_MAX_TURNS: int = 200
-DEFAULT_MAX_CONTINUATIONS: int = 50
+DEFAULT_MAX_CONTINUATIONS: int = 10
 DEFAULT_TEMPERATURE: float = 0.5
 DEFAULT_MAX_TOKENS: int = 16384
+TASK_COMPLETE_MARKER: str = "[TASK_COMPLETE]"
 
 # ---------------------------------------------------------------------------
 # Retry / heartbeat

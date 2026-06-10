@@ -6,10 +6,11 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from research_assistant.agent import run_agent, _accumulate_usage, AgentResult
+from research_assistant.agent import run_agent, _accumulate_usage, _is_completion_loop, AgentResult
 from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
 from research_assistant.tools.registry import ToolRegistry
 from research_assistant.models import TokenUsage
+from research_assistant.constants import TASK_COMPLETE_MARKER
 
 
 class MockLLMClient(LLMClient):
@@ -348,6 +349,115 @@ class TestSteerInjection:
         )
 
         assert turns == [1]
+
+
+class TestCompletionDetection:
+    def test_is_completion_loop_empty(self):
+        assert not _is_completion_loop([])
+
+    def test_is_completion_loop_single(self):
+        assert not _is_completion_loop(["Task is done."])
+
+    def test_is_completion_loop_different_messages(self):
+        assert not _is_completion_loop([
+            "Writing the introduction section now.",
+            "Moving on to the methodology section.",
+        ])
+
+    def test_is_completion_loop_similar_messages(self):
+        assert _is_completion_loop([
+            "The task is complete. All files have been created and saved.",
+            "The task is complete. All files have been created and delivered.",
+        ])
+
+    def test_is_completion_loop_identical_messages(self):
+        assert _is_completion_loop([
+            "Done! The paper has been written.",
+            "Done! The paper has been written.",
+        ])
+
+    @pytest.mark.asyncio
+    async def test_task_complete_marker_stops_loop(self):
+        """Agent stops immediately when LLM outputs [TASK_COMPLETE]."""
+        client = MockLLMClient([
+            LLMResponse(
+                content=f"All done. {TASK_COMPLETE_MARKER}",
+                stop_reason="end_turn",
+            ),
+        ])
+        tools = ToolRegistry()
+
+        result = await run_agent(
+            prompt="Write something",
+            system_prompt="",
+            llm_client=client,
+            tools=tools,
+            auto_continue=True,
+            max_continuations=10,
+        )
+
+        assert result.success
+        assert result.turns == 1
+
+    @pytest.mark.asyncio
+    async def test_repeat_detection_stops_loop(self):
+        """Agent stops when LLM repeats similar completion messages."""
+        client = MockLLMClient([
+            LLMResponse(content="The paper is finished. All sections written.", stop_reason="end_turn"),
+            LLMResponse(content="The paper is finished. All sections delivered.", stop_reason="end_turn"),
+        ])
+        tools = ToolRegistry()
+
+        result = await run_agent(
+            prompt="Write a paper",
+            system_prompt="",
+            llm_client=client,
+            tools=tools,
+            auto_continue=True,
+            max_continuations=10,
+        )
+
+        assert result.success
+        assert result.turns == 2
+
+    @pytest.mark.asyncio
+    async def test_tool_calls_reset_repeat_tracker(self):
+        """Tool call activity clears the repeat tracker so work continues."""
+        test_calls = []
+
+        class WorkingClient(LLMClient):
+            def __init__(self):
+                self._call_count = 0
+
+            async def chat(self, messages, **kwargs):
+                self._call_count += 1
+                test_calls.append(self._call_count)
+                if self._call_count == 1:
+                    return LLMResponse(content="Starting work.", stop_reason="end_turn")
+                if self._call_count == 2:
+                    return LLMResponse(
+                        tool_calls=[ToolCall(id="tc_1", name="run_python", arguments={"code": "print('hi')"})],
+                        stop_reason="tool_use",
+                    )
+                return LLMResponse(
+                    content=f"All done. {TASK_COMPLETE_MARKER}",
+                    stop_reason="end_turn",
+                )
+
+            async def close(self):
+                pass
+
+        result = await run_agent(
+            prompt="Do work",
+            system_prompt="",
+            llm_client=WorkingClient(),
+            tools=ToolRegistry(),
+            auto_continue=True,
+            max_continuations=5,
+        )
+
+        assert result.success
+        assert len(test_calls) == 3
 
 
 class TestAgentResult:

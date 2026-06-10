@@ -211,9 +211,9 @@ IMPORTANT - NO FIGURE NUMBERS:
 
         self.verbose = verbose
         self._last_error = None  # Track last error for better reporting
-        self.base_url = os.environ.get("IMAGE_BASE_URL", "https://openrouter.ai/api/v1")
-        self.image_model = os.getenv("IMAGE_MODEL", "agnes-2.0-flash")
-        self.review_model = os.getenv("IMAGE_REVIEW_MODEL", "agnes-2.0-flash")
+        self.base_url = os.environ.get("IMAGE_BASE_URL", "https://apihub.agnes-ai.com/v1")
+        self.image_model = os.getenv("IMAGE_MODEL", "agnes-image-2.1-flash")
+        self.review_model = os.getenv("IMAGE_REVIEW_MODEL", "agnes-image-2.1-flash")
         
     def _log(self, message: str):
         """Log message if verbose mode is enabled."""
@@ -317,7 +317,101 @@ IMPORTANT - NO FIGURE NUMBERS:
 
         # All retries exhausted
         raise last_exception or RuntimeError("API request failed after all retries")
-    
+
+    def _make_images_api_request(self, model: str, prompt: str,
+                                 size: str = "1024x1024",
+                                 max_retries: int = 3) -> bytes:
+        """Generate image via /images/generations endpoint (DALL-E-style API).
+
+        Used for agnes-image models that expose an images/generations endpoint
+        instead of chat/completions.
+
+        Returns:
+            Image bytes.
+        """
+        headers = {
+            "Authorization": f"Bearer {self.api_key}",
+            "Content-Type": "application/json",
+        }
+
+        payload = {
+            "model": model,
+            "prompt": prompt,
+            "n": 1,
+            "size": size,
+            "response_format": "b64_json",
+        }
+
+        base_delay = 2
+        last_exception = None
+
+        for attempt in range(max_retries):
+            self._log(f"Making images/generations request to {model} (attempt {attempt + 1}/{max_retries})...")
+
+            try:
+                response = requests.post(
+                    f"{self.base_url}/images/generations",
+                    headers=headers,
+                    json=payload,
+                    timeout=120
+                )
+
+                if response.status_code == 200:
+                    result = response.json()
+                    if "error" in result:
+                        error_msg = result["error"]
+                        if isinstance(error_msg, dict):
+                            error_msg = error_msg.get("message", str(error_msg))
+                        raise RuntimeError(f"API Error: {error_msg}")
+
+                    data_list = result.get("data", [])
+                    if not data_list:
+                        raise RuntimeError("No image data in response")
+
+                    first = data_list[0]
+                    if "b64_json" in first:
+                        return base64.b64decode(first["b64_json"])
+                    elif "url" in first:
+                        img_resp = requests.get(first["url"], timeout=60)
+                        if img_resp.status_code != 200:
+                            raise RuntimeError(f"Failed to download image: {img_resp.status_code}")
+                        return img_resp.content
+
+                    raise RuntimeError(f"Unexpected response format: {json.dumps(result)[:500]}")
+
+                if response.status_code == 429:
+                    retry_after = response.headers.get("Retry-After")
+                    wait = float(retry_after) if retry_after else base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    self._log(f"Rate limited (429). Waiting {wait:.1f}s before retry...")
+                    time.sleep(wait)
+                    last_exception = RuntimeError(f"Rate limited (HTTP 429)")
+                    continue
+
+                if response.status_code >= 500:
+                    wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                    self._log(f"Server error (HTTP {response.status_code}). Waiting {wait:.1f}s before retry...")
+                    time.sleep(wait)
+                    last_exception = RuntimeError(f"Server error (HTTP {response.status_code})")
+                    continue
+
+                raise RuntimeError(f"API request failed (HTTP {response.status_code}): {response.text[:500]}")
+
+            except requests.exceptions.Timeout:
+                wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                self._log(f"Request timed out. Waiting {wait:.1f}s before retry...")
+                time.sleep(wait)
+                last_exception = RuntimeError("API request timed out after 120 seconds")
+                continue
+
+            except requests.exceptions.RequestException as e:
+                wait = base_delay * (2 ** attempt) + random.uniform(0, 1)
+                self._log(f"Request failed: {e}. Waiting {wait:.1f}s before retry...")
+                time.sleep(wait)
+                last_exception = RuntimeError(f"API request failed: {str(e)}")
+                continue
+
+        raise last_exception or RuntimeError("API request failed after all retries")
+
     def _extract_image_from_response(self, response: Dict[str, Any]) -> Optional[bytes]:
         """
         Extract base64-encoded image from API response.
@@ -427,77 +521,65 @@ IMPORTANT - NO FIGURE NUMBERS:
     
     def generate_image(self, prompt: str) -> Optional[bytes]:
         """
-        Generate an image using Nano Banana Pro.
-        
+        Generate an image. Routes to /images/generations for agnes-image models,
+        or to /chat/completions for other models.
+
         Args:
             prompt: Description of the diagram to generate
-            
+
         Returns:
             Image bytes or None if generation failed
         """
-        self._last_error = None  # Reset error
-        
-        messages = [
-            {
-                "role": "user",
-                "content": prompt
-            }
-        ]
-        
+        self._last_error = None
+
         try:
+            if self.image_model.startswith("agnes-image"):
+                self._log(f"Using images/generations API with {self.image_model}")
+                return self._make_images_api_request(
+                    model=self.image_model,
+                    prompt=prompt,
+                )
+
+            # Chat/completions path for non-Agnes models
+            messages = [{"role": "user", "content": prompt}]
             response = self._make_request(
                 model=self.image_model,
                 messages=messages,
                 modalities=["image", "text"]
             )
-            
-            # Debug: print response structure if verbose
+
             if self.verbose:
                 self._log(f"Response keys: {response.keys()}")
-                if "error" in response:
-                    self._log(f"API Error: {response['error']}")
                 if "choices" in response and response["choices"]:
                     msg = response["choices"][0].get("message", {})
                     self._log(f"Message keys: {msg.keys()}")
-                    # Show content preview without printing huge base64 data
-                    content = msg.get("content", "")
-                    if isinstance(content, str):
-                        preview = content[:200] + "..." if len(content) > 200 else content
-                        self._log(f"Content preview: {preview}")
-                    elif isinstance(content, list):
-                        self._log(f"Content is list with {len(content)} items")
-                        for i, item in enumerate(content[:3]):
-                            if isinstance(item, dict):
-                                self._log(f"  Item {i}: type={item.get('type')}")
-            
-            # Check for API errors in response
+
             if "error" in response:
                 error_msg = response["error"]
                 if isinstance(error_msg, dict):
                     error_msg = error_msg.get("message", str(error_msg))
                 self._last_error = f"API Error: {error_msg}"
-                print(f"鉁?{self._last_error}")
+                print(f"✗ {self._last_error}")
                 return None
-            
+
             image_data = self._extract_image_from_response(response)
             if image_data:
-                self._log(f"鉁?Generated image ({len(image_data)} bytes)")
+                self._log(f"✓ Generated image ({len(image_data)} bytes)")
             else:
                 self._last_error = "No image data in API response - model may not support image generation"
-                self._log(f"鉁?{self._last_error}")
-                # Additional debug info when image extraction fails
+                self._log(f"✗ {self._last_error}")
                 if self.verbose and "choices" in response:
                     msg = response["choices"][0].get("message", {})
                     self._log(f"Full message structure: {json.dumps({k: type(v).__name__ for k, v in msg.items()})}")
-            
+
             return image_data
         except RuntimeError as e:
             self._last_error = str(e)
-            self._log(f"鉁?Generation failed: {self._last_error}")
+            self._log(f"✗ Generation failed: {self._last_error}")
             return None
         except Exception as e:
             self._last_error = f"Unexpected error: {str(e)}"
-            self._log(f"鉁?Generation failed: {self._last_error}")
+            self._log(f"✗ Generation failed: {self._last_error}")
             import traceback
             if self.verbose:
                 traceback.print_exc()

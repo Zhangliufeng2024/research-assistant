@@ -456,7 +456,7 @@ async def run_orchestrated_generation(
         system_prompt="Write a complete paper using PaperBuilder via run_python. Include all figures and references.",
         model=model, work_dir=work_dir,
         api_key=api_key, base_url=base_url, provider=provider,
-        max_continuations=30,
+        max_continuations=10,
     )
     _accum(assembly_result)
 
@@ -478,7 +478,7 @@ async def run_orchestrated_generation(
         system_prompt="Review the paper document, fix issues, write review documents.",
         model=model, work_dir=work_dir,
         api_key=api_key, base_url=base_url, provider=provider,
-        max_continuations=20,
+        max_continuations=10,
     )
     _accum(review_result)
 
