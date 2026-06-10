@@ -3,7 +3,7 @@
 Decomposes a paper generation task into parallel sub-tasks:
   Phase 1: Planner agent -> section list + figure list
   Phase 2: N research agents (parallel) + M figure agents (parallel)
-  Phase 3: Assembly agent -> writes final LaTeX paper
+  Phase 3: Assembly agent -> writes final Word document via PaperBuilder
   Phase 4: Review agent -> quality check + fixes
 
 Each agent is an independent agent loop session. Coordination through filesystem.
@@ -438,7 +438,7 @@ async def run_orchestrated_generation(
     figures_info = "\n".join(f"- {fg.name}: {fg.description} -> {fg.filename}" for fg in plan.figures)
     bib_files = "\n".join(f"- {r.files_written[0] if r.files_written else 'N/A'}" for r in research_results if r.success)
 
-    tex_file = output_dir / "drafts" / "v1_draft.tex"
+    tex_file = output_dir / "drafts" / "v1_draft.tex"  # kept for legacy .tex input detection
     docx_file = output_dir / "drafts" / "v1_draft.docx"
     bib_file = output_dir / "references" / "references.bib"
 

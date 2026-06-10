@@ -441,7 +441,7 @@ def _print_help():
     print("  exit/quit           End session")
     print("\nData Files:")
     print("  Place files in data/ folder to include in your paper")
-    print("  .tex -> drafts/, images -> figures/, data -> data/")
+    print("  .docx/.tex -> drafts/, images -> figures/, data -> data/")
     print("=" * 70)
 
 
