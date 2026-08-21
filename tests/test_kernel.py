@@ -279,10 +279,14 @@ class TestMaybeCompact:
         msgs = _long_history(40)
         await maybe_compact(msgs, llm_client=client, model="m", last_input_tokens=190_000)
         first_summary = str(msgs[1]["content"])
-        # Grow again and recompact.
-        msgs.extend(_tool_exchange(100))
+        # Grow well past the minimum span again, then recompact.
+        for j in range(20):
+            msgs.extend(_tool_exchange(100 + j))
         msgs.append({"role": "assistant", "content": "still going"})
-        await maybe_compact(msgs, llm_client=client, model="m", last_input_tokens=190_000)
+        _, compacted_again = await maybe_compact(
+            msgs, llm_client=client, model="m", last_input_tokens=190_000,
+        )
+        assert compacted_again
         assert str(msgs[1]["content"]) != first_summary
         # Only one summary block at index 1 — no nesting.
         assert sum("[CONTEXT SUMMARY" in str(m.get("content", "")) for m in msgs) == 1

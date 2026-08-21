@@ -225,10 +225,16 @@ async def maybe_compact(
             f"{summary}"
         ),
     }
-    if len(messages) > 1 and SUMMARY_MARKER in str(messages[1].get("content", "")):
+    had_previous_summary = (
+        len(messages) > 1 and SUMMARY_MARKER in str(messages[1].get("content", ""))
+    )
+    if had_previous_summary:
+        # Replace in place: the old span occupied [1:cut); index 1 is now the
+        # refreshed summary, so drop [2:cut).
         messages[1] = summary_msg
+        del messages[2:cut]
     else:
+        # Fresh insert shifts everything up one: the span moved to [2:cut+1).
         messages.insert(1, summary_msg)
-
-    del messages[2:cut + 1]
+        del messages[2:cut + 1]
     return messages, True
