@@ -42,24 +42,110 @@ def ensure_dotenv_loaded() -> None:
         pass
 
 
+SYNC_MANIFEST_NAME = ".sync_manifest.json"
+
+
+def _file_hash(path: Path) -> str:
+    import hashlib
+
+    digest = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(65536), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def sync_tree(source_dir: Path, dest_dir: Path) -> dict:
+    """Incrementally mirror *source_dir* into *dest_dir*.
+
+    Fixes the long-standing bug where ``copytree(dirs_exist_ok=True)`` left
+    stale skill copies on user machines forever. Rules:
+
+    - new/changed tracked files are copied;
+    - previously-synced files that vanished from the source are deleted;
+    - **existing untracked files are never touched** — a WRITER.md the user
+      edited locally stays theirs until they delete it;
+    - a ``.sync_manifest.json`` of content hashes records what we shipped.
+
+    Returns ``{"updated": int, "removed": int}``.
+    """
+    import json as _json
+
+    manifest_path = dest_dir / SYNC_MANIFEST_NAME
+    old: dict[str, str] = {}
+    if manifest_path.exists():
+        try:
+            old = _json.loads(manifest_path.read_text(encoding="utf-8")) or {}
+        except (OSError, ValueError):
+            old = {}
+
+    source_files: dict[str, str] = {}
+    for p in sorted(source_dir.rglob("*")):
+        if p.is_file():
+            rel = p.relative_to(source_dir).as_posix()
+            if rel == SYNC_MANIFEST_NAME or "__pycache__" in p.parts:
+                continue
+            try:
+                source_files[rel] = _file_hash(p)
+            except OSError:
+                continue
+
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    updated = removed = 0
+
+    for rel, digest in source_files.items():
+        target = dest_dir / rel
+        if old.get(rel) == digest and target.exists():
+            continue                      # unchanged since last sync
+        if target.exists() and rel not in old:
+            continue                      # user-created file — hands off
+        target.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(source_dir / rel, target)
+        updated += 1
+
+    for rel in list(old.keys()):
+        if rel not in source_files:
+            target = dest_dir / rel
+            try:
+                if target.exists():
+                    target.unlink()
+                    removed += 1
+            except OSError:
+                pass
+
+    try:
+        manifest_path.write_text(
+            _json.dumps(source_files, indent=0, sort_keys=True), encoding="utf-8",
+        )
+    except OSError:
+        pass
+    return {"updated": updated, "removed": removed}
+
+
 def setup_claude_skills(package_dir: Path, work_dir: Path) -> None:
     """
-    Set up Claude skills and WRITER.md by copying .claude/ from package to working directory.
-    
+    Set up Claude skills and WRITER.md by syncing .claude/ from package to
+    the working directory (incremental, version-aware).
+
     Args:
         package_dir: Package installation directory containing .claude/
-        work_dir: User's working directory where .claude/ should be copied
+        work_dir: User's working directory where .claude/ should be synced
     """
     source_claude = package_dir / ".claude"
     dest_claude = work_dir / ".claude"
 
-    # Copy .claude directory (which includes skills/ and WRITER.md) if source exists
     if source_claude.exists():
         try:
-            shutil.copytree(source_claude, dest_claude, dirs_exist_ok=True)
+            report = sync_tree(source_claude, dest_claude)
+            if report["updated"] or report["removed"]:
+                print(
+                    f"[research-assistant] Skills synced "
+                    f"({report['updated']} updated, {report['removed']} removed)",
+                    file=sys.stderr,
+                )
         except Exception as e:
             print(
-                f"[research-assistant] Warning: Could not copy skills to {dest_claude}: {e}",
+                f"[research-assistant] Warning: Could not sync skills to {dest_claude}: {e}",
                 file=sys.stderr,
             )
 
@@ -87,10 +173,10 @@ def get_api_key(api_key: str | None = None) -> str:
 def load_system_instructions(work_dir: Path) -> str:
     """
     Load system instructions from .claude/WRITER.md in the working directory.
-    
+
     Args:
         work_dir: Working directory containing .claude/WRITER.md.
-        
+
     Returns:
         System instructions string.
     """
@@ -110,11 +196,11 @@ def load_system_instructions(work_dir: Path) -> str:
 def ensure_output_folder(cwd: Path, custom_dir: str | None = None) -> Path:
     """
     Ensure the writing_outputs folder exists.
-    
+
     Args:
         cwd: Current working directory (project root).
         custom_dir: Optional custom output directory path.
-        
+
     Returns:
         Path to the output folder.
     """
@@ -150,11 +236,11 @@ def get_data_extensions() -> frozenset[str]:
 def get_data_files(cwd: Path, data_files: list[str] | None = None) -> list[Path]:
     """
     Get data files either from provided list or from data folder.
-    
+
     Args:
         cwd: Current working directory (project root).
         data_files: Optional list of file paths. If not provided, reads from data/ folder.
-        
+
     Returns:
         List of Path objects for data files.
     """
@@ -176,14 +262,14 @@ def get_data_files(cwd: Path, data_files: list[str] | None = None) -> list[Path]
 def extract_images_from_docx(docx_path: Path, figures_output: Path) -> list[dict[str, Any]]:
     """
     Extract all images from a .docx file and copy them to the figures folder.
-    
+
     A .docx file is a ZIP archive containing images in the word/media/ directory.
     This function extracts all image files and copies them to the specified output directory.
-    
+
     Args:
         docx_path: Path to the .docx file.
         figures_output: Path to the figures output directory.
-        
+
     Returns:
         List of dictionaries containing information about extracted images.
         Each dict has 'name', 'path', and 'source_docx' keys.
@@ -236,18 +322,18 @@ def process_data_files(
 ) -> dict[str, Any] | None:
     """
     Process data files by copying them to the paper output folder.
-    Manuscript files (.tex) go to drafts/, 
+    Manuscript files (.tex) go to drafts/,
     Source files (.md, .docx, .pdf) go to sources/,
-    images go to figures/, 
+    images go to figures/,
     data files (csv, json, etc.) go to data/,
     everything else goes to sources/.
-    
+
     Args:
         cwd: Current working directory (project root).
         data_files: List of file paths to process.
         paper_output_path: Path to the paper output directory.
         delete_originals: Whether to delete original files after copying.
-        
+
     Returns:
         Dictionary with information about processed files, or None if no files.
     """
@@ -268,7 +354,7 @@ def process_data_files(
 
     image_extensions = get_image_extensions()
     manuscript_extensions = get_manuscript_extensions()
-    source_extensions = get_source_extensions()
+    get_source_extensions()
     data_extensions = get_data_extensions()
 
     processed_info = {
@@ -361,10 +447,10 @@ def process_data_files(
 def create_data_context_message(processed_info: dict[str, Any] | None) -> str:
     """
     Create a context message about available data files.
-    
+
     Args:
         processed_info: Dictionary with processed file information.
-        
+
     Returns:
         Context message string.
     """

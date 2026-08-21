@@ -347,7 +347,7 @@ async def _verify_batch(
         raw = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list = []
-    for ref, outcome in zip(refs, raw):
+    for ref, outcome in zip(refs, raw, strict=False):
         if isinstance(outcome, Exception):
             results.append(CitationResult(
                 key=ref.key, title=ref.title or "",

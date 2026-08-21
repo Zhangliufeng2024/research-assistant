@@ -163,7 +163,7 @@ def _parse_plan(text: str) -> OrchestrationPlan:
     try:
         data = json.loads(json_str)
     except json.JSONDecodeError as e:
-        raise ValueError(f"Invalid JSON from planner: {e}\nRaw: {json_str[:500]}")
+        raise ValueError(f"Invalid JSON from planner: {e}\nRaw: {json_str[:500]}") from e
 
     plan = OrchestrationPlan(
         paper_title=data.get("paper_title", ""),
@@ -439,7 +439,7 @@ async def run_orchestrated_generation(
     figures_info = "\n".join(f"- {fg.name}: {fg.description} -> {fg.filename}" for fg in plan.figures)
     bib_files = "\n".join(f"- {r.files_written[0] if r.files_written else 'N/A'}" for r in research_results if r.success)
 
-    tex_file = output_dir / "drafts" / "v1_draft.tex"  # kept for legacy .tex input detection
+    output_dir / "drafts" / "v1_draft.tex"  # kept for legacy .tex input detection
     docx_file = output_dir / "drafts" / "v1_draft.docx"
     bib_file = output_dir / "references" / "references.bib"
 

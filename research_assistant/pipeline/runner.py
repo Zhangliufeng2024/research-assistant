@@ -205,7 +205,9 @@ async def run_pipeline(
             auto_continue=False, max_continuations=5,
         )
         if _cancelled():
-            session.finish("cancelled", budget.snapshot()); yield _t("Cancelled."); return
+            session.finish("cancelled", budget.snapshot())
+            yield _t("Cancelled.")
+            return
         try:
             if not result.success or not result.text_output.strip():
                 raise ValueError(result.error or "empty planner output")
@@ -305,7 +307,7 @@ async def run_pipeline(
     partial = False
     labels = [f"research:{s.name}" for s in plan.sections] + \
              [f"figure:{fg.name}" for fg in plan.figures]
-    for label, outcome in zip(labels, outcomes):
+    for label, outcome in zip(labels, outcomes, strict=False):
         if isinstance(outcome, Exception):
             partial = True
             yield _t(f"  [{label}] FAILED: {outcome}")
@@ -355,7 +357,9 @@ async def run_pipeline(
         max_continuations=12,
     )
     if _cancelled():
-        session.finish("cancelled", budget.snapshot()); yield _t("Cancelled."); return
+        session.finish("cancelled", budget.snapshot())
+        yield _t("Cancelled.")
+        return
 
     # Robustness: merge per-section bibs when assembly didn't produce one.
     if not bib_file.exists():
@@ -410,11 +414,13 @@ async def run_pipeline(
 
     while not gate_report.passed and revision_round < max_revision_rounds:
         if _cancelled():
-            session.finish("cancelled", budget.snapshot()); yield _t("Cancelled."); return
+            session.finish("cancelled", budget.snapshot())
+            yield _t("Cancelled.")
+            return
         revision_round += 1
         yield _p(f"[Phase 3b] Quality gates failed — revision round "
                  f"{revision_round}/{max_revision_rounds}", "revision")
-        rev = await _agent(
+        await _agent(
             f"revision_{revision_round}",
             _REVISION_PROMPT.format(
                 output_dir=output_dir, docx_file=docx_file, bib_file=bib_file,

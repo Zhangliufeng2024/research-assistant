@@ -193,7 +193,7 @@ MID-EXECUTION STEERING:
                 print("\nRetrying...\n")
                 await _run_query(prompt, silent=silent)
             elif choice == "q":
-                raise SystemExit(0)
+                raise SystemExit(0) from None
 
         except ContextLimitError:
             print(

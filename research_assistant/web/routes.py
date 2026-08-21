@@ -110,8 +110,8 @@ async def get_paper(paper_name: str, request: Request):
 
     try:
         safe_resolve(paper_dir, output_folder)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="路径不合法")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="路径不合法") from exc
 
     if not paper_dir.is_dir():
         raise HTTPException(status_code=404, detail="文档不存在")
@@ -159,14 +159,14 @@ async def serve_file(paper_name: str, file_path: str, request: Request):
 
     try:
         safe_resolve(paper_dir, output_folder)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="路径不合法")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="路径不合法") from exc
 
     full_path = paper_dir / file_path
     try:
         safe_resolve(full_path, paper_dir)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="路径不合法")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="路径不合法") from exc
 
     if not full_path.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
@@ -198,8 +198,8 @@ async def delete_paper(paper_name: str, request: Request):
 
     try:
         safe_resolve(paper_dir, output_folder)
-    except ValueError:
-        raise HTTPException(status_code=403, detail="路径不合法")
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="路径不合法") from exc
 
     if not paper_dir.is_dir():
         raise HTTPException(status_code=404, detail="文档不存在")

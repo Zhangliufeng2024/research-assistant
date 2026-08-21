@@ -13,7 +13,7 @@ def _utc_iso_now() -> str:
 @dataclass
 class ProgressUpdate:
     """Progress update during document generation.
-    
+
     Attributes:
         type: Always "progress" to distinguish from result messages
         timestamp: ISO 8601 timestamp of the update
@@ -90,7 +90,7 @@ class PaperFiles:
 @dataclass
 class TokenUsage:
     """Token usage statistics.
-    
+
     Attributes:
         input_tokens: Total input tokens consumed
         output_tokens: Total output tokens consumed

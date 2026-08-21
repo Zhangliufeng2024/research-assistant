@@ -8,10 +8,10 @@ from typing import Any
 def find_existing_papers(output_folder: Path) -> list[dict[str, Any]]:
     """
     Get all existing paper directories with their metadata.
-    
+
     Args:
         output_folder: Path to the paper outputs folder.
-        
+
     Returns:
         List of dicts with path, name, and timestamp info.
     """
@@ -35,11 +35,11 @@ def find_existing_papers(output_folder: Path) -> list[dict[str, Any]]:
 def detect_paper_reference(user_input: str, existing_papers: list[dict[str, Any]]) -> Path | None:
     """
     Try to detect if the user is referring to an existing paper.
-    
+
     Args:
         user_input: User's input text.
         existing_papers: List of existing paper dictionaries.
-        
+
     Returns:
         The paper path if found, None otherwise.
     """
@@ -117,10 +117,10 @@ def detect_paper_reference(user_input: str, existing_papers: list[dict[str, Any]
 def scan_paper_directory(paper_dir: Path) -> dict[str, Any]:
     """
     Scan a paper directory and collect all file information.
-    
+
     Args:
         paper_dir: Path to the paper directory.
-        
+
     Returns:
         Dictionary with comprehensive file information.
     """
@@ -209,10 +209,10 @@ def scan_paper_directory(paper_dir: Path) -> dict[str, Any]:
 def count_citations_in_bib(bib_file: str | None) -> int:
     """
     Count the number of citations in a BibTeX file.
-    
+
     Args:
         bib_file: Path to the .bib file.
-        
+
     Returns:
         Number of citations found.
     """
@@ -237,10 +237,10 @@ def count_citations_in_bib(bib_file: str | None) -> int:
 def extract_citation_style(bib_file: str | None) -> str:
     """
     Try to extract citation style from BibTeX file or paper metadata.
-    
+
     Args:
         bib_file: Path to the .bib file.
-        
+
     Returns:
         Citation style name (default: "BibTeX").
     """
@@ -252,10 +252,10 @@ def extract_citation_style(bib_file: str | None) -> str:
 def count_words_in_tex(tex_file: str | None) -> int | None:
     """
     Estimate word count in a LaTeX file.
-    
+
     Args:
         tex_file: Path to the .tex file.
-        
+
     Returns:
         Estimated word count, or None if file doesn't exist.
     """
@@ -286,10 +286,10 @@ def count_words_in_tex(tex_file: str | None) -> int | None:
 def extract_title_from_tex(tex_file: str | None) -> str | None:
     """
     Extract title from a LaTeX file.
-    
+
     Args:
         tex_file: Path to the .tex file.
-        
+
     Returns:
         Title string, or None if not found.
     """

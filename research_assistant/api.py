@@ -153,9 +153,17 @@ async def generate_paper(
     )
     tool_registry = ToolRegistry(work_dir=str(work_dir))
 
+    from .session.store import SessionStore
+    single_session = SessionStore.create(
+        work_dir / "writing_outputs" / target_dir_name,
+        query=query, model=model, mode="single",
+    )
+    single_session.log_event("run_start", {"query_chars": len(query)})
+
     collected_text_parts: list[str] = []
     tool_call_count = 0
     files_written: list[str] = []
+    budget = None
 
     yield ProgressUpdate(
         message="Starting document generation",
@@ -183,9 +191,8 @@ async def generate_paper(
         from .agent import RunConfig
         from .kernel.budget import BudgetGuard
 
-        budget = BudgetGuard(
-            limits=budget_limits, model=model,
-        ) if budget_limits is not None else None
+        if budget_limits is not None:
+            budget = BudgetGuard(limits=budget_limits, model=model)
         agent_result = await run_agent(
             prompt=query,
             system_prompt=system_instructions,
@@ -198,6 +205,9 @@ async def generate_paper(
             ),
             on_text=_on_text,
             on_tool_use=_on_tool,
+        )
+        single_session.finish(
+            "complete", budget.snapshot() if budget is not None else None,
         )
 
         full_text = "".join(collected_text_parts)
@@ -237,11 +247,13 @@ async def generate_paper(
         yield result.to_dict()
 
     except ContextLimitError as e:
+        single_session.finish("failed", budget.snapshot() if budget else None)
         error_result = _create_error_result(
             f"Context/token limit exceeded: {e.original}. Start a new session."
         )
         yield error_result
     except Exception as e:
+        single_session.finish("failed", budget.snapshot() if budget else None)
         yield _create_error_result(f"Error during document generation: {e}")
     finally:
         await llm_client.close()

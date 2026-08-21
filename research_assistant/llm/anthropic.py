@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import os
 import uuid
 from typing import Any
 
@@ -18,6 +19,45 @@ from .base import LLMClient, LLMResponse, OnChunkCallback, ToolCall
 from .errors import classify_response
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
+
+_CACHE_CONTROL = {"type": "ephemeral"}
+
+
+def _apply_cache_control(body: dict[str, Any]) -> None:
+    """Mark cache breakpoints so the static prefix is billed at cache rates.
+
+    Breakpoints cover (in cost order of impact):
+      1. tools — identical every turn
+      2. system — the long WRITER.md prompt, identical every turn
+      3. last message — gives the growing conversation an incremental
+         breakpoint, so each turn only re-processes the new tail.
+
+    Sub-1024-token prefixes simply don't cache (no API error), so this is
+    always safe to enable.
+    """
+    if body.get("tools"):
+        body["tools"][-1] = {**body["tools"][-1], "cache_control": _CACHE_CONTROL}
+
+    system = body.get("system")
+    if isinstance(system, str):
+        body["system"] = [{"type": "text", "text": system, "cache_control": _CACHE_CONTROL}]
+    elif isinstance(system, list) and system:
+        system[-1] = {**system[-1], "cache_control": _CACHE_CONTROL}
+
+    messages = body.get("messages") or []
+    if messages:
+        content = messages[-1].get("content")
+        if isinstance(content, str):
+            messages[-1]["content"] = [
+                {"type": "text", "text": content, "cache_control": _CACHE_CONTROL}
+            ]
+        elif isinstance(content, list) and content:
+            content[-1] = {**content[-1], "cache_control": _CACHE_CONTROL}
+
+
+def caching_enabled() -> bool:
+    """Prompt caching is on by default; ANTHROPIC_PROMPT_CACHE=0 disables it."""
+    return os.getenv("ANTHROPIC_PROMPT_CACHE", "true").lower() not in ("0", "false", "no", "off")
 
 
 def _convert_tools_to_anthropic(tools: list[dict] | None) -> list[dict]:
@@ -89,11 +129,13 @@ def _build_anthropic_messages(messages: list[dict]) -> list[dict]:
 class AnthropicClient(LLMClient):
     """Anthropic Messages API client."""
 
-    def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_ANTHROPIC_MODEL):
+    def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_ANTHROPIC_MODEL,
+                 enable_cache: bool | None = None):
         super().__init__()  # initialises per-instance throttle state
         self.api_key = api_key
         self.base_url = (base_url or ANTHROPIC_DEFAULT_BASE_URL).rstrip("/")
         self.model = model
+        self.enable_cache = caching_enabled() if enable_cache is None else enable_cache
         self._client = httpx.AsyncClient(
             timeout=httpx.Timeout(HTTP_TIMEOUT_SECONDS, connect=HTTP_CONNECT_TIMEOUT_SECONDS),
         )
@@ -130,6 +172,9 @@ class AnthropicClient(LLMClient):
         anthropic_tools = _convert_tools_to_anthropic(tools)
         if anthropic_tools:
             body["tools"] = anthropic_tools
+
+        if self.enable_cache:
+            _apply_cache_control(body)
 
         await self._throttle()
 

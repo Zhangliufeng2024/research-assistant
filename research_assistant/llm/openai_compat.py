@@ -14,6 +14,14 @@ from .errors import classify_response
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
+# Models that require `max_completion_tokens` and reject custom temperature.
+_REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5", "chatgpt-4o")
+
+
+def uses_completion_tokens(model: str) -> bool:
+    low = (model or "").lower()
+    return any(low.startswith(p) for p in _REASONING_MODEL_PREFIXES)
+
 
 def _convert_tools_to_openai(tools: list[dict] | None) -> list[dict]:
     """Convert unified tool schemas to OpenAI function-calling format."""
@@ -109,9 +117,14 @@ class OpenAICompatClient(LLMClient):
         body: dict[str, Any] = {
             "model": self.model,
             "messages": _build_openai_messages(messages, system),
-            "temperature": temperature,
-            "max_tokens": max_tokens,
         }
+        if uses_completion_tokens(self.model):
+            # Reasoning models require the new parameter name and reject
+            # sampling controls other than the default temperature.
+            body["max_completion_tokens"] = max_tokens
+        else:
+            body["temperature"] = temperature
+            body["max_tokens"] = max_tokens
         openai_tools = _convert_tools_to_openai(tools)
         if openai_tools:
             body["tools"] = openai_tools

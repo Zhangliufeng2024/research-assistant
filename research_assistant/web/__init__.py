@@ -7,10 +7,10 @@ def main():
     """Entry point: research-assistant-web command."""
     try:
         import uvicorn
-    except ImportError:
+    except ImportError as exc:
         print("Error: Web dependencies not installed.")
         print("Run: pip install research-assistant[web]")
-        raise SystemExit(1)
+        raise SystemExit(1) from exc
 
     uvicorn.run(
         "research_assistant.web.app:create_app",

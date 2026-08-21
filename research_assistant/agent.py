@@ -77,6 +77,9 @@ class RunConfig:
     hooks: HookBus | None = None
     #: Cooperative cancellation; checked between turns and before each tool.
     cancel_event: asyncio.Event | None = None
+    #: Optional permission policy mounted as a PRE_TOOL_USE hook. When None,
+    #: the default is built from RA_PERMISSION_MODE (deny_dangerous | off).
+    permission_policy: Any | None = None
     #: Write oversized tool results to .ra/tool_outputs/ instead of the history.
     externalize_outputs: bool = True
     #: Summarize old history when nearing the model's context window.
@@ -153,7 +156,7 @@ class _ActivityWatchdog:
                         await task
                     except (asyncio.CancelledError, Exception):
                         pass
-                    raise HeartbeatTimeoutError(self.timeout)
+                    raise HeartbeatTimeoutError(self.timeout) from None
         finally:
             if not task.done():
                 task.cancel()
@@ -214,6 +217,15 @@ async def run_agent(
         )
 
     hooks = cfg.hooks if cfg.hooks is not None else HookBus()
+
+    # Mount the permission policy (default from env) unless explicitly off.
+    if cfg.permission_policy is not None:
+        hooks.on(EventKind.PRE_TOOL_USE, cfg.permission_policy.as_hook)
+    else:
+        from .tools.permissions import policy_from_env
+        default_policy = policy_from_env()
+        if default_policy is not None:
+            hooks.on(EventKind.PRE_TOOL_USE, default_policy.as_hook)
     if cfg.budget is not None:
         budget = cfg.budget
     elif cfg.auto_budget:
@@ -288,7 +300,7 @@ async def run_agent(
         # --- LLM call ------------------------------------------------------
         watchdog = _ActivityWatchdog(heartbeat_timeout)
 
-        async def _do_call() -> LLMResponse:
+        async def _do_call(watchdog=watchdog, messages=messages) -> LLMResponse:
             kwargs: dict[str, Any] = {}
             if use_activity:
                 kwargs["on_activity"] = watchdog.beat
@@ -308,6 +320,10 @@ async def run_agent(
             raise
         except Exception as exc:
             await _emit(EventKind.ERROR, payload={"error": str(exc)})
+            # RUN_END must fire even when the run dies mid-loop.
+            await _emit(EventKind.RUN_END, payload={
+                "stop_reason": "error", "turns": n_llm_calls,
+            })
             raise
 
         _accumulate_usage(total_usage, response)
@@ -384,6 +400,9 @@ async def run_agent(
                     "role": "tool",
                     "tool_call_id": tc.id,
                     "content": result_text,
+                    # Providers surface this to the model (Anthropic sets
+                    # is_error on the tool_result block).
+                    "is_error": result_text.startswith(("Error:", "[DENIED by policy]")),
                 })
             else:
                 recent_text_responses.clear()
@@ -484,12 +503,9 @@ async def _llm_call_with_retry(
         except Exception as exc:
             last_exc = exc
 
-            # Structured errors carry their own verdict.
+            # Typed, non-retryable errors propagate as-is (no re-wrapping,
+            # no duplicated messages). Retryable ones fall through below.
             if isinstance(exc, LLMError) and not exc.retryable:
-                if isinstance(exc, ContextLimitError) or _is_context_limit(exc):
-                    raise
-                if isinstance(exc, ModelConfigError) or _is_model_error(exc):
-                    raise
                 raise
 
             if _is_context_limit(exc):
