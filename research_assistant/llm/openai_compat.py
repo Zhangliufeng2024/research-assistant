@@ -7,7 +7,8 @@ from typing import Any, Optional
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback, _throttle_llm
+from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
+from .errors import classify_response
 from ..models import TokenUsage
 from ..constants import DEFAULT_OPENAI_MODEL, HTTP_TIMEOUT_SECONDS, HTTP_CONNECT_TIMEOUT_SECONDS
 
@@ -77,6 +78,7 @@ class OpenAICompatClient(LLMClient):
     """OpenAI-compatible Chat Completions API client."""
 
     def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_OPENAI_MODEL):
+        super().__init__()  # initialises per-instance throttle state
         self.api_key = api_key
         self.base_url = (base_url or OPENAI_DEFAULT_BASE_URL).rstrip("/")
         self.model = model
@@ -113,7 +115,7 @@ class OpenAICompatClient(LLMClient):
         if openai_tools:
             body["tools"] = openai_tools
 
-        await _throttle_llm()
+        await self._throttle()
 
         if on_chunk is not None:
             body["stream"] = True
@@ -122,7 +124,7 @@ class OpenAICompatClient(LLMClient):
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:
-            raise RuntimeError(f"OpenAI-compatible API error ({resp.status_code}): {resp.text}")
+            raise classify_response(resp.status_code, dict(resp.headers), resp.text)
 
         data = resp.json()
         return self._parse_response(data)
@@ -143,7 +145,7 @@ class OpenAICompatClient(LLMClient):
         async with self._client.stream("POST", url, headers=headers, json=body) as resp:
             if resp.status_code != 200:
                 await resp.aread()
-                raise RuntimeError(f"OpenAI-compatible API error ({resp.status_code}): {resp.text}")
+                raise classify_response(resp.status_code, dict(resp.headers), resp.text)
 
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):

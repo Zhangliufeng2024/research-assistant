@@ -29,6 +29,12 @@ from .constants import (
     DEFAULT_RETRY_BASE_DELAY,
     DEFAULT_HEARTBEAT_TIMEOUT,
 )
+from .llm.errors import (  # noqa: F401  (re-exported for backward compatibility)
+    LLMError,
+    ContextLimitError,
+    ModelConfigError,
+    HeartbeatTimeoutError,
+)
 
 
 def _safe_int(value: str | None, default: int) -> int:
@@ -66,16 +72,10 @@ def get_heartbeat_timeout() -> float:
 # ---------------------------------------------------------------------------
 # Custom exceptions
 # ---------------------------------------------------------------------------
-
-class HeartbeatTimeoutError(Exception):
-    """Raised when no message is received from the agent within the heartbeat window."""
-
-    def __init__(self, timeout: float):
-        self.timeout = timeout
-        super().__init__(
-            f"No output received from the agent for {timeout:.0f} seconds. "
-            "The session may be stuck."
-        )
+# HeartbeatTimeoutError / ContextLimitError / ModelConfigError are now defined
+# in research_assistant.llm.errors with a structured retryable flag and
+# re-exported here so existing ``from .retry import ...`` keeps working.
+# ---------------------------------------------------------------------------
 
 
 # ---------------------------------------------------------------------------
@@ -154,36 +154,8 @@ _MODEL_ERROR_MESSAGES = (
 )
 
 
-class ContextLimitError(Exception):
-    """Raised when the API rejects a request due to exceeding the token/context limit.
-
-    This is NOT retryable — repeating the same request will always fail.
-    The caller should inform the user and suggest starting a new session or
-    reducing the input size.
-    """
-
-    def __init__(self, original: BaseException):
-        self.original = original
-        super().__init__(
-            f"Context/token limit exceeded: {original}. "
-            "Start a new session or reduce the prompt size."
-        )
-
-
-class ModelConfigError(Exception):
-    """Raised when the API rejects the model name (HTTP 400 "Not supported model").
-
-    This is NOT retryable — the model name is wrong or unsupported by the gateway.
-    The caller should inform the user to check LLM_MODEL in .env.
-    """
-
-    def __init__(self, original: BaseException):
-        self.original = original
-        super().__init__(
-            f"Model configuration error: {original}\n"
-            "Check LLM_MODEL in your .env file — "
-            "the model may not be supported by your API gateway."
-        )
+# ContextLimitError / ModelConfigError / HeartbeatTimeoutError are imported
+# from llm.errors at the top of this module (backward-compatible re-export).
 
 
 def _is_context_limit(exc: BaseException) -> bool:
@@ -200,6 +172,10 @@ def _is_model_error(exc: BaseException) -> bool:
 
 def _is_retryable(exc: BaseException) -> bool:
     """Return True if the exception represents a transient error worth retrying."""
+    # Structured errors from llm/errors.py carry their own classification.
+    if isinstance(exc, LLMError):
+        return exc.retryable
+
     # Context limit errors are never retryable — raise them immediately as ContextLimitError.
     if _is_context_limit(exc):
         return False

@@ -7,7 +7,8 @@ from typing import Any, Optional
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback, _throttle_llm
+from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
+from .errors import classify_response
 from ..models import TokenUsage
 from ..constants import (
     ANTHROPIC_API_VERSION,
@@ -89,6 +90,7 @@ class AnthropicClient(LLMClient):
     """Anthropic Messages API client."""
 
     def __init__(self, api_key: str, base_url: str = "", model: str = DEFAULT_ANTHROPIC_MODEL):
+        super().__init__()  # initialises per-instance throttle state
         self.api_key = api_key
         self.base_url = (base_url or ANTHROPIC_DEFAULT_BASE_URL).rstrip("/")
         self.model = model
@@ -128,7 +130,7 @@ class AnthropicClient(LLMClient):
         if anthropic_tools:
             body["tools"] = anthropic_tools
 
-        await _throttle_llm()
+        await self._throttle()
 
         if on_chunk is not None:
             body["stream"] = True
@@ -137,7 +139,7 @@ class AnthropicClient(LLMClient):
         resp = await self._client.post(url, headers=headers, json=body)
 
         if resp.status_code != 200:
-            raise RuntimeError(f"Anthropic API error ({resp.status_code}): {resp.text}")
+            raise classify_response(resp.status_code, dict(resp.headers), resp.text)
 
         data = resp.json()
         return self._parse_response(data)
@@ -163,7 +165,7 @@ class AnthropicClient(LLMClient):
         async with self._client.stream("POST", url, headers=headers, json=body) as resp:
             if resp.status_code != 200:
                 await resp.aread()
-                raise RuntimeError(f"Anthropic API error ({resp.status_code}): {resp.text}")
+                raise classify_response(resp.status_code, dict(resp.headers), resp.text)
 
             async for line in resp.aiter_lines():
                 if not line.startswith("data: "):
