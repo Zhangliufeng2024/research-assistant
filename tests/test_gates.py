@@ -18,6 +18,7 @@ def _report(*statuses: str) -> VerificationReport:
         rep.results.append(CitationResult(
             key=f"key{i}", title=f"Paper {i}", status=s,
             confidence=0.95 if s == "verified" else 0.3,
+            doi="", year=2024, authors="Author",
         ))
         if s == "verified":
             rep.verified += 1
