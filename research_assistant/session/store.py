@@ -11,9 +11,9 @@ from __future__ import annotations
 import json
 import time
 import uuid
-from dataclasses import dataclass, field, asdict
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 SCHEMA_VERSION = 1
 
@@ -84,7 +84,7 @@ class SessionStore:
         )
 
     @classmethod
-    def create(cls, run_dir: Path, query: str, model: str, mode: str = "pipeline") -> "SessionStore":
+    def create(cls, run_dir: Path, query: str, model: str, mode: str = "pipeline") -> SessionStore:
         store = cls(run_dir)
         store.state = SessionState(
             session_id=run_dir.name or uuid.uuid4().hex[:12],
@@ -96,7 +96,7 @@ class SessionStore:
     # -- stages ----------------------------------------------------------------
 
     def mark_stage(self, name: str, status: str,
-                   artifacts: Optional[list[str]] = None,
+                   artifacts: list[str] | None = None,
                    error: str = "") -> None:
         rec = self.state.stages.setdefault(name, StageRecord().__dict__)
         prev = self.state.stages.get(name) or {}
@@ -118,7 +118,7 @@ class SessionStore:
 
     # -- events ---------------------------------------------------------------
 
-    def log_event(self, kind: str, data: Optional[dict] = None) -> None:
+    def log_event(self, kind: str, data: dict | None = None) -> None:
         try:
             self.run_dir.mkdir(parents=True, exist_ok=True)
             with open(self._path(self.EVENTS_FILE), "a", encoding="utf-8") as f:
@@ -142,7 +142,7 @@ class SessionStore:
 
     # -- final bookkeeping ------------------------------------------------------
 
-    def finish(self, status: str, budget_snapshot: Optional[dict] = None) -> None:
+    def finish(self, status: str, budget_snapshot: dict | None = None) -> None:
         self.state.status = status
         if budget_snapshot:
             self.state.budget = budget_snapshot

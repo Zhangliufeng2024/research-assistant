@@ -8,7 +8,7 @@ import asyncio
 import sys
 import threading
 import time
-from typing import Callable, Optional
+from collections.abc import Callable
 
 
 class SteerReader:
@@ -23,7 +23,7 @@ class SteerReader:
     """
 
     def __init__(self) -> None:
-        self._thread: Optional[threading.Thread] = None
+        self._thread: threading.Thread | None = None
         self._stop = threading.Event()
 
     def start(self, queue: "asyncio.Queue[str]", loop: asyncio.AbstractEventLoop) -> None:

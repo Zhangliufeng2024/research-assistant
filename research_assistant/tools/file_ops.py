@@ -1,15 +1,35 @@
 """File operation tools: read, write, edit, glob, grep."""
 
-import os
 import re
 from pathlib import Path
 
-from ..constants import GREP_MAX_RESULTS, GLOB_MAX_RESULTS, BINARY_EXTENSIONS
+from ..constants import BINARY_EXTENSIONS, GLOB_MAX_RESULTS, GREP_MAX_RESULTS
+from ..core import safe_resolve
 
 
-async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
-    """Read a file and return its content with line numbers."""
-    p = Path(file_path).resolve()
+async def read_file(
+    file_path: str,
+    offset: int = 0,
+    limit: int = 2000,
+    sandbox: str | None = None,
+) -> str:
+    """Read a file and return its content with line numbers.
+
+    Args:
+        file_path: Absolute or relative path to the file.
+        offset: Line number to start reading from (0-based).
+        limit: Maximum number of lines to read.
+        sandbox: If set, restricts access to this directory tree.
+    """
+    p = Path(file_path)
+    if sandbox:
+        try:
+            p = safe_resolve(p, Path(sandbox))
+        except ValueError as e:
+            return f"Error: {e}"
+    else:
+        p = p.resolve()
+
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
     if p.is_dir():
@@ -34,9 +54,29 @@ async def read_file(file_path: str, offset: int = 0, limit: int = 2000) -> str:
     return result
 
 
-async def write_file(file_path: str, content: str) -> str:
-    """Write content to a file, creating parent directories if needed."""
-    p = Path(file_path).resolve()
+async def write_file(
+    file_path: str,
+    content: str,
+    sandbox: str | None = None,
+) -> str:
+    """Write content to a file, creating parent directories if needed.
+
+    Args:
+        file_path: Absolute or relative path to the file.
+        content: The content to write.
+        sandbox: If set, restricts writes to this directory tree.
+    """
+    p = Path(file_path)
+    if sandbox:
+        try:
+            # Resolve against sandbox — parent must also be inside sandbox
+            sandbox_path = Path(sandbox)
+            resolved_parent = safe_resolve(Path(file_path).parent, sandbox_path)
+            p = resolved_parent / Path(file_path).name
+        except ValueError as e:
+            return f"Error: {e}"
+    else:
+        p = p.resolve()
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
@@ -45,9 +85,29 @@ async def write_file(file_path: str, content: str) -> str:
         return f"Error writing file: {e}"
 
 
-async def edit_file(file_path: str, old_string: str, new_string: str) -> str:
-    """Replace an exact string in a file. old_string must appear exactly once."""
-    p = Path(file_path).resolve()
+async def edit_file(
+    file_path: str,
+    old_string: str,
+    new_string: str,
+    sandbox: str | None = None,
+) -> str:
+    """Replace an exact string in a file. old_string must appear exactly once.
+
+    Args:
+        file_path: Absolute or relative path to the file.
+        old_string: The exact text to find and replace.
+        new_string: The text to replace it with.
+        sandbox: If set, restricts edits to this directory tree.
+    """
+    p = Path(file_path)
+    if sandbox:
+        try:
+            p = safe_resolve(p, Path(sandbox))
+        except ValueError as e:
+            return f"Error: {e}"
+    else:
+        p = p.resolve()
+
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
 

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .base import Gate, GateResult
 
@@ -47,9 +47,9 @@ class DocGate(Gate):
     def __init__(
         self,
         docx_path: str | Path,
-        expected_sections: Optional[list[str]] = None,
-        figures_dir: Optional[str | Path] = None,
-        target_words: Optional[int] = None,
+        expected_sections: list[str] | None = None,
+        figures_dir: str | Path | None = None,
+        target_words: int | None = None,
         min_words_ratio: float = 0.8,
     ) -> None:
         self.docx_path = Path(docx_path)

@@ -1,11 +1,12 @@
 """Tool definitions and registry for the agent loop."""
 
-from typing import Any, Callable, Awaitable
+from collections.abc import Awaitable, Callable
+from typing import Any
 
-from .file_ops import read_file, write_file, edit_file, glob_files, grep_search
 from .bash import run_bash
+from .citation_verify import verify_citations
+from .file_ops import edit_file, glob_files, grep_search, read_file, write_file
 from .python_exec import run_python
-
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -95,6 +96,32 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
             "required": ["code"],
         },
     },
+    {
+        "name": "verify_citations",
+        "description": (
+            "Verify all BibTeX citations in a .bib file against Crossref, Semantic Scholar, "
+            "and OpenAlex. Returns a verification report with per-citation confidence scores. "
+            "MANDATORY: call this after assembling references.bib. "
+            "Any UNVERIFIED citations must be replaced before paper submission."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "bib_file": {
+                    "type": "string",
+                    "description": "Absolute path to the .bib file to verify.",
+                },
+                "output_file": {
+                    "type": "string",
+                    "description": (
+                        "Optional absolute path to save the Markdown report "
+                        "(e.g. sources/CITATION_VERIFICATION.md)."
+                    ),
+                },
+            },
+            "required": ["bib_file"],
+        },
+    },
 ]
 
 
@@ -111,6 +138,7 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
     "glob_files": glob_files,
     "grep_search": grep_search,
     "run_python": run_python,
+    "verify_citations": verify_citations,
 }
 
 
@@ -129,6 +157,13 @@ class ToolRegistry:
         handler = self._handlers.get(name)
         if handler is None:
             return f"Error: Unknown tool '{name}'. Available tools: {list(self._handlers.keys())}"
+
+        # Inject sandbox restriction for file tools and citation verifier.
+        # This prevents the LLM from reading or writing arbitrary paths outside
+        # the configured work directory.
+        if name in ("read_file", "write_file", "edit_file", "verify_citations"):
+            if "sandbox" not in arguments:
+                arguments["sandbox"] = self.work_dir
 
         if name in ("bash", "glob_files", "grep_search"):
             if "path" not in arguments or not arguments.get("path"):

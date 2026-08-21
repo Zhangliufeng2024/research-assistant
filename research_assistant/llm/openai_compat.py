@@ -3,14 +3,14 @@
 import asyncio
 import json
 import uuid
-from typing import Any, Optional
+from typing import Any
 
 import httpx
 
-from .base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
-from .errors import classify_response
+from ..constants import DEFAULT_OPENAI_MODEL, HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_TIMEOUT_SECONDS
 from ..models import TokenUsage
-from ..constants import DEFAULT_OPENAI_MODEL, HTTP_TIMEOUT_SECONDS, HTTP_CONNECT_TIMEOUT_SECONDS
+from .base import LLMClient, LLMResponse, OnChunkCallback, ToolCall
+from .errors import classify_response
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
@@ -94,8 +94,8 @@ class OpenAICompatClient(LLMClient):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 16384,
-        on_chunk: Optional[OnChunkCallback] = None,
-        on_activity: Optional[Any] = None,
+        on_chunk: OnChunkCallback | None = None,
+        on_activity: Any | None = None,
     ) -> LLMResponse:
         base = self.base_url
         if not base.endswith("/v1"):
@@ -136,7 +136,7 @@ class OpenAICompatClient(LLMClient):
         headers: dict,
         body: dict,
         on_chunk: OnChunkCallback,
-        on_activity: Optional[Any] = None,
+        on_activity: Any | None = None,
     ) -> LLMResponse:
         """Stream the OpenAI-compatible response via SSE, calling on_chunk for text deltas."""
         content_text = ""

@@ -19,10 +19,8 @@ from __future__ import annotations
 import os
 import time
 from dataclasses import dataclass, field
-from typing import Optional
 
 from ..llm.base import LLMResponse
-from ..models import TokenUsage
 
 #: USD per million tokens: {"input": x, "output": y, "cache_write": z, "cache_read": w}
 PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
@@ -53,14 +51,14 @@ def price_for(model: str) -> dict[str, float]:
 class BudgetLimits:
     """Hard caps. ``None`` or <=0 means unlimited for that dimension."""
 
-    max_cost_usd: Optional[float] = None
-    max_total_tokens: Optional[int] = None
-    max_turns: Optional[int] = None
-    max_wall_seconds: Optional[float] = None
+    max_cost_usd: float | None = None
+    max_total_tokens: int | None = None
+    max_turns: int | None = None
+    max_wall_seconds: float | None = None
 
     @classmethod
-    def from_env(cls) -> "BudgetLimits":
-        def _float(name: str) -> Optional[float]:
+    def from_env(cls) -> BudgetLimits:
+        def _float(name: str) -> float | None:
             raw = os.getenv(name)
             if not raw:
                 return None
@@ -70,7 +68,7 @@ class BudgetLimits:
                 return None
             return v if v > 0 else None
 
-        def _int(name: str) -> Optional[int]:
+        def _int(name: str) -> int | None:
             v = _float(name)
             return int(v) if v is not None else None
 
@@ -128,9 +126,9 @@ class BudgetGuard:
 
     def __init__(
         self,
-        limits: Optional[BudgetLimits] = None,
+        limits: BudgetLimits | None = None,
         model: str = "",
-        started_at: Optional[float] = None,
+        started_at: float | None = None,
     ) -> None:
         self.limits = limits or BudgetLimits.from_env()
         self.model = model

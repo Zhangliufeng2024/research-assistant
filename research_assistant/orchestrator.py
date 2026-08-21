@@ -13,15 +13,16 @@ import asyncio
 import json
 import re
 import time
-from pathlib import Path
-from typing import Optional, List, Dict, Any, AsyncGenerator, Callable
+from collections.abc import AsyncGenerator
 from dataclasses import dataclass, field
+from pathlib import Path
+from typing import Any
 
-from .agent import run_agent, AgentResult as _AgentLoopResult
-from .llm.factory import create_llm_client
-from .tools.registry import ToolRegistry
-from .models import ProgressUpdate, TextUpdate, TokenUsage
+from .agent import run_agent
 from .constants import OUTPUT_SUBDIRS
+from .llm.factory import create_llm_client
+from .models import ProgressUpdate, TextUpdate, TokenUsage
+from .tools.registry import ToolRegistry
 
 
 def _sanitize_filename(name: str, default: str = "unnamed") -> str:
@@ -41,7 +42,7 @@ class SectionPlan:
     title: str
     description: str
     estimated_words: int = 500
-    search_queries: List[str] = field(default_factory=list)
+    search_queries: list[str] = field(default_factory=list)
 
 
 @dataclass
@@ -57,8 +58,8 @@ class OrchestrationPlan:
     paper_title: str = ""
     paper_type: str = "research_paper"
     venue: str = ""
-    sections: List[SectionPlan] = field(default_factory=list)
-    figures: List[FigurePlan] = field(default_factory=list)
+    sections: list[SectionPlan] = field(default_factory=list)
+    figures: list[FigurePlan] = field(default_factory=list)
     total_estimated_words: int = 0
     citation_target: int = 30
 
@@ -69,10 +70,10 @@ class AgentResult:
     agent_role: str
     success: bool
     text_output: str = ""
-    files_written: List[str] = field(default_factory=list)
-    error: Optional[str] = None
+    files_written: list[str] = field(default_factory=list)
+    error: str | None = None
     duration_seconds: float = 0.0
-    token_usage: Optional[TokenUsage] = None
+    token_usage: TokenUsage | None = None
 
 
 async def _run_sub_agent(  # noqa: PLR0913
@@ -82,9 +83,9 @@ async def _run_sub_agent(  # noqa: PLR0913
     system_prompt: str,
     model: str,
     work_dir: Path,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    provider: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    provider: str | None = None,
     auto_continue: bool = True,
     max_continuations: int = 20,
 ) -> "AgentResult":
@@ -295,12 +296,12 @@ async def run_orchestrated_generation(
     model: str,
     work_dir: Path,
     output_dir: Path,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    provider: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    provider: str | None = None,
     max_parallel_research: int = 4,
     max_parallel_figures: int = 4,
-) -> AsyncGenerator[Dict[str, Any], None]:
+) -> AsyncGenerator[dict[str, Any], None]:
     """Run the full multi-agent orchestration pipeline."""
     total_start = time.time()
 
@@ -410,8 +411,8 @@ async def run_orchestrated_generation(
 
     all_results = await asyncio.gather(*all_coros, return_exceptions=True)
 
-    research_results: List[AgentResult] = []
-    figure_results: List[AgentResult] = []
+    research_results: list[AgentResult] = []
+    figure_results: list[AgentResult] = []
 
     for i, result in enumerate(all_results):
         if isinstance(result, Exception):

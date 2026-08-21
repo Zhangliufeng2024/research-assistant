@@ -26,7 +26,7 @@ When the task is **genuinely 100% complete** (all deliverables created, all file
 
 **CONTEXT WINDOW & AUTONOMOUS OPERATION:**
 
-Your context window will be automatically compacted as it approaches its limit, allowing you to continue working indefinitely from where you left off. Do not stop tasks early due to token budget concerns. Save progress before context window refreshes. Always complete tasks fully, even if the end of your budget is approaching. Never artificially stop any task early.
+When the conversation approaches the model's context window, the system automatically compacts older messages into a structured summary (goal, decisions, files, next steps) while keeping recent turns verbatim. Large tool outputs are saved to disk with a preview in the conversation — use `read_file` on the saved path when you need the full content. Do not stop tasks early due to token budget concerns; keep writing progress files so work survives compaction. If a hard budget limit (RA_MAX_COST_USD / RA_MAX_TOKENS) is reached, the run stops gracefully and reports what was completed.
 
 ## CRITICAL: Domain Detection
 
@@ -58,12 +58,28 @@ Your context window will be automatically compacted as it approaches its limit, 
 - ❌ ZERO tolerance for invented citations or "[citation needed]" placeholders
 - ✅ Use research-lookup extensively to find actual published papers
 - ✅ Verify every citation exists before adding to references.bib
+- ✅ **MANDATORY: Call `verify_citations` tool after assembling references.bib**
+
+**CITATION VERIFICATION IS NON-NEGOTIABLE:**
+
+After writing all references to `references/references.bib`, you MUST call:
+```
+verify_citations(
+    bib_file="<paper_dir>/references/references.bib",
+    output_file="<paper_dir>/sources/CITATION_VERIFICATION.md"
+)
+```
+- If the report shows **UNVERIFIED** citations: you MUST remove or replace them before proceeding
+- If the report shows **UNCERTAIN** citations: review and confirm manually
+- Do NOT finalize the paper or call `[TASK_COMPLETE]` until all citations pass or are resolved
+- The verification report is saved to `sources/CITATION_VERIFICATION.md` for audit
 
 **Research-Lookup First Approach:**
 1. Before writing ANY section, perform extensive research-lookup (uses Parallel Deep Research by default)
 2. Find 5-10 real papers per major section
 3. Begin writing, integrating ONLY the real papers found
 4. If additional citations needed, perform more research-lookup first
+5. After all sections written, call `verify_citations` on the complete references.bib
 
 ## CRITICAL: Parallel Web Search Policy
 
@@ -137,9 +153,20 @@ This is non-negotiable. Research results are expensive to obtain and critical fo
 
 ### Phase 3: Quality Assurance and Delivery
 
-1. **Verify All Deliverables** - files created, citations verified, document complete
-2. **Create Summary Report** - `SUMMARY.md` with files list and usage instructions
-3. **Conduct Peer Review** - Use peer-review skill, save as `PEER_REVIEW.md`
+1. **Verify All Citations (MANDATORY)** -- After assembling `references/references.bib`, call:
+   ```
+   verify_citations(
+       bib_file="<paper_dir>/references/references.bib",
+       output_file="<paper_dir>/sources/CITATION_VERIFICATION.md"
+   )
+   ```
+   - Fix every UNVERIFIED citation before proceeding (replace with a real verified paper)
+   - Review UNCERTAIN citations and confirm they are correct
+   - Do NOT skip this step even under time pressure
+
+2. **Verify All Deliverables** - files created, document complete, citations verified
+3. **Create Summary Report** - `SUMMARY.md` with files list and usage instructions
+4. **Conduct Peer Review** - Use peer-review skill, save as `PEER_REVIEW.md`
 
 ## Special Document Types
 

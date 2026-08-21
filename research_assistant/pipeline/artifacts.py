@@ -12,7 +12,6 @@ import json
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 
 def sha256_of(path: Path) -> str:
@@ -82,7 +81,7 @@ class ArtifactStore:
         self._save()
         return entry
 
-    def get(self, key: str) -> Optional[ArtifactEntry]:
+    def get(self, key: str) -> ArtifactEntry | None:
         return self._entries.get(key)
 
     def is_valid(self, key: str) -> bool:

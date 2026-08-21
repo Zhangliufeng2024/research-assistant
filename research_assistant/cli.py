@@ -1,51 +1,68 @@
 #!/usr/bin/env python3
 """Research Assistant CLI Tool — command-line interface for research and writing."""
 
+import asyncio
+import json
 import os
 import sys
 import time
-import asyncio
-import threading
 from pathlib import Path
-from typing import Optional
 
 if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
+from .agent import run_agent
 from .config import (
+    build_llm_client,
+    generate_session_dir_name,
     load_project_env,
     resolve_model,
-    build_system_instructions,
-    generate_session_dir_name,
-    build_llm_client,
-)
-from .agent import run_agent, AgentResult
-from .tools.registry import ToolRegistry
-from .retry import (
-    HeartbeatTimeoutError,
-    ContextLimitError,
-    ModelConfigError,
-    get_max_retries,
-    get_heartbeat_timeout,
 )
 from .core import (
-    get_api_key,
-    load_system_instructions,
-    ensure_output_folder,
-    get_data_files,
-    process_data_files,
     create_data_context_message,
+    ensure_output_folder,
+    get_api_key,
+    get_data_files,
+    load_system_instructions,
+    process_data_files,
     setup_claude_skills,
 )
-from .utils import find_existing_papers, detect_paper_reference, scan_paper_directory
+from .display import format_status_line, format_tool_result_tag, format_tool_start
 from .models import TokenUsage
 from .orchestrator import run_orchestrated_generation
-from .display import format_tool_start, format_tool_result_tag, format_status_line
+from .retry import (
+    ContextLimitError,
+    HeartbeatTimeoutError,
+    ModelConfigError,
+    get_max_retries,
+)
 from .steer import SteerReader
+from .tools.registry import ToolRegistry
+from .utils import detect_paper_reference, find_existing_papers
 
 
-async def main(track_token_usage: bool = False) -> Optional[TokenUsage]:
+def _list_runs(output_folder: Path) -> list[tuple[str, str]]:
+    """List paper directories with their run.json status (newest first)."""
+    runs: list[tuple[str, str]] = []
+    if not output_folder.exists():
+        return runs
+    for d in sorted(output_folder.iterdir(), key=lambda p: p.stat().st_mtime,
+                     reverse=True):
+        if not d.is_dir():
+            continue
+        status = "?"
+        rf = d / "run.json"
+        if rf.exists():
+            try:
+                status = json.loads(rf.read_text(encoding="utf-8")).get("status", "?")
+            except Exception:
+                pass
+        runs.append((d.name, status))
+    return runs
+
+
+async def main(track_token_usage: bool = False) -> TokenUsage | None:
     """Main CLI loop for the research assistant."""
     cwd = Path.cwd().resolve()
     load_project_env(cwd)
@@ -272,6 +289,30 @@ MID-EXECUTION STEERING:
                         print(f"\nMulti-agent mode: {'ENABLED' if multi_agent else 'DISABLED'}")
                     continue
 
+                if user_input.lower().startswith("resume"):
+                    parts = user_input.split()
+                    runs = _list_runs(output_folder)
+                    if len(parts) == 1:
+                        if not runs:
+                            print("\nNo previous runs found.")
+                        else:
+                            print("\nRuns (newest first):")
+                            for name, status in runs[:15]:
+                                print(f"  {name}  [{status}]")
+                            print("\nUse: resume <name-prefix>")
+                        continue
+                    prefix = parts[1]
+                    match = next(
+                        (name for name, _ in runs if name.startswith(prefix)), None,
+                    )
+                    if match:
+                        current_paper_path = str(output_folder / match)
+                        status = dict(runs).get(match, "?")
+                        print(f"\nResuming: {match} [{status}]")
+                    else:
+                        print(f"\nNo run matching '{prefix}'. Try 'resume' to list.")
+                    continue
+
                 if not user_input:
                     continue
 
@@ -437,6 +478,7 @@ def _print_help():
     print("  - Document manipulation")
     print("\nCommands:")
     print("  multi-agent on|off  Toggle parallel agent execution")
+    print("  resume [prefix]     List/resume a previous run (run.json state)")
     print("  new paper           Start a fresh paper")
     print("  exit/quit           End session")
     print("\nData Files:")

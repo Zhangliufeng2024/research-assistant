@@ -12,8 +12,8 @@ from __future__ import annotations
 
 import json
 from abc import ABC, abstractmethod
-from dataclasses import dataclass, field, asdict
-from typing import Any, Optional
+from dataclasses import asdict, dataclass, field
+from typing import Any
 
 
 @dataclass
@@ -64,7 +64,7 @@ class GateReport:
                      encoding="utf-8")
 
     @classmethod
-    def load(cls, path) -> "GateReport":
+    def load(cls, path) -> GateReport:
         data = json.loads(__import__("pathlib").Path(path).read_text(encoding="utf-8"))
         report = cls(revision_round=data.get("revision_round", 0))
         for r in data.get("results", []):

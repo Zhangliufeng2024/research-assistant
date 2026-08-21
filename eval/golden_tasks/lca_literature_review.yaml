@@ -1,0 +1,14 @@
+id: lca_literature_review
+description: "LCA literature review — engineering domain routing + citation quality"
+query: >
+  Write a literature review (about 2000 words) on life cycle assessment of
+  building retrofit measures, covering embodied carbon accounting methods,
+  ISO 14040/14044 framework applications, and recent case studies. Include a
+  PRISMA-style search strategy description and a comparison table.
+expect_sections: ["Introduction", "Methods", "Results", "Discussion", "Conclusion"]
+min_words: 1500
+min_citations: 10
+citation_pass_rate: 0.9
+min_figures: 1
+budget_usd: 3.0
+max_wall_seconds: 2400

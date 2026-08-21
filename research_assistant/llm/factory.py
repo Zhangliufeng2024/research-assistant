@@ -1,12 +1,11 @@
 """Factory for creating LLM clients based on configuration."""
 
 import os
-from typing import Optional
 
-from .base import LLMClient
-from .anthropic import AnthropicClient
-from .openai_compat import OpenAICompatClient
 from ..constants import DEFAULT_ANTHROPIC_MODEL, DEFAULT_OPENAI_MODEL
+from .anthropic import AnthropicClient
+from .base import LLMClient
+from .openai_compat import OpenAICompatClient
 
 
 def detect_provider(api_key: str, provider: str = "") -> str:
@@ -19,10 +18,10 @@ def detect_provider(api_key: str, provider: str = "") -> str:
 
 
 def create_llm_client(
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
 ) -> LLMClient:
     """Create an LLM client from explicit params or environment variables.
 

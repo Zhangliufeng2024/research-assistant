@@ -15,28 +15,29 @@ import asyncio
 import inspect
 import random
 import time
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Callable, Optional, Awaitable
+from typing import Any
 
-from .llm.base import LLMClient, LLMResponse, ToolCall, OnChunkCallback
-from .llm.errors import LLMError, HeartbeatTimeoutError
-from .kernel.events import AgentEvent, EventKind, HookBus
-from .kernel.budget import BudgetGuard, BudgetExceededError
+from .constants import DEFAULT_MAX_CONTINUATIONS, TASK_COMPLETE_MARKER
+from .kernel.budget import BudgetExceededError, BudgetGuard
 from .kernel.context import externalize_tool_result, maybe_compact
-from .tools.registry import ToolRegistry
+from .kernel.events import AgentEvent, EventKind, HookBus
+from .llm.base import LLMClient, LLMResponse, OnChunkCallback
+from .llm.errors import HeartbeatTimeoutError, LLMError
 from .models import TokenUsage
-from .constants import TASK_COMPLETE_MARKER, DEFAULT_MAX_CONTINUATIONS
 from .retry import (
     ContextLimitError,
     ModelConfigError,
     _is_context_limit,
     _is_model_error,
     _is_retryable,
+    get_heartbeat_timeout,
     get_max_retries,
     get_retry_base_delay,
-    get_heartbeat_timeout,
 )
+from .tools.registry import ToolRegistry
 
 
 @dataclass
@@ -45,7 +46,7 @@ class AgentResult:
     success: bool = True
     text_output: str = ""
     files_written: list[str] = field(default_factory=list)
-    error: Optional[str] = None
+    error: str | None = None
     duration_seconds: float = 0.0
     token_usage: TokenUsage = field(default_factory=TokenUsage)
     turns: int = 0
@@ -70,17 +71,17 @@ class RunConfig:
     temperature: float = 0.5
     max_tokens: int = 16384
     #: Hard caps; a fresh guard is built from env (RA_MAX_*) when None.
-    budget: Optional[BudgetGuard] = None
+    budget: BudgetGuard | None = None
     auto_budget: bool = True
     #: Lifecycle hooks; a private bus is created when None.
-    hooks: Optional[HookBus] = None
+    hooks: HookBus | None = None
     #: Cooperative cancellation; checked between turns and before each tool.
-    cancel_event: Optional[asyncio.Event] = None
+    cancel_event: asyncio.Event | None = None
     #: Write oversized tool results to .ra/tool_outputs/ instead of the history.
     externalize_outputs: bool = True
     #: Summarize old history when nearing the model's context window.
     compaction: bool = True
-    heartbeat_timeout: Optional[float] = None
+    heartbeat_timeout: float | None = None
 
 
 def _is_completion_loop(recent_texts: list[str]) -> bool:
@@ -101,7 +102,7 @@ def _is_completion_loop(recent_texts: list[str]) -> bool:
     return jaccard > 0.6
 
 
-async def _maybe_await(fn: Optional[Callable[..., Any]], *args: Any) -> None:
+async def _maybe_await(fn: Callable[..., Any] | None, *args: Any) -> None:
     if fn is None:
         return
     result = fn(*args)
@@ -164,18 +165,18 @@ async def run_agent(
     llm_client: LLMClient,
     tools: ToolRegistry,
     *,
-    config: Optional[RunConfig] = None,
+    config: RunConfig | None = None,
     max_turns: int = 200,
     auto_continue: bool = True,
     max_continuations: int = DEFAULT_MAX_CONTINUATIONS,
     temperature: float = 0.5,
     max_tokens: int = 16384,
-    on_text: Optional[OnTextCallback] = None,
-    on_tool_use: Optional[OnToolCallback] = None,
-    on_tool_start: Optional[OnToolStartCallback] = None,
-    on_turn_start: Optional[OnTurnStartCallback] = None,
-    steer_queue: Optional[asyncio.Queue] = None,
-    on_steer_injected: Optional[OnSteerCallback] = None,
+    on_text: OnTextCallback | None = None,
+    on_tool_use: OnToolCallback | None = None,
+    on_tool_start: OnToolStartCallback | None = None,
+    on_turn_start: OnTurnStartCallback | None = None,
+    steer_queue: asyncio.Queue | None = None,
+    on_steer_injected: OnSteerCallback | None = None,
 ) -> AgentResult:
     """Run an agentic conversation loop to completion.
 
@@ -247,7 +248,7 @@ async def run_agent(
     await _emit(EventKind.RUN_START, payload={"prompt_chars": len(prompt)})
 
     # Per-run scratch space for externalized tool outputs.
-    artifacts_dir: Optional[Path] = None
+    artifacts_dir: Path | None = None
     if cfg.externalize_outputs:
         work_dir = getattr(tools, "work_dir", None)
         if work_dir:
@@ -462,8 +463,8 @@ async def _llm_call_with_retry(
     heartbeat_timeout: float,
     max_retries: int,
     base_delay: float,
-    on_chunk: Optional[OnChunkCallback] = None,
-    extra_kwargs: Optional[dict] = None,
+    on_chunk: OnChunkCallback | None = None,
+    extra_kwargs: dict | None = None,
 ) -> LLMResponse:
     """Call the LLM with retry on transient errors and a silence watchdog."""
     last_exc: BaseException | None = None
@@ -521,7 +522,7 @@ def _accumulate_usage(total: TokenUsage, response: LLMResponse) -> None:
 
 
 def _drain_steer_queue(
-    queue: Optional[asyncio.Queue],
+    queue: asyncio.Queue | None,
     messages: list[dict],
 ) -> list[str]:
     """Drain pending steer messages and inject as a single user message.

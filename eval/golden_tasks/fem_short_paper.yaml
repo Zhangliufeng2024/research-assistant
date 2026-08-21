@@ -1,0 +1,13 @@
+id: fem_short_paper
+description: "Short FEM research paper — smoke-level golden task (cheap, fast)"
+query: >
+  Write a short research paper (about 1200 words) on finite element mesh
+  convergence studies for reinforced concrete beams, with an introduction,
+  methods, results, discussion and conclusion. Word .docx output.
+expect_sections: ["Introduction", "Methods", "Results", "Discussion", "Conclusion"]
+min_words: 900
+min_citations: 5
+citation_pass_rate: 0.9
+min_figures: 1
+budget_usd: 2.0
+max_wall_seconds: 1800

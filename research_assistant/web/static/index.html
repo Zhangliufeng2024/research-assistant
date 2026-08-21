@@ -1,0 +1,85 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>研究助手</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<header class="navbar">
+  <span class="navbar-title">研究助手</span>
+  <nav class="navbar-tabs">
+    <button class="tab active" data-view="task">新建任务</button>
+    <button class="tab" data-view="papers">历史文档</button>
+  </nav>
+</header>
+
+<main class="container">
+
+  <!-- View 1: New Task -->
+  <section id="view-task" class="view active">
+    <div class="task-form">
+      <label class="form-label" for="query">请描述您需要生成的文档</label>
+      <textarea id="query" class="form-textarea" rows="4" placeholder="例如：写一篇关于复合结构在土木工程中应用的综述论文"></textarea>
+      <div class="form-actions">
+        <label class="checkbox-label">
+          <input type="checkbox" id="multi-agent"> 多智能体模式
+        </label>
+        <button id="btn-generate" class="btn btn-primary">开始生成</button>
+      </div>
+    </div>
+
+    <!-- Progress Panel (hidden by default) -->
+    <div id="progress-panel" class="progress-panel hidden">
+      <div class="progress-header">
+        <span class="progress-title">生成进度</span>
+        <span id="progress-stage" class="progress-stage">初始化</span>
+      </div>
+      <div class="progress-bar-track">
+        <div id="progress-bar" class="progress-bar-fill" style="width: 0%"></div>
+      </div>
+      <div id="progress-log" class="progress-log"></div>
+    </div>
+
+    <!-- Result Card (hidden by default) -->
+    <div id="result-card" class="result-card hidden">
+      <div class="result-header">
+        <span class="result-icon">&#10003;</span>
+        <span class="result-title">文档生成完成</span>
+      </div>
+      <div id="result-meta" class="result-meta"></div>
+      <div id="result-actions" class="result-actions"></div>
+    </div>
+
+    <!-- Error Card -->
+    <div id="error-card" class="error-card hidden">
+      <div class="error-header">&#10007; 生成失败</div>
+      <div id="error-message" class="error-message"></div>
+    </div>
+  </section>
+
+  <!-- View 2: Papers Browser -->
+  <section id="view-papers" class="view">
+    <div class="papers-layout">
+      <aside class="papers-list">
+        <div class="papers-list-header">
+          <span>历史文档</span>
+          <span id="papers-count" class="papers-count"></span>
+        </div>
+        <div id="papers-items" class="papers-items">
+          <div class="loading">加载中...</div>
+        </div>
+      </aside>
+      <div class="papers-detail" id="papers-detail">
+        <div class="detail-placeholder">选择左侧文档查看详情</div>
+      </div>
+    </div>
+  </section>
+
+</main>
+
+<script src="app.js"></script>
+</body>
+</html>

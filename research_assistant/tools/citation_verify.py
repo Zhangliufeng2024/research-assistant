@@ -24,13 +24,11 @@ import os
 import re
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Optional
 
 import httpx
 
-from ..docgen import parse_bibtex
 from ..core import safe_resolve
-
+from ..docgen import parse_bibtex
 
 # ---------------------------------------------------------------------------
 # Thresholds and constants
@@ -57,8 +55,8 @@ class CitationResult:
     authors: str
     status: str = "unverified"      # "verified" | "uncertain" | "unverified"
     confidence: float = 0.0         # 0.0 - 1.0
-    matched_title: Optional[str] = None
-    matched_doi: Optional[str] = None
+    matched_title: str | None = None
+    matched_doi: str | None = None
     source: str = ""                 # which API resolved it
     note: str = ""
 
@@ -114,7 +112,7 @@ def _classify(confidence: float) -> str:
 
 async def _crossref_doi(
     doi: str, expected_title: str, client: httpx.AsyncClient
-) -> Optional[CitationResult]:
+) -> CitationResult | None:
     """Verify a DOI via Crossref /works/{doi}."""
     if not doi:
         return None
@@ -151,7 +149,7 @@ async def _crossref_doi(
 
 async def _crossref_title(
     title: str, authors: str, client: httpx.AsyncClient
-) -> Optional[CitationResult]:
+) -> CitationResult | None:
     """Search Crossref by bibliographic query."""
     if not title:
         return None
@@ -202,7 +200,7 @@ async def _crossref_title(
 
 async def _semantic_scholar_title(
     title: str, ss_api_key: str, client: httpx.AsyncClient
-) -> Optional[CitationResult]:
+) -> CitationResult | None:
     """Search Semantic Scholar by title."""
     if not title:
         return None
@@ -245,7 +243,7 @@ async def _semantic_scholar_title(
 
 async def _openalex_title(
     title: str, email: str, client: httpx.AsyncClient
-) -> Optional[CitationResult]:
+) -> CitationResult | None:
     """Search OpenAlex by title."""
     if not title:
         return None
@@ -488,8 +486,8 @@ async def verify_bibtex_file(bib_file) -> VerificationReport:
 
 async def verify_citations(
     bib_file: str,
-    output_file: Optional[str] = None,
-    sandbox: Optional[str] = None,
+    output_file: str | None = None,
+    sandbox: str | None = None,
 ) -> str:
     """Verify all BibTeX citations against Crossref, Semantic Scholar, and OpenAlex.
 

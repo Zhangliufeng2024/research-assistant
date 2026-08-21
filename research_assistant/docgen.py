@@ -6,16 +6,14 @@ cross-referencing, and venue-specific templates.
 """
 
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 from docx import Document
-from docx.shared import Inches, Pt, Cm, RGBColor
-from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.enum.text import WD_ALIGN_PARAGRAPH
 from docx.oxml.ns import qn
-
+from docx.shared import Inches, Pt, RGBColor
 
 # ---------------------------------------------------------------------------
 # Document template system
@@ -251,7 +249,7 @@ class CrossReferenceManager:
     def register(self, label: str, ref_type: str, number: int, title: str = "") -> None:
         self._entries[label] = _RefEntry(ref_type=ref_type, number=number, title=title)
 
-    def get(self, label: str) -> Optional[_RefEntry]:
+    def get(self, label: str) -> _RefEntry | None:
         return self._entries.get(label)
 
     def format_ref(self, label: str) -> str:
@@ -357,9 +355,9 @@ class PaperBuilder:
     def __init__(
         self,
         title: str,
-        authors: Optional[list[str]] = None,
-        abstract: Optional[str] = None,
-        affiliation: Optional[str] = None,
+        authors: list[str] | None = None,
+        abstract: str | None = None,
+        affiliation: str | None = None,
         template: str | DocumentTemplate = "default",
     ):
         if isinstance(template, str):
@@ -447,8 +445,8 @@ class PaperBuilder:
     def _add_title_block(
         self,
         title: str,
-        authors: Optional[list[str]],
-        affiliation: Optional[str],
+        authors: list[str] | None,
+        affiliation: str | None,
     ) -> None:
         t = self._template
 
@@ -509,7 +507,7 @@ class PaperBuilder:
         title: str,
         content: str,
         level: int = 1,
-        label: Optional[str] = None,
+        label: str | None = None,
     ) -> None:
         """Add a section with heading and body text.
 
@@ -550,8 +548,8 @@ class PaperBuilder:
         self,
         image_path: str,
         caption: str,
-        label: Optional[str] = None,
-        width_inches: Optional[float] = None,
+        label: str | None = None,
+        width_inches: float | None = None,
     ) -> None:
         """Add a figure with auto-numbered caption.
 
@@ -596,8 +594,8 @@ class PaperBuilder:
         self,
         headers: list[str],
         rows: list[list[str]],
-        caption: Optional[str] = None,
-        label: Optional[str] = None,
+        caption: str | None = None,
+        label: str | None = None,
     ) -> None:
         """Add a table with optional auto-numbered caption.
 
@@ -718,8 +716,10 @@ _ENTRY_RE = re.compile(
     re.DOTALL,
 )
 
+# Matches:  field = {value}  or  field = "value"  (machine-generated BibTeX).
+# Group 1 = field name, group 2 = brace-delimited value, group 3 = quote-delimited value.
 _FIELD_RE = re.compile(
-    r"(\w+)\s*=\s*\{([^}]*)\}",
+    r'(\w+)\s*=\s*(?:\{([^}]*)\}|"([^"]*)")'
 )
 
 
@@ -742,7 +742,9 @@ def parse_bibtex(bib_path: str) -> list[Reference]:
 
         fields: dict[str, str] = {}
         for fm in _FIELD_RE.finditer(body):
-            fields[fm.group(1).lower()] = fm.group(2).strip()
+            # group(2) for {brace} values, group(3) for "quoted" values
+            value = fm.group(2) if fm.group(2) is not None else (fm.group(3) or "")
+            fields[fm.group(1).lower()] = value.strip()
 
         year_str = fields.get("year", "0")
         try:

@@ -13,10 +13,28 @@ AI-powered research and writing assistant that combines deep research with publi
 - **Real citation lookup** — queries Semantic Scholar, OpenAlex, Perplexity, and Parallel Web; zero tolerance for fabricated references
 - **Figure generation** — schematics, data plots, AI-generated images via NVIDIA NIM (free) or any OpenAI-compatible image API
 - **Document review** — reads generated .docx to verify content completeness; optional PDF conversion via LibreOffice
-- **Multi-agent mode** — decomposes work into parallel research, figure, assembly, and review agents
+- **Multi-agent mode** — resumable pipeline state machine: PLAN → RESEARCH∥ → FIGURES∥ → ASSEMBLE → GATES → REVISION → FINALIZE
 - **26 specialized skills** — from scientific writing and venue templates to LCA/carbon analysis and infographics
 - **Built-in tools** — read_file, write_file, edit_file, bash, glob_files, grep_search, run_python
 - **Programmatic API** — async generator interface with streaming progress updates
+
+## Architecture: The Mechanism Layer
+
+Quality policies are enforced by code, not just prompts:
+
+| Mechanism | Module | What it guarantees |
+|---|---|---|
+| **State machine** | `pipeline/` + `session/` | Every stage writes sha256-addressed artifacts (`manifest.json`) and state (`run.json`) — a crashed run resumes where it left off via `resume` (CLI) or re-invocation; no mtime guessing |
+| **Quality gates** | `gates/` | `CitationGate` (unverified citations block finalization) and `DocGate` (sections present, figures exist, no placeholders, word floor) must pass before `final/manuscript.docx` is written; failures trigger bounded revision rounds (≤3) with the gate report injected |
+| **Hook system** | `kernel/events.py` | Lifecycle event bus; `PRE_TOOL_USE` hooks can deny tool calls; budget guard and permission policies are hooks |
+| **Context management** | `kernel/context.py` | Oversized tool results are externalized to `.ra/tool_outputs/` with a preview pointer; history is compacted near the window limit with tool-call-pairing-safe cut points |
+| **Budget & cancellation** | `kernel/budget.py` + `RunConfig.cancel_event` | Hard caps on cost/tokens/turns/wall-clock (`RA_MAX_COST_USD`, …) stop runs gracefully; web `POST /api/tasks/{id}/stop` cancels mid-run |
+| **Structured errors** | `llm/errors.py` | Errors classified by status code/body/`Retry-After` — no substring guessing; silence-based heartbeat never kills healthy slow streams |
+| **Eval harness** | `eval/` | Golden tasks (`eval/golden_tasks/*.yaml`) run headless through the pipeline; metrics (citation pass rate, word count, figures, cost) computed offline from artifacts for regression testing |
+
+Key environment variables: `RA_MAX_COST_USD`, `RA_MAX_TOKENS`, `RA_MAX_TURNS`,
+`RA_MAX_WALL_SECONDS`, `RA_PIPELINE` (multi-agent implementation switch),
+`RA_HEARTBEAT_TIMEOUT`, `RA_AUTO_CONTINUE`.
 
 ## Quick Start
 

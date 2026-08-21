@@ -2,8 +2,8 @@
 
 from pathlib import Path
 
+from .constants import DISPLAY_TOKEN_THRESHOLD, DISPLAY_TRUNCATION_LENGTH
 from .models import TokenUsage
-from .constants import DISPLAY_TRUNCATION_LENGTH, DISPLAY_TOKEN_THRESHOLD
 
 
 def _is_error(result: str) -> bool:

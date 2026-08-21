@@ -4,12 +4,12 @@ import asyncio
 import os
 import time
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
-from typing import Any, Awaitable, Callable, Optional
+from typing import Any
 
-from ..models import TokenUsage
 from ..constants import DEFAULT_LLM_REQUEST_INTERVAL
-
+from ..models import TokenUsage
 
 OnChunkCallback = Callable[[str], Awaitable[None] | None]
 
@@ -72,8 +72,8 @@ class LLMClient(ABC):
         tools: list[dict] | None = None,
         temperature: float = 0.7,
         max_tokens: int = 16384,
-        on_chunk: Optional[OnChunkCallback] = None,
-        on_activity: Optional[Any] = None,
+        on_chunk: OnChunkCallback | None = None,
+        on_activity: Any | None = None,
     ) -> LLMResponse:
         """Send a chat request and return the full response.
 

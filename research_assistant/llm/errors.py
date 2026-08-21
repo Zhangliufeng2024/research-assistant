@@ -19,7 +19,6 @@ from __future__ import annotations
 
 import email.utils
 import time
-from typing import Optional
 
 
 class LLMError(Exception):
@@ -31,10 +30,10 @@ class LLMError(Exception):
         self,
         message: str,
         *,
-        status_code: Optional[int] = None,
+        status_code: int | None = None,
         provider_type: str = "",
         provider_code: str = "",
-        retry_after: Optional[float] = None,
+        retry_after: float | None = None,
     ) -> None:
         super().__init__(message)
         self.status_code = status_code
@@ -148,7 +147,7 @@ _MODEL_MARKERS = (
 )
 
 
-def parse_retry_after(value: Optional[str]) -> Optional[float]:
+def parse_retry_after(value: str | None) -> float | None:
     """Parse a ``Retry-After`` header value into seconds.
 
     Accepts delay-seconds (``"30"``) and HTTP-date formats.
@@ -175,7 +174,7 @@ def parse_retry_after(value: Optional[str]) -> Optional[float]:
 
 def classify_response(
     status_code: int,
-    headers: Optional[dict] = None,
+    headers: dict | None = None,
     body_text: str = "",
 ) -> LLMError:
     """Build a typed :class:`LLMError` from an HTTP error response.

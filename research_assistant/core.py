@@ -6,9 +6,9 @@ import sys
 import zipfile
 from collections import defaultdict
 from pathlib import Path
-from typing import Optional, List, Dict, Any
+from typing import Any
 
-from .constants import IMAGE_EXTENSIONS, MANUSCRIPT_EXTENSIONS, SOURCE_EXTENSIONS, DATA_EXTENSIONS
+from .constants import DATA_EXTENSIONS, IMAGE_EXTENSIONS, MANUSCRIPT_EXTENSIONS, SOURCE_EXTENSIONS
 
 _dotenv_loaded = False
 
@@ -52,7 +52,7 @@ def setup_claude_skills(package_dir: Path, work_dir: Path) -> None:
     """
     source_claude = package_dir / ".claude"
     dest_claude = work_dir / ".claude"
-    
+
     # Copy .claude directory (which includes skills/ and WRITER.md) if source exists
     if source_claude.exists():
         try:
@@ -64,7 +64,7 @@ def setup_claude_skills(package_dir: Path, work_dir: Path) -> None:
             )
 
 
-def get_api_key(api_key: Optional[str] = None) -> str:
+def get_api_key(api_key: str | None = None) -> str:
     """Get the LLM API key.
 
     Checks: explicit param -> LLM_API_KEY env.
@@ -95,9 +95,9 @@ def load_system_instructions(work_dir: Path) -> str:
         System instructions string.
     """
     instructions_file = work_dir / ".claude" / "WRITER.md"
-    
+
     if instructions_file.exists():
-        with open(instructions_file, 'r', encoding='utf-8') as f:
+        with open(instructions_file, encoding='utf-8') as f:
             return f.read()
     else:
         # Fallback if WRITER.md doesn't exist
@@ -107,7 +107,7 @@ def load_system_instructions(work_dir: Path) -> str:
         )
 
 
-def ensure_output_folder(cwd: Path, custom_dir: Optional[str] = None) -> Path:
+def ensure_output_folder(cwd: Path, custom_dir: str | None = None) -> Path:
     """
     Ensure the writing_outputs folder exists.
     
@@ -122,7 +122,7 @@ def ensure_output_folder(cwd: Path, custom_dir: Optional[str] = None) -> Path:
         output_folder = Path(custom_dir).resolve()
     else:
         output_folder = cwd / "writing_outputs"
-    
+
     output_folder.mkdir(exist_ok=True, parents=True)
     return output_folder
 
@@ -147,7 +147,7 @@ def get_data_extensions() -> frozenset[str]:
     return DATA_EXTENSIONS
 
 
-def get_data_files(cwd: Path, data_files: Optional[List[str]] = None) -> List[Path]:
+def get_data_files(cwd: Path, data_files: list[str] | None = None) -> list[Path]:
     """
     Get data files either from provided list or from data folder.
     
@@ -160,20 +160,20 @@ def get_data_files(cwd: Path, data_files: Optional[List[str]] = None) -> List[Pa
     """
     if data_files:
         return [Path(f).resolve() for f in data_files]
-    
+
     data_folder = cwd / "data"
     if not data_folder.exists():
         return []
-    
+
     files = []
     for file_path in data_folder.iterdir():
         if file_path.is_file():
             files.append(file_path)
-    
+
     return files
 
 
-def extract_images_from_docx(docx_path: Path, figures_output: Path) -> List[Dict[str, Any]]:
+def extract_images_from_docx(docx_path: Path, figures_output: Path) -> list[dict[str, Any]]:
     """
     Extract all images from a .docx file and copy them to the figures folder.
     
@@ -190,50 +190,50 @@ def extract_images_from_docx(docx_path: Path, figures_output: Path) -> List[Dict
     """
     extracted_images = []
     image_extensions = get_image_extensions()
-    
+
     try:
         with zipfile.ZipFile(docx_path, 'r') as zip_ref:
             # List all files in the archive
             all_files = zip_ref.namelist()
-            
+
             # Filter for files in word/media/ directory that are images
             media_files = [f for f in all_files if f.startswith('word/media/')]
-            
+
             for media_file in media_files:
                 # Get the filename from the path
                 file_name = Path(media_file).name
                 file_ext = Path(media_file).suffix.lower()
-                
+
                 # Only extract if it's an image file
                 if file_ext in image_extensions:
                     # Extract to figures folder
                     output_path = figures_output / file_name
-                    
+
                     # Read the file from the zip and write it to the output
                     with zip_ref.open(media_file) as source:
                         with open(output_path, 'wb') as target:
                             target.write(source.read())
-                    
+
                     extracted_images.append({
                         'name': file_name,
                         'path': str(output_path),
                         'source_docx': docx_path.name
                     })
-    
+
     except (zipfile.BadZipFile, RuntimeError, KeyError):
         print(f"Warning: {docx_path.name} is not a valid .docx file (ZIP archive)")
     except Exception as e:
         print(f"Warning: Could not extract images from {docx_path.name}: {str(e)}")
-    
+
     return extracted_images
 
 
 def process_data_files(
     cwd: Path,
-    data_files: List[Path],
+    data_files: list[Path],
     paper_output_path: str,
     delete_originals: bool = False,
-) -> Optional[Dict[str, Any]]:
+) -> dict[str, Any] | None:
     """
     Process data files by copying them to the paper output folder.
     Manuscript files (.tex) go to drafts/, 
@@ -253,24 +253,24 @@ def process_data_files(
     """
     if not data_files:
         return None
-    
+
     paper_output = Path(paper_output_path)
     data_output = paper_output / "data"
     figures_output = paper_output / "figures"
     drafts_output = paper_output / "drafts"
     sources_output = paper_output / "sources"
-    
+
     # Ensure output directories exist
     data_output.mkdir(parents=True, exist_ok=True)
     figures_output.mkdir(parents=True, exist_ok=True)
     drafts_output.mkdir(parents=True, exist_ok=True)
     sources_output.mkdir(parents=True, exist_ok=True)
-    
+
     image_extensions = get_image_extensions()
     manuscript_extensions = get_manuscript_extensions()
     source_extensions = get_source_extensions()
     data_extensions = get_data_extensions()
-    
+
     processed_info = {
         'data_files': [],
         'image_files': [],
@@ -278,7 +278,7 @@ def process_data_files(
         'source_files': [],
         'all_files': []
     }
-    
+
     for file_path in data_files:
         file_ext = file_path.suffix.lower()
         file_name = file_path.name
@@ -354,11 +354,11 @@ def process_data_files(
                     original.unlink()
             except Exception as e:
                 print(f"Warning: Could not delete original file {original.name}: {e}")
-    
+
     return processed_info
 
 
-def create_data_context_message(processed_info: Optional[Dict[str, Any]]) -> str:
+def create_data_context_message(processed_info: dict[str, Any] | None) -> str:
     """
     Create a context message about available data files.
     
@@ -370,9 +370,9 @@ def create_data_context_message(processed_info: Optional[Dict[str, Any]]) -> str
     """
     if not processed_info or not processed_info['all_files']:
         return ""
-    
+
     context_parts = ["\n[DATA FILES AVAILABLE]"]
-    
+
     # CRITICAL: If manuscript files (.tex) are present, this is an EDITING task
     if processed_info.get('manuscript_files'):
         context_parts.append("\n⚠️  EDITING MODE - Manuscript files (.tex) detected!")
@@ -384,44 +384,44 @@ def create_data_context_message(processed_info: Optional[Dict[str, Any]]) -> str
         context_parts.append("   → Apply the requested changes/improvements")
         context_parts.append("   → Create new version following version numbering protocol")
         context_parts.append("   → Document changes in revision_notes.md")
-    
+
     if processed_info.get('source_files'):
         context_parts.append("\nSource/Context files (in sources/ folder for reference):")
         for file_info in processed_info['source_files']:
             ext = file_info.get('extension', '')
             context_parts.append(f"  - {file_info['name']} ({ext}): {file_info['path']}")
         context_parts.append("\nNote: These files are available as reference/context material.")
-    
+
     if processed_info.get('data_files'):
         context_parts.append("\nData files (in data/ folder):")
         for file_info in processed_info['data_files']:
             context_parts.append(f"  - {file_info['name']}: {file_info['path']}")
-    
+
     if processed_info.get('image_files'):
         # Separate images by source (direct vs extracted from docx)
         direct_images = [img for img in processed_info['image_files'] if 'source_docx' not in img]
         extracted_images = [img for img in processed_info['image_files'] if 'source_docx' in img]
-        
+
         context_parts.append("\nImage files (in figures/ folder):")
-        
+
         if direct_images:
             context_parts.append("  Directly provided:")
             for file_info in direct_images:
                 context_parts.append(f"    - {file_info['name']}: {file_info['path']}")
-        
+
         if extracted_images:
             images_by_docx: dict[str, list] = defaultdict(list)
             for img in extracted_images:
                 images_by_docx[img['source_docx']].append(img)
-            
+
             context_parts.append("  Extracted from .docx files:")
             for docx_name, images in images_by_docx.items():
                 img_names = ', '.join([img['name'] for img in images])
                 context_parts.append(f"    - From {docx_name}: {img_names}")
-        
+
         context_parts.append("\nNote: These images can be referenced as figures in the paper.")
-    
+
     context_parts.append("[END DATA FILES]\n")
-    
+
     return "\n".join(context_parts)
 

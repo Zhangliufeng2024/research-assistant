@@ -1,57 +1,62 @@
 """Async API for programmatic scientific document generation."""
 
+import asyncio
 import os
 import time
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Optional, List, Dict, Any, AsyncGenerator
+from typing import Any
 
+from .agent import run_agent
 from .config import (
-    load_project_env,
-    resolve_model,
+    build_llm_client,
     build_system_instructions,
     generate_session_dir_name,
-    build_llm_client,
-)
-from .agent import run_agent, AgentResult
-from .tools.registry import ToolRegistry
-from .retry import (
-    ContextLimitError,
-    get_max_retries,
-    get_heartbeat_timeout,
+    load_project_env,
+    resolve_model,
 )
 from .core import (
-    get_api_key,
     ensure_output_folder,
+    get_api_key,
     get_data_files,
     process_data_files,
     setup_claude_skills,
 )
-from .models import ProgressUpdate, TextUpdate, PaperResult, PaperMetadata, PaperFiles, TokenUsage
-from .utils import (
-    scan_paper_directory,
-    count_citations_in_bib,
-    extract_citation_style,
-    count_words_in_tex,
-    extract_title_from_tex,
-    count_words_in_docx,
-    extract_title_from_docx,
-)
+from .models import PaperFiles, PaperMetadata, PaperResult, ProgressUpdate, TextUpdate
 from .orchestrator import run_orchestrated_generation
+from .retry import (
+    ContextLimitError,
+    get_heartbeat_timeout,
+    get_max_retries,
+)
+from .tools.registry import ToolRegistry
+from .utils import (
+    count_citations_in_bib,
+    count_words_in_docx,
+    count_words_in_tex,
+    extract_citation_style,
+    extract_title_from_docx,
+    extract_title_from_tex,
+    scan_paper_directory,
+)
 
 
 async def generate_paper(
     query: str,
-    output_dir: Optional[str] = None,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    model: Optional[str] = None,
-    provider: Optional[str] = None,
-    data_files: Optional[List[str]] = None,
-    cwd: Optional[str] = None,
+    output_dir: str | None = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    model: str | None = None,
+    provider: str | None = None,
+    data_files: list[str] | None = None,
+    cwd: str | None = None,
     track_token_usage: bool = False,
     auto_continue: bool = True,
     multi_agent: bool = False,
-) -> AsyncGenerator[Dict[str, Any], None]:
+    cancel_event: asyncio.Event | None = None,
+    budget_limits: Any | None = None,
+    use_pipeline: bool | None = None,
+) -> AsyncGenerator[dict[str, Any], None]:
     """Generate a scientific document asynchronously with progress updates."""
     start_time = time.time()
 
@@ -79,6 +84,8 @@ async def generate_paper(
     target_dir_name = generate_session_dir_name(query)
     system_instructions = build_system_instructions(work_dir, target_dir_name)
 
+    # Resolve data files once; reuse the list later for actual processing.
+    data_file_paths: list = []
     if data_files:
         data_file_paths = get_data_files(work_dir, data_files)
         if data_file_paths:
@@ -94,25 +101,46 @@ async def generate_paper(
 
     # Multi-agent mode
     if multi_agent:
+        if use_pipeline is None:
+            use_pipeline = os.environ.get("RA_PIPELINE", "true").lower() in ("true", "1", "yes")
         output_folder = ensure_output_folder(work_dir, output_dir)
         paper_output_dir = work_dir / "writing_outputs" / target_dir_name
 
         yield ProgressUpdate(
-            message=f"Multi-agent mode: orchestrating with model {model}",
+            message=f"Multi-agent mode ({'pipeline' if use_pipeline else 'orchestrator'}): "
+                    f"model {model}",
             stage="initialization",
             details={"mode": "multi_agent", "model": model},
         ).to_dict()
 
-        async for update in run_orchestrated_generation(
-            query=query,
-            model=model,
-            work_dir=work_dir,
-            output_dir=paper_output_dir,
-            api_key=api_key,
-            base_url=base_url,
-            provider=provider,
-        ):
-            yield update
+        if use_pipeline:
+            from .kernel.events import HookBus
+            from .pipeline.runner import run_pipeline
+
+            async for update in run_pipeline(
+                query=query,
+                model=model,
+                work_dir=work_dir,
+                output_dir=paper_output_dir,
+                api_key=api_key,
+                base_url=base_url,
+                provider=provider,
+                cancel_event=cancel_event,
+                hooks=HookBus(),
+                budget_limits=budget_limits,
+            ):
+                yield update
+        else:
+            async for update in run_orchestrated_generation(
+                query=query,
+                model=model,
+                work_dir=work_dir,
+                output_dir=paper_output_dir,
+                api_key=api_key,
+                base_url=base_url,
+                provider=provider,
+            ):
+                yield update
 
         file_info = scan_paper_directory(paper_output_dir)
         result = _build_paper_result(paper_output_dir, file_info)
@@ -152,12 +180,22 @@ async def generate_paper(
                 files_written.append(fp)
 
     try:
+        from .agent import RunConfig
+        from .kernel.budget import BudgetGuard
+
+        budget = BudgetGuard(
+            limits=budget_limits, model=model,
+        ) if budget_limits is not None else None
         agent_result = await run_agent(
             prompt=query,
             system_prompt=system_instructions,
             llm_client=llm_client,
             tools=tool_registry,
-            auto_continue=auto_continue,
+            config=RunConfig(
+                auto_continue=auto_continue,
+                budget=budget,
+                cancel_event=cancel_event,
+            ),
             on_text=_on_text,
             on_tool_use=_on_tool,
         )
@@ -179,9 +217,7 @@ async def generate_paper(
             yield error_result
             return
 
-        if data_files:
-            data_file_paths = get_data_files(work_dir, data_files)
-            if data_file_paths:
+        if data_file_paths:
                 processed_info = process_data_files(
                     work_dir, data_file_paths, str(output_directory), delete_originals=False,
                 )
@@ -211,7 +247,7 @@ async def generate_paper(
         await llm_client.close()
 
 
-def _find_most_recent_output(output_folder: Path, start_time: float) -> Optional[Path]:
+def _find_most_recent_output(output_folder: Path, start_time: float) -> Path | None:
     """Find the most recently created/modified output directory."""
     try:
         output_dirs = [d for d in output_folder.iterdir() if d.is_dir()]
@@ -225,7 +261,7 @@ def _find_most_recent_output(output_folder: Path, start_time: float) -> Optional
         return None
 
 
-def _build_paper_result(paper_dir: Path, file_info: Dict[str, Any]) -> PaperResult:
+def _build_paper_result(paper_dir: Path, file_info: dict[str, Any]) -> PaperResult:
     """Build a comprehensive PaperResult from scanned files."""
     from datetime import datetime
 
@@ -296,7 +332,7 @@ def _build_paper_result(paper_dir: Path, file_info: Dict[str, Any]) -> PaperResu
     )
 
 
-def _create_error_result(error_message: str) -> Dict[str, Any]:
+def _create_error_result(error_message: str) -> dict[str, Any]:
     return PaperResult(
         status="failed",
         paper_directory="",

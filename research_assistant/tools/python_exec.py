@@ -5,7 +5,7 @@ import sys
 import uuid
 from pathlib import Path
 
-from ..constants import OUTPUT_TRUNCATION_LIMIT, OUTPUT_TRUNCATION_HALF
+from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
 from .bash import _kill_process
 
 

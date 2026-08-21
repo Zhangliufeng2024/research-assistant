@@ -4,7 +4,7 @@ import asyncio
 import os
 import sys
 
-from ..constants import OUTPUT_TRUNCATION_LIMIT, OUTPUT_TRUNCATION_HALF
+from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:

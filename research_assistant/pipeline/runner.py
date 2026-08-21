@@ -17,20 +17,22 @@ import asyncio
 import json
 import shutil
 import time
+from collections.abc import AsyncGenerator
 from pathlib import Path
-from typing import Any, AsyncGenerator, Optional
+from typing import Any
 
-from ..agent import run_agent, AgentResult as LoopResult, RunConfig
-from ..llm.factory import create_llm_client
+from ..agent import AgentResult as LoopResult
+from ..agent import RunConfig, run_agent
 from ..kernel.budget import BudgetGuard, BudgetLimits
-from ..kernel.events import EventKind, HookBus
-from ..models import ProgressUpdate, TextUpdate, TokenUsage
+from ..kernel.events import HookBus
+from ..llm.factory import create_llm_client
+from ..models import ProgressUpdate, TextUpdate
 from ..orchestrator import (
-    _parse_plan,
-    _sanitize_filename,
+    _FIGURE_PROMPT,
     _PLANNER_PROMPT,
     _RESEARCH_PROMPT,
-    _FIGURE_PROMPT,
+    _parse_plan,
+    _sanitize_filename,
 )
 from .artifacts import ArtifactStore
 
@@ -89,12 +91,12 @@ async def _run_stage_agent(
     *,
     model: str,
     work_dir: Path,
-    api_key: Optional[str],
-    base_url: Optional[str],
-    provider: Optional[str],
+    api_key: str | None,
+    base_url: str | None,
+    provider: str | None,
     budget: BudgetGuard,
     hooks: HookBus,
-    cancel_event: Optional[asyncio.Event],
+    cancel_event: asyncio.Event | None,
     auto_continue: bool = True,
     max_continuations: int = 10,
 ) -> LoopResult:
@@ -140,14 +142,14 @@ async def run_pipeline(
     work_dir: Path,
     output_dir: Path,
     *,
-    api_key: Optional[str] = None,
-    base_url: Optional[str] = None,
-    provider: Optional[str] = None,
+    api_key: str | None = None,
+    base_url: str | None = None,
+    provider: str | None = None,
     max_parallel_sections: int = 4,
     max_parallel_figures: int = 4,
-    cancel_event: Optional[asyncio.Event] = None,
-    hooks: Optional[HookBus] = None,
-    budget_limits: Optional[BudgetLimits] = None,
+    cancel_event: asyncio.Event | None = None,
+    hooks: HookBus | None = None,
+    budget_limits: BudgetLimits | None = None,
     max_revision_rounds: int = 3,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Execute the full generation pipeline, yielding progress updates."""
@@ -458,7 +460,7 @@ async def run_pipeline(
              f"(gates: {'PASS' if gate_report.passed else 'PARTIAL'}, "
              f"cost ${budget.state.cost_usd:.2f})", "complete")
 
-    from ..utils import scan_paper_directory
     from ..api import _build_paper_result  # lazy to avoid circular import
+    from ..utils import scan_paper_directory
     file_info = scan_paper_directory(output_dir)
     yield _build_paper_result(output_dir, file_info).to_dict()

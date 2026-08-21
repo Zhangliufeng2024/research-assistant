@@ -1,0 +1,14 @@
+id: ml_shm_survey
+description: "ML for structural health monitoring — AI-for-engineering domain"
+query: >
+  Write a survey-style paper (about 1500 words) on deep learning for
+  structural health monitoring, covering CNN and LSTM approaches to vibration
+  based damage detection, benchmark datasets such as Z24, and remaining
+  challenges for field deployment.
+expect_sections: ["Introduction", "Methods", "Results", "Discussion", "Conclusion"]
+min_words: 1100
+min_citations: 8
+citation_pass_rate: 0.9
+min_figures: 1
+budget_usd: 2.5
+max_wall_seconds: 2400

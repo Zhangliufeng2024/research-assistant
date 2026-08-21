@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 from pathlib import Path
-from typing import Any, Optional
+from typing import Any
 
 from .base import Gate, GateResult
 
@@ -26,7 +26,7 @@ class CitationGate(Gate):
         self,
         bib_path: str | Path,
         min_pass_rate: float = 0.90,
-        report_output: Optional[str | Path] = None,
+        report_output: str | Path | None = None,
         verify_fn=None,
     ) -> None:
         self.bib_path = Path(bib_path)
