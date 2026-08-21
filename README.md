@@ -34,6 +34,8 @@ Quality policies are enforced by code, not just prompts:
 
 Key environment variables: `RA_MAX_COST_USD`, `RA_MAX_TOKENS`, `RA_MAX_TURNS`,
 `RA_MAX_WALL_SECONDS`, `RA_PIPELINE` (multi-agent implementation switch),
+`RA_PERMISSION_MODE` (`deny_dangerous` default, `off` to disable dangerous-command
+blocking), `ANTHROPIC_PROMPT_CACHE` (`0` disables cache_control breakpoints),
 `RA_HEARTBEAT_TIMEOUT`, `RA_AUTO_CONTINUE`.
 
 ## Quick Start
