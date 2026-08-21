@@ -8,9 +8,12 @@
     initialization: "初始化",
     planning: "规划中",
     research: "研究中",
+    revision: "质量修订中",
+    finalization: "定稿中",
     writing: "写作中",
     compilation: "编译中",
     complete: "已完成",
+    cancelled: "已停止",
     error: "出错",
   };
 
@@ -32,7 +35,9 @@
 
   const queryInput = $("#query");
   const multiAgentCheckbox = $("#multi-agent");
+  const maxCostInput = $("#max-cost");
   const btnGenerate = $("#btn-generate");
+  const btnStop = $("#btn-stop");
   const progressPanel = $("#progress-panel");
   const progressBar = $("#progress-bar");
   const progressStage = $("#progress-stage");
@@ -49,6 +54,7 @@
 
   let ws = null;
   let currentPaperName = null;
+  let currentTaskId = null;
 
   // === View switching ===
   tabs.forEach((tab) => {
@@ -86,14 +92,18 @@
     ws = new WebSocket(`${protocol}//${location.host}/ws/generate`);
 
     ws.onopen = () => {
-      ws.send(
-        JSON.stringify({
-          action: "start",
-          query: query,
-          multi_agent: multiAgentCheckbox.checked,
-          track_token_usage: true,
-        })
-      );
+      const payload = {
+        action: "start",
+        query: query,
+        multi_agent: multiAgentCheckbox.checked,
+        track_token_usage: true,
+      };
+      const maxCost = parseFloat(maxCostInput.value);
+      if (!Number.isNaN(maxCost) && maxCost > 0) {
+        payload.max_cost_usd = maxCost;
+      }
+      ws.send(JSON.stringify(payload));
+      btnStop.classList.remove("hidden");
     };
 
     ws.onmessage = (event) => {
@@ -108,6 +118,8 @@
     ws.onclose = () => {
       btnGenerate.disabled = false;
       btnGenerate.textContent = "开始生成";
+      btnStop.classList.add("hidden");
+      currentTaskId = null;
       ws = null;
     };
   }
@@ -115,10 +127,18 @@
   function handleMessage(msg) {
     switch (msg.type) {
       case "connected":
+        currentTaskId = msg.task_id || null;
         appendLog("已连接，任务启动中...");
         break;
 
       case "progress":
+        if (msg.stage === "cancelled") {
+          appendLog(msg.message || "任务已停止");
+          btnStop.classList.add("hidden");
+          btnGenerate.disabled = false;
+          btnGenerate.textContent = "开始生成";
+          break;
+        }
         handleProgress(msg);
         break;
 
@@ -127,18 +147,40 @@
         break;
 
       case "result":
+        btnStop.classList.add("hidden");
         handleResult(msg);
         break;
 
       case "error":
+        btnStop.classList.add("hidden");
         showError(msg.message);
         break;
 
       case "done":
+        btnStop.classList.add("hidden");
         if (ws) ws.close();
         break;
     }
   }
+
+  async function stopGeneration() {
+    if (!currentTaskId) return;
+    btnStop.disabled = true;
+    btnStop.textContent = "停止中...";
+    appendLog("正在请求停止任务...");
+    try {
+      await fetch(`/api/tasks/${encodeURIComponent(currentTaskId)}/stop`, {
+        method: "POST",
+      });
+    } catch (e) {
+      appendLog(`停止请求失败: ${e.message}`);
+    } finally {
+      btnStop.disabled = false;
+      btnStop.textContent = "停止";
+    }
+  }
+
+  btnStop.addEventListener("click", stopGeneration);
 
   function handleProgress(msg) {
     const stage = msg.stage || "initialization";
