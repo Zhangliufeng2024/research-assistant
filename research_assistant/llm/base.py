@@ -10,25 +10,6 @@ from typing import Any, Awaitable, Callable, Optional
 from ..models import TokenUsage
 from ..constants import DEFAULT_LLM_REQUEST_INTERVAL
 
-_last_llm_request_time: float = 0.0
-
-
-async def _throttle_llm() -> None:
-    """Enforce minimum interval between LLM API requests."""
-    global _last_llm_request_time
-    raw = os.getenv("LLM_REQUEST_INTERVAL")
-    try:
-        interval = float(raw) if raw is not None else DEFAULT_LLM_REQUEST_INTERVAL
-    except (ValueError, TypeError):
-        interval = DEFAULT_LLM_REQUEST_INTERVAL
-    if interval <= 0:
-        return
-    now = time.monotonic()
-    elapsed = now - _last_llm_request_time
-    if elapsed < interval and _last_llm_request_time > 0:
-        await asyncio.sleep(interval - elapsed)
-    _last_llm_request_time = time.monotonic()
-
 
 OnChunkCallback = Callable[[str], Awaitable[None] | None]
 
@@ -56,7 +37,31 @@ class LLMClient(ABC):
     Subclasses implement the wire protocol for a specific API format
     (Anthropic Messages API, OpenAI Chat Completions, etc.) and convert
     responses into the unified ``LLMResponse`` model.
+
+    Rate limiting is handled per-instance via ``_throttle()``, using an
+    ``asyncio.Lock`` so concurrent calls from the same client are serialised
+    without cross-client interference.
     """
+
+    def __init__(self) -> None:
+        self._last_request_time: float = 0.0
+        self._throttle_lock: asyncio.Lock = asyncio.Lock()
+
+    async def _throttle(self) -> None:
+        """Enforce minimum interval between LLM API requests (per-instance)."""
+        async with self._throttle_lock:
+            raw = os.getenv("LLM_REQUEST_INTERVAL")
+            try:
+                interval = float(raw) if raw is not None else DEFAULT_LLM_REQUEST_INTERVAL
+            except (ValueError, TypeError):
+                interval = DEFAULT_LLM_REQUEST_INTERVAL
+            if interval <= 0:
+                return
+            now = time.monotonic()
+            elapsed = now - self._last_request_time
+            if elapsed < interval and self._last_request_time > 0:
+                await asyncio.sleep(interval - elapsed)
+            self._last_request_time = time.monotonic()
 
     @abstractmethod
     async def chat(
@@ -68,6 +73,7 @@ class LLMClient(ABC):
         temperature: float = 0.7,
         max_tokens: int = 16384,
         on_chunk: Optional[OnChunkCallback] = None,
+        on_activity: Optional[Any] = None,
     ) -> LLMResponse:
         """Send a chat request and return the full response.
 
@@ -75,6 +81,10 @@ class LLMClient(ABC):
         provider's streaming API and call ``on_chunk(text_delta)`` for
         each text fragment as it arrives.  The returned ``LLMResponse``
         still contains the full accumulated content.
+
+        When *on_activity* is provided, the implementation should call it
+        (no arguments) on every protocol-level sign of life (each SSE line)
+        so callers can distinguish "slow but alive" from "stuck".
         """
 
     @abstractmethod

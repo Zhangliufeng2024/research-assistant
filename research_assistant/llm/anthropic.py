@@ -107,6 +107,7 @@ class AnthropicClient(LLMClient):
         temperature: float = 0.7,
         max_tokens: int = 16384,
         on_chunk: Optional[OnChunkCallback] = None,
+        on_activity: Optional[Any] = None,
     ) -> LLMResponse:
         base = self.base_url
         if not base.endswith("/v1"):
@@ -134,7 +135,7 @@ class AnthropicClient(LLMClient):
 
         if on_chunk is not None:
             body["stream"] = True
-            return await self._chat_streaming(url, headers, body, on_chunk)
+            return await self._chat_streaming(url, headers, body, on_chunk, on_activity)
 
         resp = await self._client.post(url, headers=headers, json=body)
 
@@ -150,6 +151,7 @@ class AnthropicClient(LLMClient):
         headers: dict,
         body: dict,
         on_chunk: OnChunkCallback,
+        on_activity: Optional[Any] = None,
     ) -> LLMResponse:
         """Stream the Anthropic response via SSE, calling on_chunk for text deltas."""
         content_text = ""
@@ -168,6 +170,8 @@ class AnthropicClient(LLMClient):
                 raise classify_response(resp.status_code, dict(resp.headers), resp.text)
 
             async for line in resp.aiter_lines():
+                if on_activity is not None:
+                    on_activity()
                 if not line.startswith("data: "):
                     continue
                 data_str = line[6:]
