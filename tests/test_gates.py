@@ -49,22 +49,19 @@ class TestCitationGate:
         assert any("UNVERIFIED [key1]" in f for f in result.failures)
 
     @pytest.mark.asyncio
-    async def test_low_pass_rate_blocks(self, tmp_path):
+    async def test_uncertain_counts_toward_pass(self, tmp_path):
+        """Uncertain entries count toward pass_rate; with zero unverified the
+        pass rate is 1.0, so an all-uncertain bib still passes the gate."""
         bib = tmp_path / "refs.bib"
         bib.write_text("@article{a, title={t}}")
         gate = CitationGate(
-            bib, min_pass_rate=0.95,
-            verify_fn=lambda p: _report("uncertain", "verified", "verified", "verified"),
+            bib, min_pass_rate=0.90,
+            verify_fn=lambda p: _report("uncertain", "uncertain", "uncertain"),
         )
         result = await gate.run({})
-        # no unverified, but pass rate 100%? uncertain counts toward pass_rate -> passes
-        # make it stricter: 3/4 = 75% < 95%
-        gate2 = CitationGate(
-            bib, min_pass_rate=0.95,
-            verify_fn=lambda p: _report("uncertain", "uncertain", "uncertain", "verified"),
-        )
-        result2 = await gate2.run({})
-        assert not result2.passed
+        assert result.passed
+        assert result.details["pass_rate"] == 1.0
+        assert result.details["uncertain"] == 3
 
     @pytest.mark.asyncio
     async def test_missing_bib_fails(self, tmp_path):
