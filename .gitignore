@@ -1,6 +1,7 @@
 # Python
 __pycache__/
 *.py[cod]
+*.pyc
 *$py.class
 *.egg-info/
 dist/
@@ -55,3 +56,9 @@ existing_figures/
 .claude/memory/
 .claude/settings.local.json
 .claude/skills.zip
+
+# Evaluation results (generated at runtime)
+eval_results/
+
+# Local research-assistant state
+.ra/

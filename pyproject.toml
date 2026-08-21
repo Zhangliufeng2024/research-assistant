@@ -13,6 +13,9 @@ dependencies = [
     "python-docx>=1.1.0",
 ]
 
+[project.optional-dependencies]
+web = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
+
 # System Dependencies (must be installed separately):
 #
 # LibreOffice (optional, for .docx to PDF conversion):
@@ -24,6 +27,7 @@ dependencies = [
 
 [project.scripts]
 research-assistant = "research_assistant.cli:cli_main"
+research-assistant-web = "research_assistant.web:main"
 
 [build-system]
 requires = ["hatchling"]
@@ -40,4 +44,13 @@ asyncio_mode = "auto"
 dev-dependencies = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pyinstaller>=6.0",
 ]
+
+[tool.ruff]
+line-length = 100
+target-version = "py310"
+
+[tool.ruff.lint]
+select = ["E", "F", "W", "I", "UP", "B"]
+ignore = ["E501"]
