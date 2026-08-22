@@ -53,6 +53,15 @@ export function renderChatView(root, onCleanup) {
     if ((e.ctrlKey || e.metaKey) && e.key === "Enter") { e.preventDefault(); send(); }
   });
 
+  /* 未配置模型时顶部引导（计划 D5）：Web / 桌面壳共用一处逻辑 */
+  const setupBannerSlot = el("div");
+  api.get("/api/settings").then((c) => {
+    if (!c || c.configured) return;
+    setupBannerSlot.append(el("div", { class: "setup-banner" },
+      el("span", {}, "尚未配置模型：填写 API Key 与模型名后即可开始对话。"),
+      el("a", { onclick: () => { location.hash = "#/settings"; } }, "去配置 →")));
+  }).catch(() => { /* 设置 API 不可用时不打扰对话 */ });
+
   const chatPanel = el("div", { class: "chat-panel" },
     el("div", { class: "chat-head" },
       el("span", { class: "chat-title" }, "SESSION"),
@@ -60,6 +69,7 @@ export function renderChatView(root, onCleanup) {
       ui.connHint,
       el("span", { style: "flex:1" }),
       el("button", { class: "btn btn-ghost btn-sm", onclick: () => { location.hash = "#/task"; } }, "长文档任务 →")),
+    setupBannerSlot,
     ui.stream,
     ui.approvalSlot,
     el("div", { class: "chat-foot" },
