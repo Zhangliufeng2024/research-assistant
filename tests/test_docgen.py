@@ -2,18 +2,16 @@
 
 from pathlib import Path
 
-import pytest
 from docx import Document
 
 from research_assistant.docgen import (
+    CrossReferenceManager,
+    DocumentTemplate,
     PaperBuilder,
     Reference,
-    parse_bibtex,
-    DocumentTemplate,
-    CrossReferenceManager,
     get_template,
     list_templates,
-    TEMPLATES,
+    parse_bibtex,
 )
 
 
@@ -130,7 +128,8 @@ class TestPaperBuilder:
 
     def test_add_figure_with_image(self, tmp_path):
         # Create a minimal valid PNG (1x1 pixel)
-        import struct, zlib
+        import struct
+        import zlib
         def _make_png():
             sig = b"\x89PNG\r\n\x1a\n"
             ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
@@ -156,7 +155,8 @@ class TestPaperBuilder:
         assert any("Figure 1. Test caption" in t for t in texts)
 
     def test_figure_auto_numbering(self, tmp_path):
-        import struct, zlib
+        import struct
+        import zlib
         def _make_png():
             sig = b"\x89PNG\r\n\x1a\n"
             ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
@@ -447,7 +447,8 @@ class TestCrossReferenceManager:
 
 class TestPaperBuilderCrossRefs:
     def _make_png(self):
-        import struct, zlib
+        import struct
+        import zlib
         sig = b"\x89PNG\r\n\x1a\n"
         ihdr_data = struct.pack(">IIBBBBB", 1, 1, 8, 2, 0, 0, 0)
         ihdr_crc = zlib.crc32(b"IHDR" + ihdr_data) & 0xFFFFFFFF

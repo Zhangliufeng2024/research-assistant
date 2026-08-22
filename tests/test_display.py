@@ -1,9 +1,9 @@
 """Tests for research_assistant.display — tool and status formatting."""
 
 from research_assistant.display import (
-    format_tool_start,
-    format_tool_result_tag,
     format_status_line,
+    format_tool_result_tag,
+    format_tool_start,
 )
 from research_assistant.models import TokenUsage
 

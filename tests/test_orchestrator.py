@@ -3,13 +3,13 @@
 import pytest
 
 from research_assistant.orchestrator import (
-    _parse_plan,
-    _extract_json_object,
-    _sanitize_filename,
+    AgentResult,
+    FigurePlan,
     OrchestrationPlan,
     SectionPlan,
-    FigurePlan,
-    AgentResult,
+    _extract_json_object,
+    _parse_plan,
+    _sanitize_filename,
 )
 
 

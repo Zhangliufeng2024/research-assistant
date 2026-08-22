@@ -1,7 +1,7 @@
 """Tests for research_assistant.llm.errors — structured error taxonomy."""
 
-import time
 import email.utils
+import time
 
 import httpx
 import pytest
@@ -10,8 +10,6 @@ from research_assistant.llm.errors import (
     AuthError,
     BadRequestError,
     ContextLimitError,
-    HeartbeatTimeoutError,
-    LLMError,
     ModelConfigError,
     OverloadedError,
     RateLimitError,

@@ -1,14 +1,18 @@
 """Tests for research_assistant.tools — built-in tool implementations."""
 
 import os
-import asyncio
-from pathlib import Path
 
 import pytest
 
-from research_assistant.tools.file_ops import read_file, write_file, edit_file, glob_files, grep_search
 from research_assistant.tools.bash import run_bash
-from research_assistant.tools.registry import ToolRegistry, TOOL_DEFINITIONS
+from research_assistant.tools.file_ops import (
+    edit_file,
+    glob_files,
+    grep_search,
+    read_file,
+    write_file,
+)
+from research_assistant.tools.registry import TOOL_DEFINITIONS, ToolRegistry
 
 
 class TestReadFile:

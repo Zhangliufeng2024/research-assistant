@@ -2,8 +2,6 @@
 
 import asyncio
 
-import pytest
-
 from research_assistant.agent import _drain_steer_queue
 
 

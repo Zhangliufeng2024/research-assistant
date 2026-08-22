@@ -1,7 +1,6 @@
 """Tests for research_assistant.tools.python_exec."""
 
 import os
-import asyncio
 
 import pytest
 
@@ -45,7 +44,7 @@ class TestRunPython:
     @pytest.mark.asyncio
     async def test_file_creation(self, tmp_path):
         code = f"from pathlib import Path; Path(r'{tmp_path / 'output.txt'}').write_text('created')"
-        result = await run_python(code, cwd=str(tmp_path))
+        await run_python(code, cwd=str(tmp_path))
         assert (tmp_path / "output.txt").read_text() == "created"
 
     @pytest.mark.asyncio

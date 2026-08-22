@@ -1,21 +1,18 @@
 """Tests for research_assistant.llm — LLM client abstraction."""
 
-import json
 import pytest
 
-from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
-from research_assistant.models import TokenUsage
 from research_assistant.llm.anthropic import (
     AnthropicClient,
-    _convert_tools_to_anthropic,
     _build_anthropic_messages,
+    _convert_tools_to_anthropic,
 )
+from research_assistant.llm.factory import create_llm_client, detect_provider
 from research_assistant.llm.openai_compat import (
     OpenAICompatClient,
-    _convert_tools_to_openai,
     _build_openai_messages,
+    _convert_tools_to_openai,
 )
-from research_assistant.llm.factory import detect_provider, create_llm_client
 
 
 class TestDetectProvider:

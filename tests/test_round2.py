@@ -1,21 +1,20 @@
 """Tests for round-2 improvements: caching, permissions, provider compat,
 skill sync, and single-agent session state."""
 
-import asyncio
 import json
 from pathlib import Path
 
 import httpx
 import pytest
 
+from research_assistant.agent import RunConfig, run_agent
+from research_assistant.core import SYNC_MANIFEST_NAME, sync_tree
 from research_assistant.llm.anthropic import AnthropicClient, _apply_cache_control
 from research_assistant.llm.base import LLMResponse
 from research_assistant.llm.openai_compat import OpenAICompatClient, uses_completion_tokens
-from research_assistant.agent import run_agent, RunConfig
-from research_assistant.core import sync_tree, SYNC_MANIFEST_NAME
+from research_assistant.models import TokenUsage
 from research_assistant.tools.permissions import PermissionPolicy, policy_from_env
 from research_assistant.tools.registry import ToolRegistry
-
 
 # ---------------------------------------------------------------------------
 # Prompt caching (Anthropic)
@@ -268,7 +267,7 @@ class TestSyncTree:
         (dst / "WRITER.md").write_text("my local edits", encoding="utf-8")
         self._touch(src, "WRITER.md", "shipped version")
 
-        report = sync_tree(src, dst)
+        sync_tree(src, dst)
         assert (dst / "WRITER.md").read_text(encoding="utf-8") == "my local edits"
         # once tracked, future changes DO propagate
         report2 = sync_tree(src, dst)  # still untracked -> skipped again
@@ -295,8 +294,6 @@ class TestSyncTree:
 @pytest.mark.asyncio
 async def test_single_agent_writes_run_json(tmp_path, monkeypatch):
     import research_assistant.api as api_mod
-    from research_assistant.agent import AgentResult
-    from research_assistant.models import TokenUsage
 
     monkeypatch.setattr(api_mod, "setup_claude_skills", lambda *a, **k: None)
     monkeypatch.setattr(

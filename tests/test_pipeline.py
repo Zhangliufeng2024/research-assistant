@@ -13,7 +13,6 @@ import pytest
 from research_assistant.pipeline.artifacts import ArtifactStore
 from research_assistant.session.store import SessionStore
 
-
 # ---------------------------------------------------------------------------
 # ArtifactStore
 # ---------------------------------------------------------------------------
@@ -53,7 +52,8 @@ class TestArtifactStore:
     def test_all_valid(self, tmp_path):
         store = ArtifactStore(tmp_path)
         a, b = tmp_path / "a", tmp_path / "b"
-        a.write_text("1"); b.write_text("2")
+        a.write_text("1")
+        b.write_text("2")
         store.register("a", a, stage="s")
         store.register("b", b, stage="s")
         assert store.all_valid("a", "b")
@@ -197,8 +197,8 @@ def _make_fake_agent(calls: list, workdir_holder: dict):
 @pytest.fixture
 def gate_stub(monkeypatch):
     """CitationGate that always passes without network."""
-    from research_assistant.gates import GateResult
     import research_assistant.gates as gates_pkg
+    from research_assistant.gates import GateResult
 
     class StubCitationGate(gates_pkg.CitationGate):
         async def run(self, context):
@@ -291,7 +291,7 @@ async def test_pipeline_cancel_before_start(tmp_path, monkeypatch, gate_stub):
     from research_assistant.pipeline.runner import run_pipeline
 
     out_dir = tmp_path / "run"
-    updates = await _collect(run_pipeline(
+    await _collect(run_pipeline(
         "q", "m", tmp_path, out_dir, cancel_event=cancel,
     ))
     assert calls == []

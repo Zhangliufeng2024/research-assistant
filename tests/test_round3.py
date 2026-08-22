@@ -2,11 +2,10 @@
 result rewriting, and session-log mirroring."""
 
 import asyncio
-import json
 
 import pytest
 
-from research_assistant.agent import run_agent, RunConfig
+from research_assistant.agent import RunConfig, run_agent
 from research_assistant.kernel.approval import (
     ApprovalDecision,
     QueueApprover,
@@ -221,8 +220,9 @@ class TestRepeatGuard:
     def test_counts_consecutive_identical_calls(self):
         guard = RepeatToolCallGuard(limit=3)
         args = {"command": "make all"}
-        for i in range(2):
-            verdict = guard.check_sync(args) if hasattr(guard, "check_sync") else None
+        for _ in range(2):
+            if hasattr(guard, "check_sync"):
+                guard.check_sync(args)
         # use the async path directly
         async def drive():
             outs = []
@@ -393,6 +393,7 @@ def test_run_config_has_new_fields():
 
 def test_generate_paper_signature_accepts_approver():
     import inspect
+
     from research_assistant.api import generate_paper
     params = inspect.signature(generate_paper).parameters
     assert "approver" in params

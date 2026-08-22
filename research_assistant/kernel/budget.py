@@ -142,6 +142,12 @@ class BudgetGuard:
                 logging.getLogger(__name__).warning(
                     "No price table entry for model %r — cost budget unenforceable", model
                 )
+        # 未知价格 + 设了成本上限 → 上限无法按美元强制执行（token/轮次/时长上限不受影响）。
+        # 快照里如实上报，前端据此显示告示而不是静默展示 $0.00。
+        price_known = bool(self.prices.get("input") or self.prices.get("output"))
+        self.cost_cap_enforceable = (
+            not self.limits.max_cost_usd or price_known
+        )
         self._warned: set[str] = set()
 
     # -- accumulation -------------------------------------------------------
@@ -220,6 +226,7 @@ class BudgetGuard:
             "total_tokens": s.total_tokens,
             "turns": s.turns,
             "cost_usd": round(s.cost_usd, 4),
+            "cost_cap_enforceable": self.cost_cap_enforceable,
             "limits": {
                 "max_cost_usd": self.limits.max_cost_usd,
                 "max_total_tokens": self.limits.max_total_tokens,

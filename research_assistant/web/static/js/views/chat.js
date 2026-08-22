@@ -320,6 +320,11 @@ export function renderChatView(root, onCleanup) {
       wrap.append(el("div", { class: "cost-track" },
         el("div", { class: `cost-fill ${pct >= 80 ? "hot" : ""}`, style: `width:${pct}%` })));
     }
+    // 模型无价格表时成本上限不可执行（BudgetGuard.snapshot 如实上报）——明示，别让 $0.00 装作免费
+    if (limit && b.cost_cap_enforceable === false) {
+      wrap.append(el("div", { class: "b-note" },
+        "⚠ 该模型无价格表：费用上限暂不生效（token/轮次/时长上限仍生效）"));
+    }
     if (typeof b.total_tokens === "number") {
       wrap.append(el("div", { class: "b-row" }, el("span", {}, "Tokens"),
         el("b", {}, fmtNum(b.total_tokens))));

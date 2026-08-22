@@ -61,3 +61,5 @@ ignore = ["E501"]
 [tool.ruff.lint.per-file-ignores]
 # Package __init__ files re-export the public API on purpose.
 "__init__.py" = ["F401"]
+# importorskip must run before eval imports (yaml is optional at test time).
+"tests/test_eval.py" = ["E402"]

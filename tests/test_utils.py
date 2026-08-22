@@ -1,18 +1,16 @@
 """Tests for research_assistant.utils."""
 
-import tempfile
-from pathlib import Path
 
 from research_assistant.utils import (
-    find_existing_papers,
-    detect_paper_reference,
-    scan_paper_directory,
     count_citations_in_bib,
-    count_words_in_tex,
-    extract_title_from_tex,
-    extract_citation_style,
     count_words_in_docx,
+    count_words_in_tex,
+    detect_paper_reference,
+    extract_citation_style,
     extract_title_from_docx,
+    extract_title_from_tex,
+    find_existing_papers,
+    scan_paper_directory,
 )
 
 
@@ -24,7 +22,8 @@ class TestFindExistingPapers:
         assert find_existing_papers(tmp_path / "nope") == []
 
     def test_returns_sorted_by_mtime(self, tmp_path):
-        import time, os
+        import os
+        import time
         old = tmp_path / "20240101_000000_old"
         old.mkdir()
         # Force different mtime by backdating the old directory

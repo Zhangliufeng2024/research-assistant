@@ -1,15 +1,15 @@
 """Tests for research_assistant.models."""
 
 import json
-from datetime import datetime, timezone
+from datetime import datetime
 
 from research_assistant.models import (
+    PaperFiles,
+    PaperMetadata,
+    PaperResult,
     ProgressUpdate,
     TextUpdate,
-    PaperMetadata,
-    PaperFiles,
     TokenUsage,
-    PaperResult,
 )
 
 

@@ -2,7 +2,6 @@
 
 import pytest
 
-from research_assistant.kernel.events import AgentEvent, EventKind, HookBus, HookVerdict
 from research_assistant.kernel.budget import (
     BudgetExceededError,
     BudgetGuard,
@@ -15,9 +14,9 @@ from research_assistant.kernel.context import (
     maybe_compact,
     window_for,
 )
+from research_assistant.kernel.events import AgentEvent, EventKind, HookBus, HookVerdict
 from research_assistant.llm.base import LLMClient, LLMResponse
 from research_assistant.models import TokenUsage
-
 
 # ---------------------------------------------------------------------------
 # HookBus
@@ -155,6 +154,17 @@ class TestBudget:
         assert snap["model"] == "deepseek-chat"
         assert snap["total_tokens"] == 110
         assert snap["limits"]["max_turns"] == 9
+
+    def test_cost_cap_enforceable_flag(self):
+        # 已知价格 + 设了成本上限 → 可执行
+        g1 = BudgetGuard(BudgetLimits(max_cost_usd=5), model="claude-sonnet-4-6")
+        assert g1.snapshot()["cost_cap_enforceable"] is True
+        # 未知价格 + 设了成本上限 → 如实上报不可执行（token 等其它上限不受影响）
+        g2 = BudgetGuard(BudgetLimits(max_cost_usd=5), model="agnes-2.0-flash")
+        assert g2.snapshot()["cost_cap_enforceable"] is False
+        # 未设成本上限 → 无所谓可不可执行，恒为 True
+        g3 = BudgetGuard(model="agnes-2.0-flash")
+        assert g3.snapshot()["cost_cap_enforceable"] is True
 
 
 # ---------------------------------------------------------------------------

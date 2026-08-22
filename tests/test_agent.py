@@ -1,16 +1,14 @@
 """Tests for research_assistant.agent — custom agentic loop."""
 
 import asyncio
-from unittest.mock import AsyncMock, MagicMock
-from dataclasses import dataclass, field
 
 import pytest
 
-from research_assistant.agent import run_agent, _accumulate_usage, _is_completion_loop, AgentResult
-from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
-from research_assistant.tools.registry import ToolRegistry
-from research_assistant.models import TokenUsage
+from research_assistant.agent import AgentResult, _accumulate_usage, _is_completion_loop, run_agent
 from research_assistant.constants import TASK_COMPLETE_MARKER
+from research_assistant.llm.base import LLMClient, LLMResponse, ToolCall
+from research_assistant.models import TokenUsage
+from research_assistant.tools.registry import ToolRegistry
 
 
 class MockLLMClient(LLMClient):
@@ -234,7 +232,7 @@ class TestSteerInjection:
         await steer_queue.put("focus on methods")
 
         steers_received = []
-        result = await run_agent(
+        await run_agent(
             prompt="Write a paper",
             system_prompt="",
             llm_client=CapturingClient(),
@@ -267,7 +265,7 @@ class TestSteerInjection:
             async def close(self):
                 pass
 
-        result = await run_agent(
+        await run_agent(
             prompt="Write",
             system_prompt="",
             llm_client=CapturingClient(),

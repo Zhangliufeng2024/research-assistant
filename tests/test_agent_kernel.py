@@ -5,9 +5,9 @@ import time
 
 import pytest
 
-from research_assistant.agent import run_agent, RunConfig
-from research_assistant.kernel.events import EventKind, HookBus, HookVerdict
+from research_assistant.agent import RunConfig, run_agent
 from research_assistant.kernel.budget import BudgetGuard, BudgetLimits
+from research_assistant.kernel.events import EventKind, HookBus, HookVerdict
 from research_assistant.llm.base import LLMClient, LLMResponse
 from research_assistant.llm.errors import HeartbeatTimeoutError
 from research_assistant.tools.registry import ToolRegistry

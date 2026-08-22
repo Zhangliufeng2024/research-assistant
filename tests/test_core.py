@@ -1,27 +1,24 @@
 """Tests for research_assistant.core."""
 
-import os
 import zipfile
 from pathlib import Path
 
 import pytest
 
 from research_assistant.core import (
-    get_api_key,
-    load_system_instructions,
+    create_data_context_message,
     ensure_output_folder,
+    extract_images_from_docx,
+    get_api_key,
+    get_data_extensions,
+    get_data_files,
     get_image_extensions,
     get_manuscript_extensions,
     get_source_extensions,
-    get_data_extensions,
-    get_data_files,
-    extract_images_from_docx,
+    load_system_instructions,
     process_data_files,
-    create_data_context_message,
-    ensure_dotenv_loaded,
     safe_resolve,
 )
-import pytest
 
 
 class TestGetApiKey:

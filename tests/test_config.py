@@ -1,10 +1,8 @@
 """Tests for research_assistant.config."""
 
-import os
-from pathlib import Path
 import pytest
 
-from research_assistant.config import resolve_model, build_llm_client, load_project_env
+from research_assistant.config import build_llm_client, resolve_model
 
 
 class TestResolveModel:
