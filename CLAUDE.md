@@ -81,12 +81,28 @@ When the user provides data files (placed in `data/` folder before running the C
 - ❌ ZERO tolerance for invented citations or "[citation needed]" placeholders
 - ✅ Use research-lookup extensively to find actual published papers
 - ✅ Verify every citation exists before adding to references.bib
+- ✅ **MANDATORY: Call `verify_citations` tool after assembling references.bib**
+
+**CITATION VERIFICATION IS NON-NEGOTIABLE:**
+
+After writing all references to `references/references.bib`, you MUST call:
+```
+verify_citations(
+    bib_file="<paper_dir>/references/references.bib",
+    output_file="<paper_dir>/sources/CITATION_VERIFICATION.md"
+)
+```
+- If the report shows **UNVERIFIED** citations: you MUST remove or replace them before proceeding
+- If the report shows **UNCERTAIN** citations: review and confirm manually
+- Do NOT finalize the paper or call `[TASK_COMPLETE]` until all citations pass or are resolved
+- The verification report is saved to `sources/CITATION_VERIFICATION.md` for audit
 
 **Research-Lookup First Approach:**
 1. Before writing ANY section, perform extensive research-lookup
 2. Find 5-10 real papers per major section
 3. Begin writing, integrating ONLY the real papers found
 4. If additional citations needed, perform more research-lookup first
+5. After all sections written, call `verify_citations` on the complete references.bib
 
 ## CRITICAL: Parallel Web Search Policy
 
@@ -183,10 +199,21 @@ This is non-negotiable. Research results are expensive to obtain and critical fo
 
 ### Phase 3: Quality Assurance and Delivery
 
-1. **Verify All Deliverables** - files created, citations verified, document complete
-2. **Finalize progress.md** - mark all items as `[done]`, add final metrics summary
-3. **Create Summary Report** - `SUMMARY.md` with files list and usage instructions
-4. **Conduct Peer Review** - Use peer-review skill, save as `PEER_REVIEW.md`
+1. **Verify All Citations (MANDATORY)** -- After assembling `references/references.bib`, call:
+   ```
+   verify_citations(
+       bib_file="<paper_dir>/references/references.bib",
+       output_file="<paper_dir>/sources/CITATION_VERIFICATION.md"
+   )
+   ```
+   - Fix every UNVERIFIED citation before proceeding (replace with a real verified paper)
+   - Review UNCERTAIN citations and confirm they are correct
+   - Do NOT skip this step even under time pressure
+
+2. **Verify All Deliverables** - files created, document complete, citations verified
+3. **Finalize progress.md** - mark all items as `[done]`, add final metrics summary
+4. **Create Summary Report** - `SUMMARY.md` with files list and usage instructions
+5. **Conduct Peer Review** - Use peer-review skill, save as `PEER_REVIEW.md`
 
 ## Special Document Types
 
