@@ -33,6 +33,7 @@ desktop.ini
 
 # pytest
 .pytest_cache/
+.ruff_cache/
 
 # Writing outputs (generated at runtime)
 writing_outputs/
@@ -62,3 +63,9 @@ eval_results/
 
 # Local research-assistant state
 .ra/
+
+# 产品在本仓库内运行时的临时脚本残留（run_python/bash 落在 cwd 的草稿）
+_ra_exec_*.py
+
+# build.py --restricted 的 PyInstaller 产物 spec（每次构建重新生成）
+ResearchAssistant_Trial.spec

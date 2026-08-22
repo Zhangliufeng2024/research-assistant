@@ -67,8 +67,8 @@ GitHub Releases 提供 `ResearchAssistant_setup_<版本>.exe`：安装后从开�
 首次运行选择一个工作文件夹即可开工；**模型 API Key 在「设置」页图形化配置**（含测试连接），
 无需手写 `.env`。卸载走系统「应用与功能」，用户工作目录数据不受影响。
 
-从源码构建安装包：`python -m PyInstaller ResearchAssistant.spec --noconfirm`，再运行
-`ISCC build\installer.iss`。
+从源码构建安装包：`python -m PyInstaller packaging/ResearchAssistant.spec --noconfirm`，
+再运行 `ISCC packaging\installer.iss`（或一键：`python build.py`）。
 
 #### 从源码安装
 

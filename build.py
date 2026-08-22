@@ -5,9 +5,10 @@ Usage:
     python build.py --restricted # Build restricted version (3-month expiry)
 """
 
+import re
+import shutil
 import subprocess
 import sys
-import shutil
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -146,12 +147,12 @@ def build(restricted: bool = False):
         print(f"  Output: {exe_path}")
         print(f"  Size:   {exe_path.stat().st_size / 1024 / 1024:.1f} MB")
         if restricted:
-            print(f"  Expiry: 2026-09-15")
+            print("  Expiry: 2026-09-15")
         print(f"{'='*60}")
 
         leaked = _check_for_leaked_keys(DIST / app_name)
         if leaked:
-            print(f"\nWARNING: Potential key leaks:")
+            print("\nWARNING: Potential key leaks:")
             for f in leaked:
                 print(f"  - {f}")
         else:
@@ -161,6 +162,8 @@ def build(restricted: bool = False):
 
 
 def _check_for_leaked_keys(dist_dir: Path) -> list[str]:
+    """扫描产物中是否混入 .env 或疑似密钥串（按前缀+长度泛式匹配，不硬编码具体值）。"""
+    leak_pattern = re.compile(r"\b(?:sk-|nvapi-)[A-Za-z0-9_-]{16,}")
     problems = []
     for f in dist_dir.rglob("*"):
         if f.name == ".env" and f.is_file():
@@ -168,7 +171,7 @@ def _check_for_leaked_keys(dist_dir: Path) -> list[str]:
         if f.suffix in (".json", ".txt", ".cfg", ".ini") and f.is_file():
             try:
                 content = f.read_text(encoding="utf-8", errors="ignore")
-                if "***REMOVED-KEY***" in content or "***REMOVED-KEY***" in content:
+                if leak_pattern.search(content):
                     problems.append(f"{f} (contains API key!)")
             except Exception:
                 pass
