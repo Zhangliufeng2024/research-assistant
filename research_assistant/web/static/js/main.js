@@ -2,11 +2,13 @@
 import { S } from "./store.js";
 import { api } from "./api.js";
 import { initRouter, registerRoutes } from "./router.js";
+import { renderChatView } from "./views/chat.js";
 import { renderTaskView } from "./views/task.js";
 import { renderPapersView } from "./views/papers.js";
 import { renderSettingsView } from "./views/settings.js";
 
 registerRoutes({
+  chat: renderChatView,   // D1：会话为主视图
   task: renderTaskView,
   papers: renderPapersView,
   settings: renderSettingsView,

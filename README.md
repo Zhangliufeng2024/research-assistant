@@ -14,6 +14,12 @@ AI-powered research and writing assistant that combines deep research with publi
 - **Figure generation** — schematics, data plots, AI-generated images via NVIDIA NIM (free) or any OpenAI-compatible image API
 - **Document review** — reads generated .docx to verify content completeness; optional PDF conversion via LibreOffice
 - **Multi-agent mode** — resumable pipeline state machine: PLAN → RESEARCH∥ → FIGURES∥ → ASSEMBLE → GATES → REVISION → FINALIZE
+- **Web console（「墨台」暗色控制台）** — stage timeline, live activity & LLM output
+  stream, real-time budget gauges, mid-run steer injection, tool approval cards,
+  run history with one-click resume (ArtifactStore checkpointing), events.jsonl
+  audit timeline, paper library with search/gallery/zip export. Zero build step:
+  vanilla ES modules served by FastAPI (`static/js/`), pure-function layers
+  covered by `node --test tests/js/`
 - **26 specialized skills** — from scientific writing and venue templates to LCA/carbon analysis and infographics
 - **Built-in tools** — read_file, write_file, edit_file, bash, glob_files, grep_search, run_python
 - **Programmatic API** — async generator interface with streaming progress updates

@@ -1,4 +1,4 @@
-/* hash 路由：#/task #/papers #/settings */
+/* hash 路由：#/chat #/task #/papers #/settings（会话为默认主视图） */
 
 const routes = {}; // name → render(root, onCleanup)
 let cleanupFn = null;
@@ -9,7 +9,7 @@ export function registerRoutes(map) {
 
 function currentRoute() {
   const h = location.hash.replace(/^#\/?/, "").split("/")[0];
-  return routes[h] ? h : "task";
+  return routes[h] ? h : "chat";
 }
 
 function apply() {

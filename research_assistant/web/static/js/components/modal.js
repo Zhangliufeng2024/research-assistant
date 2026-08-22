@@ -47,3 +47,17 @@ export function confirmDialog(message, { danger = true, okText = "确认", cance
     document.getElementById("modal-root").append(ov);
   });
 }
+
+/* 通用内容面板（调用方自填 DOM），返回 {close} */
+export function panelModal(title, buildContent) {
+  const { ov, dispose } = overlay(dispose);
+  const body = el("div", { class: "modal-body", style: "width:min(720px,92vw);max-height:86vh" },
+    el("button", { class: "modal-close", "aria-label": "关闭", onclick: () => dispose() }, "✕"));
+  if (title) body.append(el("div", { class: "panel-head" }, title));
+  const content = el("div", { class: "panel-body" });
+  body.append(content);
+  ov.append(body);
+  document.getElementById("modal-root").append(ov);
+  buildContent && buildContent(content, dispose);
+  return { close: dispose };
+}

@@ -5,7 +5,7 @@ import { wsConnect, wsSend, wsClose, wsConnected } from "../ws.js";
 import { emptyTask, reduceTask, RUN_STATUS_LABEL, runBadgeClass } from "../protocol.js";
 import { el, fmtDate, fmtCost, fmtNum } from "../format.js";
 import { toast } from "../components/toast.js";
-import { confirmDialog } from "../components/modal.js";
+import { confirmDialog, panelModal } from "../components/modal.js";
 import { createActivityStream, approvalCard } from "../components/activity.js";
 import { renderTimeline } from "../components/timeline.js";
 import { renderBudget } from "../components/budget.js";
@@ -336,13 +336,80 @@ export function renderTaskView(root, onCleanup) {
     }
   }
 
+  /* ---- 运行详情弹窗：run.json 概览 + events 审计时间线 ---- */
+  const EVENT_LABEL = {
+    run_start: "开始", run_end: "结束", msg_add: "消息", tool_call: "工具",
+    tool_result_rewrite: "结果改写", approval: "审批", steer: "转向",
+    compaction: "压缩", invariant_warning: "不变量告警", gates: "质量门",
+  };
+
+  function eventSummary(ev) {
+    const d = ev.data || {};
+    if (ev.kind === "msg_add") return `[${d.role || "?"}] ${(d.content || "").slice(0, 160)}`;
+    if (ev.kind === "tool_call") return `${d.tool} ${JSON.stringify(d.arguments || {}).slice(0, 140)}`;
+    if (ev.kind === "approval") return `${d.tool} → ${d.approved ? "允许" : "拒绝"}${d.note ? ` (${d.note})` : ""}`;
+    if (ev.kind === "steer") return d.message || "";
+    if (ev.kind === "compaction") return `追加 ${d.appended} / 删除 ${d.deleted}`;
+    if (ev.kind === "invariant_warning") return `账本期望 ${d.expected}，实际 ${d.actual}`;
+    if (ev.kind === "gates") return `第 ${d.round} 轮 ${d.passed ? "通过" : "未通过"}`;
+    if (ev.kind === "run_end") return d.status || d.stop_reason || "";
+    const s = JSON.stringify(d);
+    return s.length > 140 ? s.slice(0, 140) + "…" : s;
+  }
+
+  async function openRunModal(r) {
+    const { close } = panelModal(`运行详情 · ${r.name}`, (content, dispose) => {
+      const meta = el("div", { class: "pd-meta", style: "padding:12px 16px 0" },
+        el("span", { class: `badge ${runBadgeClass(r.status)}` }, RUN_STATUS_LABEL[r.status] || r.status),
+        r.stage ? el("span", { class: "badge b-info" }, `阶段 ${r.stage}`) : null,
+        r.budget?.cost_usd != null ? el("span", { class: "badge" }, `花费 ${fmtCost(r.budget.cost_usd)}`) : null,
+        r.budget?.total_tokens != null ? el("span", { class: "badge" }, `${fmtNum(r.budget.total_tokens)} tok`) : null,
+        r.budget?.turns != null ? el("span", { class: "badge" }, `${r.budget.turns} 轮`) : null);
+      const query = el("div", { class: "md-content", style: "padding:8px 16px" },
+        el("strong", {}, "任务："), r.query || r.paper?.topic || "—");
+      const actions = el("div", { class: "compose-actions", style: "padding:0 16px 10px" });
+      if (r.status !== "legacy") {
+        actions.append(el("button", {
+          class: "btn btn-amber btn-sm",
+          onclick: () => { dispose(); startGeneration(r.query || "", true, null, r.name); },
+        }, r.status === "running" ? "接入监控（续跑）" : "▶ 断点续跑"));
+      }
+      actions.append(el("button", { class: "btn btn-ghost btn-sm", onclick: () => { location.hash = "#/papers"; dispose(); } }, "在文库查看"));
+      content.append(meta, query, actions,
+        el("div", { class: "file-group-title", style: "margin:0 16px" }, "事件时间线 EVENTS.JSONL"));
+
+      const log = el("div", { class: "activity", style: "max-height:46vh" },
+        el("div", { style: "padding:14px 16px", class: "empty" },
+          el("span", { class: "spin" }), " 加载事件…"));
+      content.append(log);
+
+      api.get(`/api/runs/${encodeURIComponent(r.name)}/events?tail=200`).then((res) => {
+        log.innerHTML = "";
+        const events = res.events || [];
+        if (!events.length) { log.append(el("div", { class: "empty" }, "无事件记录")); return; }
+        for (const ev of events.slice().reverse()) {
+          const kind = ev.kind || "";
+          const cls = kind === "invariant_warning" || /failed|error/i.test(kind) ? "err"
+            : kind.startsWith("stage_") || kind === "gates" ? "stage"
+            : kind === "run_end" ? "ok" : "log";
+          const time = ev.ts ? new Date(ev.ts * 1000).toLocaleTimeString("zh-CN", { hour12: false }) : "";
+          log.append(el("div", { class: `act-entry k-${cls}` },
+            el("span", { class: "act-time" }, time),
+            el("div", { class: "act-body" },
+              el("b", {}, EVENT_LABEL[kind] || kind), "  ", eventSummary(ev))));
+        }
+        log.scrollTop = 0;
+        content.prepend(el("div", { class: "steer-hint", style: "padding:0 16px 6px" }, `共 ${res.total ?? events.length} 条事件，显示最近 ${events.length} 条（新→旧）`));
+      }).catch((e) => {
+        log.innerHTML = "";
+        log.append(el("div", { class: "empty" }, `事件加载失败：${e.message}`));
+      });
+    });
+  }
+
   async function onRunClick(r) {
     if (r.status === "legacy") { location.hash = "#/papers"; return; }
-    const okResume = await confirmDialog(
-      `续跑「${r.name}」？\n已完成阶段将自动跳过（ArtifactStore 断点续跑）。`,
-      { danger: false, okText: "续跑", cancelText: "取消" });
-    if (!okResume) return;
-    startGeneration(r.query || "", true, null, r.name);
+    openRunModal(r);
   }
 
   /* ================= 订阅与轮询 ================= */
