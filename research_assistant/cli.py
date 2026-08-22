@@ -12,7 +12,7 @@ if sys.platform == "win32":
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
     sys.stderr.reconfigure(encoding="utf-8", errors="replace")
 
-from .agent import run_agent
+from .agent import RunConfig, run_agent
 from .config import (
     build_llm_client,
     generate_session_dir_name,
@@ -154,13 +154,31 @@ MID-EXECUTION STEERING:
         if not silent and sys.stdin.isatty():
             steer_reader.start(steer_queue, asyncio.get_event_loop())
 
+        # Interactive approvals ride the same stdin channel as steering:
+        # a PRE_TOOL_USE ask prints the request; the next typed line
+        # (y/yes = allow, anything else = deny) answers it.
+        approver = None
+        if (os.environ.get("RA_APPROVAL_MODE", "off").strip().lower()
+                == "interactive"):
+            from .kernel.approval import QueueApprover
+
+            def _print_approval(text: str) -> None:
+                print(f"\n  ⚠ {text}\n    允许执行? 输入 y 允许，其他任意内容拒绝",
+                      flush=True)
+
+            approver = QueueApprover(steer_queue, timeout=120.0,
+                                     printer=_print_approval)
+
         try:
             result = await run_agent(
                 prompt=prompt,
                 system_prompt=system_instructions,
                 llm_client=llm_client,
                 tools=tool_registry,
-                auto_continue=auto_continue,
+                config=RunConfig(
+                    auto_continue=auto_continue,
+                    approver=approver,
+                ),
                 on_text=_on_text,
                 on_tool_start=_on_tool_start,
                 on_tool_use=_on_tool_use,

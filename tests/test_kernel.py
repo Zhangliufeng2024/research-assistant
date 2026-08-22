@@ -243,7 +243,7 @@ class TestMaybeCompact:
     async def test_below_trigger_is_noop(self):
         client = _SummarizerClient()
         msgs = _long_history(5)
-        out, compacted = await maybe_compact(
+        out, compacted, _info = await maybe_compact(
             msgs, llm_client=client, model="claude-sonnet-4-6",
         )
         assert not compacted
@@ -256,7 +256,7 @@ class TestMaybeCompact:
         msgs = _long_history(40)
         original_first = dict(msgs[0])
         # Force trigger via measured tokens.
-        out, compacted = await maybe_compact(
+        out, compacted, _info = await maybe_compact(
             msgs, llm_client=client, model="claude-sonnet-4-6",
             last_input_tokens=190_000,
         )
@@ -283,7 +283,7 @@ class TestMaybeCompact:
         for j in range(20):
             msgs.extend(_tool_exchange(100 + j))
         msgs.append({"role": "assistant", "content": "still going"})
-        _, compacted_again = await maybe_compact(
+        _, compacted_again, _info2 = await maybe_compact(
             msgs, llm_client=client, model="m", last_input_tokens=190_000,
         )
         assert compacted_again

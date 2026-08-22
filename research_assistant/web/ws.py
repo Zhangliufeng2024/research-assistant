@@ -40,18 +40,46 @@ async def ws_generate(websocket: WebSocket):
         cwd = websocket.app.state.cwd
 
         cancel_event = asyncio.Event()
+        approval_queue: asyncio.Queue = asyncio.Queue()
         budget_limits = BudgetLimits(
             max_cost_usd=msg.get("max_cost_usd") or None,
             max_wall_seconds=msg.get("max_wall_seconds") or None,
         )
+
+        from ..kernel.approval import QueueApprover
+
+        def _push_approval(request) -> None:
+            asyncio.get_running_loop().create_task(websocket.send_json({
+                "type": "approval_request",
+                "id": task_id,
+                "tool": request.tool_name,
+                "summary": request.summary(),
+            }))
+
+        approver = QueueApprover(approval_queue, timeout=120.0,
+                                 on_request=_push_approval)
+
         websocket.app.state.active_tasks[task_id] = {
             "status": "running",
             "query": query[:100],
             "cancel_event": cancel_event,
+            "approvals": approval_queue,
         }
 
         await websocket.send_json({"type": "connected", "task_id": task_id})
 
+        async def _pump() -> None:
+            """Route client messages (approvals) while generation runs."""
+            try:
+                while True:
+                    reply = await websocket.receive_json()
+                    if reply.get("action") == "approval":
+                        await approval_queue.put(reply.get("approved"))
+            except Exception:
+                cancel_event.set()
+                approval_queue.put_nowait(None)  # unblock a pending approver
+
+        pump = asyncio.create_task(_pump())
         try:
             async for update in generate_paper(
                 query=query,
@@ -62,16 +90,24 @@ async def ws_generate(websocket: WebSocket):
                 data_files=msg.get("data_files"),
                 cancel_event=cancel_event,
                 budget_limits=budget_limits,
+                approver=approver,
                 track_token_usage=True,
             ):
                 if cancel_event.is_set():
-                    await websocket.send_json({
-                        "type": "progress", "stage": "cancelled",
-                        "message": "任务已停止",
-                    })
+                    try:
+                        await websocket.send_json({
+                            "type": "progress", "stage": "cancelled",
+                            "message": "任务已停止",
+                        })
+                    except Exception:
+                        pass
                     break
-                await websocket.send_json(update)
+                try:
+                    await websocket.send_json(update)
+                except Exception:
+                    break
         finally:
+            pump.cancel()
             websocket.app.state.active_tasks.pop(task_id, None)
 
         await websocket.send_json({"type": "done"})

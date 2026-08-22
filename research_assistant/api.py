@@ -55,6 +55,7 @@ async def generate_paper(
     multi_agent: bool = False,
     cancel_event: asyncio.Event | None = None,
     budget_limits: Any | None = None,
+    approver: Any | None = None,
     use_pipeline: bool | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate a scientific document asynchronously with progress updates."""
@@ -128,6 +129,7 @@ async def generate_paper(
                 cancel_event=cancel_event,
                 hooks=HookBus(),
                 budget_limits=budget_limits,
+                approver=approver,
             ):
                 yield update
         else:
@@ -202,6 +204,8 @@ async def generate_paper(
                 auto_continue=auto_continue,
                 budget=budget,
                 cancel_event=cancel_event,
+                approver=approver,
+                session_log=single_session,  # SessionStore has .log()
             ),
             on_text=_on_text,
             on_tool_use=_on_tool,

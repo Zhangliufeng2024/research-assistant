@@ -99,6 +99,8 @@ async def _run_stage_agent(
     cancel_event: asyncio.Event | None,
     auto_continue: bool = True,
     max_continuations: int = 10,
+    approver: Any | None = None,
+    session_log: Any | None = None,
 ) -> LoopResult:
     """One sub-agent run inside the pipeline, sharing budget/hooks/cancel."""
     llm_client = create_llm_client(
@@ -117,6 +119,8 @@ async def _run_stage_agent(
                 cancel_event=cancel_event,
                 auto_continue=auto_continue,
                 max_continuations=max_continuations,
+                approver=approver,
+                session_log=session_log,
             ),
         )
     finally:
@@ -150,6 +154,7 @@ async def run_pipeline(
     cancel_event: asyncio.Event | None = None,
     hooks: HookBus | None = None,
     budget_limits: BudgetLimits | None = None,
+    approver: Any | None = None,
     max_revision_rounds: int = 3,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Execute the full generation pipeline, yielding progress updates."""
@@ -181,7 +186,9 @@ async def run_pipeline(
             stage, prompt, system_prompt,
             model=model, work_dir=work_dir,
             api_key=api_key, base_url=base_url, provider=provider,
-            budget=budget, hooks=hooks, cancel_event=cancel_event, **kw,
+            budget=budget, hooks=hooks, cancel_event=cancel_event,
+            approver=approver, session_log=session,  # SessionStore has .log()
+            **kw,
         )
         session.log_event(f"stage_{stage}", {
             "stop_reason": result.stop_reason, "turns": result.turns,

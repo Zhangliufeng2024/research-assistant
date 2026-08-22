@@ -206,11 +206,11 @@ async def maybe_compact(
     trigger = int(window * trigger_fraction)
     measured = last_input_tokens or estimate_tokens(messages)
     if measured < trigger:
-        return messages, False
+        return messages, False, None
 
     cut = find_cut_point(messages, keep_recent=keep_recent)
     if not cut:
-        return messages, False
+        return messages, False, None
 
     span = messages[1:cut]
     span_text = render_span_for_summary(span)
@@ -229,11 +229,18 @@ async def maybe_compact(
     )
     if had_previous_summary:
         # Replace in place: the old span occupied [1:cut); index 1 is now the
-        # refreshed summary, so drop [2:cut).
+        # refreshed summary, so drop [2:cut). Counted as +1/-1 for the length
+        # ledger (the summary content itself changed too).
         messages[1] = summary_msg
         del messages[2:cut]
     else:
         # Fresh insert shifts everything up one: the span moved to [2:cut+1).
         messages.insert(1, summary_msg)
         del messages[2:cut + 1]
-    return messages, True
+
+    info = {
+        "appended": 1,
+        "deleted": cut - 1,
+        "summary_chars": len(summary),
+    }
+    return messages, True, info

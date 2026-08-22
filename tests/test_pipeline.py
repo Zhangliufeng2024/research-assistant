@@ -137,7 +137,8 @@ def _make_fake_agent(calls: list, workdir_holder: dict):
 
     async def fake_agent(stage_name, prompt, system_prompt, *, model, work_dir,
                          api_key, base_url, provider, budget, hooks, cancel_event,
-                         auto_continue=True, max_continuations=10):
+                         auto_continue=True, max_continuations=10,
+                         approver=None, session_log=None):
         calls.append(stage_name)
         from research_assistant.agent import AgentResult
 

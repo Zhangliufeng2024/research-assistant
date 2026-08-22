@@ -13,6 +13,7 @@ Kernel features (all optional, wired via :class:`RunConfig`):
 
 import asyncio
 import inspect
+import json
 import random
 import time
 from collections.abc import Awaitable, Callable
@@ -21,9 +22,11 @@ from pathlib import Path
 from typing import Any
 
 from .constants import DEFAULT_MAX_CONTINUATIONS, TASK_COMPLETE_MARKER
+from .kernel.approval import ToolApprovalRequest, resolve_approval
 from .kernel.budget import BudgetExceededError, BudgetGuard
 from .kernel.context import externalize_tool_result, maybe_compact
 from .kernel.events import AgentEvent, EventKind, HookBus
+from .kernel.guards import repeat_guard_from_env
 from .llm.base import LLMClient, LLMResponse, OnChunkCallback
 from .llm.errors import HeartbeatTimeoutError, LLMError
 from .models import TokenUsage
@@ -80,6 +83,16 @@ class RunConfig:
     #: Optional permission policy mounted as a PRE_TOOL_USE hook. When None,
     #: the default is built from RA_PERMISSION_MODE (deny_dangerous | off).
     permission_policy: Any | None = None
+    #: Approver for hooks that return HookVerdict(ask=True). Missing approver,
+    #: timeout (approval_timeout), or approver error all resolve to deny.
+    approver: Any | None = None
+    approval_timeout: float = 120.0
+    #: Session-log port: object with ``.log(kind, data)``. Mirrors every
+    #: model-visible mutation (see docs/protocol.md).
+    session_log: Any | None = None
+    #: Repeat-call guard: None=from env (default on, limit 3), False=off,
+    #: or a guard instance with ``__call__``.
+    repeat_guard: Any | None = None
     #: Write oversized tool results to .ra/tool_outputs/ instead of the history.
     externalize_outputs: bool = True
     #: Summarize old history when nearing the model's context window.
@@ -257,7 +270,44 @@ async def run_agent(
     async def _emit(kind: EventKind, **kw: Any) -> Any:
         return await hooks.emit(AgentEvent(kind, **kw))
 
+    # --- session-log mirroring ("model-visible is logged") -----------------
+    # Every mutation of `messages` goes through the helpers below, which keep
+    # a length ledger; before each LLM request we assert the live list length
+    # matches the ledger, so an unlogged mutation cannot slip through
+    # unnoticed (soft warning — see docs/protocol.md for the contract).
+    ledger = {"appended": 0, "deleted": 0}
+    session_log = cfg.session_log
+
+    def _slog(kind: str, **data: Any) -> None:
+        if session_log is None:
+            return
+        try:
+            session_log.log(kind, data)
+        except Exception:
+            pass  # telemetry must never break the run
+
+    def _log_append(msg: dict) -> None:
+        ledger["appended"] += 1
+        seq = ledger["appended"] - ledger["deleted"] - 1
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        _slog("msg_add", seq=seq, role=msg.get("role", "?"),
+              content=str(content)[:20_000],
+              tool_calls=bool(msg.get("tool_calls")))
+
+    def _log_delete(n: int) -> None:
+        ledger["deleted"] += n
+
+    # Mount the repeat-call guard (env-tunable, on by default).
+    if cfg.repeat_guard is not False:
+        guard = (cfg.repeat_guard if callable(cfg.repeat_guard)
+                 else repeat_guard_from_env())
+        if guard is not None:
+            hooks.on(EventKind.PRE_TOOL_USE, guard)
+
     await _emit(EventKind.RUN_START, payload={"prompt_chars": len(prompt)})
+    _log_append({"role": "user", "content": prompt})
 
     # Per-run scratch space for externalized tool outputs.
     artifacts_dir: Path | None = None
@@ -276,9 +326,12 @@ async def run_agent(
             break
 
         injected = _drain_steer_queue(steer_queue, messages)
+        if injected:
+            _log_append(messages[-1])
         for s in injected:
             await _maybe_await(on_steer_injected, s)
             await _emit(EventKind.STEER_INJECTED, payload={"message": s})
+            _slog("steer", message=s[:2000])
 
         await _maybe_await(
             on_turn_start, turn + 1, time.time() - start_time, total_usage,
@@ -298,6 +351,13 @@ async def run_agent(
                 break
 
         # --- LLM call ------------------------------------------------------
+        expected_len = ledger["appended"] - ledger["deleted"]
+        if len(messages) != expected_len:
+            await _emit(EventKind.INVARIANT_WARNING, payload={
+                "expected": expected_len, "actual": len(messages),
+            })
+            _slog("invariant_warning", expected=expected_len, actual=len(messages))
+
         watchdog = _ActivityWatchdog(heartbeat_timeout)
 
         async def _do_call(watchdog=watchdog, messages=messages) -> LLMResponse:
@@ -339,14 +399,19 @@ async def run_agent(
         # --- context compaction (after measuring real usage) ---------------
         if cfg.compaction:
             try:
-                messages, compacted = await maybe_compact(
+                messages, compacted, compact_info = await maybe_compact(
                     messages,
                     llm_client=llm_client,
                     model=getattr(llm_client, "model", ""),
                     last_input_tokens=response.usage.input_tokens,
                 )
                 if compacted:
-                    await _emit(EventKind.CONTEXT_COMPACTION, turn=turn + 1)
+                    if compact_info:
+                        ledger["appended"] += compact_info.get("appended", 0)
+                        ledger["deleted"] += compact_info.get("deleted", 0)
+                    await _emit(EventKind.CONTEXT_COMPACTION, turn=turn + 1,
+                                payload=compact_info or {})
+                    _slog("compaction", turn=turn + 1, **(compact_info or {}))
             except Exception:
                 pass  # compaction is best-effort; never kill a healthy run
 
@@ -363,6 +428,7 @@ async def run_agent(
             if response.content:
                 assistant_msg["content"] = response.content
             messages.append(assistant_msg)
+            _log_append(assistant_msg)
 
             for tc in response.tool_calls:
                 if cfg.cancel_event is not None and cfg.cancel_event.is_set():
@@ -375,13 +441,48 @@ async def run_agent(
                     tool_name=tc.name,
                     payload={"arguments": tc.arguments},
                 )
-                if not verdict.allowed:
+                approved_via_ask = False
+                if verdict.ask and verdict.allowed:
+                    request = ToolApprovalRequest(
+                        tool_name=tc.name, arguments=tc.arguments,
+                        turn=turn + 1, reason=verdict.reason,
+                    )
+                    await _emit(EventKind.APPROVAL_REQUESTED, turn=turn + 1,
+                                tool_name=tc.name,
+                                payload={"summary": request.summary()})
+                    approved, note = await resolve_approval(
+                        cfg.approver, request, cfg.approval_timeout,
+                    )
+                    await _emit(EventKind.APPROVAL_RESOLVED, turn=turn + 1,
+                                tool_name=tc.name,
+                                payload={"approved": approved, "note": note})
+                    _slog("approval", tool=tc.name, approved=approved, note=note)
+                    if approved:
+                        approved_via_ask = True
+                    else:
+                        result_text = f"[DENIED by approval] {note or verdict.reason}"
+                elif not verdict.allowed:
                     result_text = f"[DENIED by policy] {verdict.reason}"
+
+                if not verdict.allowed or (verdict.ask and not approved_via_ask):
+                    pass  # result_text already carries the denial text
                 else:
                     await _maybe_await(on_tool_start, tc.name, tc.arguments)
                     await _emit(EventKind.TOOL_START, turn=turn + 1,
                                 tool_name=tc.name, payload={"arguments": tc.arguments})
+                    _slog("tool_call", tool=tc.name, arguments=tc.arguments)
                     result_text = await tools.execute(tc.name, tc.arguments)
+                    raw_result_text = result_text
+                    rewrite = await hooks.first_response(AgentEvent(
+                        EventKind.TOOL_RESULT_REWRITE, turn=turn + 1,
+                        tool_name=tc.name,
+                        payload={"arguments": tc.arguments, "result": raw_result_text},
+                    ))
+                    if isinstance(rewrite, str) and rewrite != raw_result_text:
+                        _slog("tool_result_rewrite",
+                              chars_before=len(raw_result_text),
+                              chars_after=len(rewrite))
+                        result_text = rewrite
                     if artifacts_dir is not None:
                         result_text = externalize_tool_result(
                             result_text, tc.name, turn + 1, artifacts_dir,
@@ -391,7 +492,9 @@ async def run_agent(
                                 payload={"result_chars": len(result_text)})
                 await _maybe_await(on_tool_use, tc.name, tc.arguments, result_text)
 
-                if tc.name in ("write_file",):
+                if tc.name in ("write_file",) and (
+                    not result_text.startswith("[DENIED")
+                ):
                     fp = tc.arguments.get("file_path", "")
                     if fp:
                         files_written.append(fp)
@@ -402,8 +505,10 @@ async def run_agent(
                     "content": result_text,
                     # Providers surface this to the model (Anthropic sets
                     # is_error on the tool_result block).
-                    "is_error": result_text.startswith(("Error:", "[DENIED by policy]")),
+                    "is_error": result_text.startswith(
+                        ("Error:", "[DENIED by policy]", "[DENIED by approval]")),
                 })
+                _log_append(messages[-1])
             else:
                 recent_text_responses.clear()
                 continue
@@ -412,13 +517,17 @@ async def run_agent(
 
         if response.stop_reason == "max_tokens":
             messages.append({"role": "assistant", "content": response.content})
+            _log_append(messages[-1])
             injected = _drain_steer_queue(steer_queue, messages)
             if not injected:
                 messages.append({"role": "user", "content": "Continue from where you left off."})
+                _log_append(messages[-1])
             else:
+                _log_append(messages[-1])
                 for s in injected:
                     await _maybe_await(on_steer_injected, s)
                     await _emit(EventKind.STEER_INJECTED, payload={"message": s})
+                    _slog("steer", message=s[:2000])
             continuation_count += 1
             if continuation_count >= cfg.max_continuations:
                 stop_reason = "max_continuations"
@@ -439,13 +548,17 @@ async def run_agent(
 
             if cfg.auto_continue and continuation_count < cfg.max_continuations:
                 messages.append({"role": "assistant", "content": response.content})
+                _log_append(messages[-1])
                 injected = _drain_steer_queue(steer_queue, messages)
                 if not injected:
                     messages.append({"role": "user", "content": "Continue."})
+                    _log_append(messages[-1])
                 else:
+                    _log_append(messages[-1])
                     for s in injected:
                         await _maybe_await(on_steer_injected, s)
                         await _emit(EventKind.STEER_INJECTED, payload={"message": s})
+                        _slog("steer", message=s[:2000])
                 continuation_count += 1
                 continue
             else:
@@ -459,6 +572,7 @@ async def run_agent(
         "stop_reason": stop_reason,
         "turns": n_llm_calls,
     })
+    _slog("run_end", stop_reason=stop_reason, turns=n_llm_calls)
 
     duration = time.time() - start_time
     return AgentResult(

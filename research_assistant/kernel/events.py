@@ -38,10 +38,14 @@ class EventKind(str, enum.Enum):
     PRE_TOOL_USE = "pre_tool_use"
     TOOL_START = "tool_start"
     TOOL_END = "tool_end"
+    TOOL_RESULT_REWRITE = "tool_result_rewrite"
+    APPROVAL_REQUESTED = "approval_requested"
+    APPROVAL_RESOLVED = "approval_resolved"
     STEER_INJECTED = "steer_injected"
     CONTEXT_COMPACTION = "context_compaction"
     BUDGET_WARNING = "budget_warning"
     BUDGET_EXCEEDED = "budget_exceeded"
+    INVARIANT_WARNING = "invariant_warning"
     ERROR = "error"
     RUN_END = "run_end"
 
@@ -59,10 +63,17 @@ class AgentEvent:
 
 @dataclass
 class HookVerdict:
-    """Decision returned by a PRE_TOOL_USE hook."""
+    """Decision returned by a PRE_TOOL_USE hook.
+
+    ``ask=True`` routes the call to the run's approver (see
+    kernel/approval.py). When no approver is attached — or the approver
+    times out / errors — the call is denied (dsh rule: "absent or
+    unanswerable: deny").
+    """
 
     allowed: bool = True
     reason: str = ""
+    ask: bool = False
 
 
 #: Handlers may be sync or async. Returning a HookVerdict with allowed=False
@@ -106,6 +117,28 @@ class HookBus:
                     "hook %r failed on %s: %s", handler, event.kind.value, exc
                 )
                 continue
-            if isinstance(result, HookVerdict) and not result.allowed:
+            if isinstance(result, HookVerdict) and (not result.allowed or result.ask):
                 return result
         return HookVerdict()
+
+    async def first_response(self, event: AgentEvent) -> Any | None:
+        """Run handlers of *kind* in order; return the first non-verdict value.
+
+        Used for rewriting-style events such as TOOL_RESULT_REWRITE where a
+        handler contributes replacement content rather than a decision.
+        """
+        for handler in self._handlers.get(event.kind, []):
+            try:
+                result = handler(event)
+                if hasattr(result, "__await__"):
+                    result = await result  # type: ignore[union-attr]
+            except Exception as exc:  # noqa: BLE001
+                import logging
+
+                logging.getLogger(__name__).warning(
+                    "hook %r failed on %s: %s", handler, event.kind.value, exc
+                )
+                continue
+            if result is not None and not isinstance(result, HookVerdict):
+                return result
+        return None

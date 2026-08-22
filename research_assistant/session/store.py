@@ -128,6 +128,10 @@ class SessionStore:
         except OSError:
             pass  # logging must never break the run
 
+    def log(self, kind: str, data: dict | None = None) -> None:
+        """Alias matching the kernel session-log port contract (``.log``)."""
+        self.log_event(kind, data)
+
     def read_events(self) -> list[dict]:
         p = self._path(self.EVENTS_FILE)
         if not p.exists():
