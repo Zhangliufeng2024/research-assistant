@@ -500,6 +500,64 @@ body {
   box-shadow: 0 4px 24px rgba(0, 0, 0, 0.3);
 }
 
+/* === Tool Approval Card === */
+.approval-overlay {
+  background: rgba(0, 0, 0, 0.45);
+  cursor: default;
+}
+
+.approval-card {
+  background: var(--card);
+  border: 1px solid var(--border);
+  border-top: 3px solid var(--warning);
+  border-radius: var(--radius);
+  box-shadow: 0 8px 32px rgba(0, 0, 0, 0.18);
+  max-width: 520px;
+  width: min(520px, calc(100vw - 48px));
+  padding: 20px 24px;
+  cursor: default;
+}
+
+.approval-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+  margin-bottom: 12px;
+}
+
+.approval-summary {
+  font-family: var(--mono);
+  font-size: 12px;
+  color: var(--text2);
+  background: var(--bg);
+  border: 1px solid var(--border);
+  border-radius: var(--radius);
+  padding: 10px 12px;
+  margin-bottom: 16px;
+  white-space: pre-wrap;
+  word-break: break-all;
+  max-height: 200px;
+  overflow-y: auto;
+}
+
+.approval-actions {
+  display: flex;
+  gap: 8px;
+}
+
+.approval-actions .btn {
+  flex: 1;
+  padding: 8px 24px;
+  font-size: 13px;
+}
+
+.approval-hint {
+  font-size: 11px;
+  color: var(--text3);
+  margin-top: 10px;
+  text-align: center;
+}
+
 /* === Loading === */
 .loading {
   text-align: center;

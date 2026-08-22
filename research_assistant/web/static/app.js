@@ -55,6 +55,7 @@
   let ws = null;
   let currentPaperName = null;
   let currentTaskId = null;
+  let approvalCard = null; // 当前显示的工具审批卡片（modal overlay 元素）
 
   // === View switching ===
   tabs.forEach((tab) => {
@@ -116,6 +117,7 @@
     };
 
     ws.onclose = () => {
+      removeApprovalCard();
       btnGenerate.disabled = false;
       btnGenerate.textContent = "开始生成";
       btnStop.classList.add("hidden");
@@ -134,6 +136,7 @@
       case "progress":
         if (msg.stage === "cancelled") {
           appendLog(msg.message || "任务已停止");
+          removeApprovalCard();
           btnStop.classList.add("hidden");
           btnGenerate.disabled = false;
           btnGenerate.textContent = "开始生成";
@@ -146,13 +149,19 @@
         // Full text output — not displayed in progress (it's internal LLM text)
         break;
 
+      case "approval_request":
+        showApprovalCard(msg);
+        break;
+
       case "result":
         btnStop.classList.add("hidden");
+        removeApprovalCard();
         handleResult(msg);
         break;
 
       case "error":
         btnStop.classList.add("hidden");
+        removeApprovalCard();
         showError(msg.message);
         break;
 
@@ -465,6 +474,62 @@
         }
       }
     );
+  }
+
+  // === Tool Approval ===
+  // 服务端在敏感工具执行前推送 {"type":"approval_request", id, tool, summary}，
+  // 用户通过非阻塞卡片应答（回发 {"action":"approval", id, approved}）；
+  // 120 秒无响应由服务端自动拒绝。
+  function showApprovalCard(msg) {
+    // 若已有卡片在显示，先移除旧卡再显示新卡。旧请求不发送任何应答，
+    // 交由服务端 120 秒超时自动拒绝——避免对同一 id 重复应答造成错乱。
+    // （服务端为串行问询，此情况实际罕见。）
+    removeApprovalCard();
+
+    const overlay = document.createElement("div");
+    overlay.className = "modal-overlay approval-overlay";
+    overlay.innerHTML = `
+      <div class="approval-card" role="dialog" aria-modal="true">
+        <div class="approval-title">⚠ 工具执行审批</div>
+        <div class="approval-summary">${esc(msg.summary || "")}</div>
+        <div class="approval-actions">
+          <button type="button" class="btn btn-primary approval-allow">允许执行</button>
+          <button type="button" class="btn btn-danger approval-deny">拒绝</button>
+        </div>
+        <div class="approval-hint">120 秒内未响应将自动拒绝</div>
+      </div>`;
+
+    const respond = (approved) => {
+      if (approvalCard !== overlay) return; // 卡片已被移除或被新请求替换
+      if (ws && ws.readyState === WebSocket.OPEN) {
+        ws.send(JSON.stringify({ action: "approval", id: msg.id, approved }));
+        appendLog(`审批${approved ? "通过" : "拒绝"}: ${msg.tool}`);
+      } else {
+        appendLog(`审批${approved ? "通过" : "拒绝"}: ${msg.tool}（连接已断开，未能发送）`);
+      }
+      removeApprovalCard();
+    };
+
+    const onEsc = (e) => {
+      if (e.key === "Escape") respond(false);
+    };
+
+    overlay.querySelector(".approval-allow").addEventListener("click", () => respond(true));
+    overlay.querySelector(".approval-deny").addEventListener("click", () => respond(false));
+    document.addEventListener("keydown", onEsc);
+    overlay._onEsc = onEsc;
+
+    document.body.appendChild(overlay);
+    approvalCard = overlay;
+  }
+
+  function removeApprovalCard() {
+    if (!approvalCard) return;
+    if (approvalCard._onEsc) {
+      document.removeEventListener("keydown", approvalCard._onEsc);
+    }
+    approvalCard.remove();
+    approvalCard = null;
   }
 
   // === View Paper (from result card) ===
