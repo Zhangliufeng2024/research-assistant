@@ -309,7 +309,9 @@ export function renderChatView(root, onCleanup) {
       el("div", { class: "empty", style: "padding:12px" }, "等待首轮用量…"));
     const wrap = el("div", { class: "panel-pad" });
     const cost = typeof b.cost_usd === "number" ? b.cost_usd : 0;
-    const limit = typeof b.max_cost_usd === "number" && b.max_cost_usd > 0 ? b.max_cost_usd : null;
+    // BudgetGuard.snapshot() 把上限嵌在 limits 子对象下（docs/protocol.md §10）
+    const limitRaw = b.max_cost_usd ?? b.limits?.max_cost_usd;
+    const limit = typeof limitRaw === "number" && limitRaw > 0 ? limitRaw : null;
     const pct = limit ? Math.min(100, (cost / limit) * 100) : 0;
     wrap.append(el("div", { class: "b-row" }, el("span", {}, "费用"),
       el("b", { style: pct >= 80 ? "color:var(--err)" : "" },

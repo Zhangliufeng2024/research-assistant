@@ -164,3 +164,86 @@ class ExecProvider(Protocol):
 1. 任何破坏 `run.json` / `events.jsonl` / HookVerdict 语义的改动必须递增 `SCHEMA_VERSION`；
 2. 读取端必须容忍未知字段与未知 kind（现实现已满足：`SessionState(**known_only)`、逐行 try-parse）;
 3. 新增枚举值/事件 kind 不算破坏性变更（消费方按白名单处理的应忽略未知值）。
+
+## 10. 会话协议 (/ws/chat)（R2）
+
+> 实现权威：`web/chat.py`；前端消费方：`static/js/protocol_chat.js`（reduceChat 纯函数归约）、`static/js/views/chat.js`。
+> 挂载：同一 router include 两次 —— REST 带 `prefix="/api"`，WS 无前缀落在 `/ws/chat`。
+
+### 10.1 会话目录与持久化（D2）
+
+每会话一个目录 `<workdir>/.ra/sessions/<YYYYMMDD_HHMMSS_slug>/`：
+
+| 文件 | 角色 |
+|---|---|
+| `run.json` | SessionStore 状态机；`mode:"chat"`、`status: running/complete/cancelled/failed`、预算快照 |
+| `events.jsonl` | kernel 逐条审计镜像（§3 目录），不用于重建 |
+| `history.json` | **对话唯一权威**（D2）：`{"schema_version": 1, "messages": [{"role": "user"\|"assistant", "content": str}, ...]}` 归约文本往来；每轮结束整份写回，重启即恢复。工具调用明细不入 history（前端恢复只渲染文本往来） |
+
+slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
+
+### 10.2 REST（挂载于 `/api` 前缀下）
+
+| 方法 | 路径 | 请求 | 响应 |
+|---|---|---|---|
+| POST | `/api/chat/sessions` | body 可选 `{"title": str}` | `{"id", "created_at"(epoch 秒)}` |
+| GET | `/api/chat/sessions` | — | `[{id, title?null, last_message(≤80字), turns(用户消息数), created_at, updated_at}]` 按 updated_at 倒序 |
+| GET | `/api/chat/sessions/{id}` | — | `{id, messages:[{role,content}...]}`（history.json 全量）；未知 404、非法 ID 403 |
+| DELETE | `/api/chat/sessions/{id}` | — | `{ok:true}` 删除整个目录 |
+
+### 10.3 WS 帧 schema
+
+连接：`GET ws://host/ws/chat?session=<id>`；`session` 缺省则新建会话；给出的 id 已被删除时按同名幂等重建（不卡 UI）；含路径分隔符/盘符的 id 发 `error` 帧并关闭。
+
+**server → client**
+
+| type | 字段 | 说明 |
+|---|---|---|
+| `connected` | `session_id` | 握手完成，可发消息 |
+| `text` | `delta` | 流式正文增量；接续最后一个 text 气泡（前端合并） |
+| `tool_card` | `id`, `tool`, `arguments`, `status: running\|done\|error`, `result_preview`(≤400字), `files:[{path}]` | 同 `id` 多次推送按卡合并；`files` 从 write_file/edit_file 的 `file_path` 与 bash/run_python 结果文本的扩展名启发式提取（去重保序，≤8 条） |
+| `usage` | `budget`: BudgetGuard.snapshot() | 运行期约每 1s 一帧，结束至少一帧（复用 B5 usage_ticks） |
+| `approval_request` | `id`, `tool`, `summary` | PRE_TOOL_USE ask 升级时推送；`id` 为本次问询唯一标识 |
+| `result` | `stop_reason`, `turns` | 一轮结束。stop_reason 枚举同 AgentResult（completed/cancelled/budget_exceeded/max_turns/max_continuations） |
+| `error` | `message` | 校验失败/运行异常/配置错误（如缺 API key） |
+
+**client → server**
+
+| action | 字段 | 说明 |
+|---|---|---|
+| `user` | `text`(≤8000) | 触发一轮；空/超长发 `error` 且不启动循环 |
+| `approval` | `id`, `approved` | 应答当前问询；`id` 与待答请求不符（迟到/伪造）直接忽略，防止残留答案自动放行下一次问询 |
+| `steer` | `message`(≤2000) | 运行中注入 steer_queue（内核下一轮首并入 user 消息）；空闲期收到则入队、下一轮开始时生效 |
+| `stop` | — | 置位 cancel_event，协作停止本轮（结果帧 stop_reason=cancelled） |
+
+未知 action/type 均容忍（error 帧 / 忽略），符合 §9 承诺。
+
+### 10.4 生命周期
+
+```
+浏览器                                ws_chat 服务端
+  │── GET /ws/chat?session=<id> ──▶ accept；定位/新建会话目录
+  │                                  同会话并发：后连者 close(4001) 踢前者
+  │◀── {"connected", session_id} ──┤ 组装：BudgetGuard(RA_MAX_* 继承)、
+  │                                  QueueApprover、ToolRegistry(cwd 围栏)
+  │── {"action":"user","text"} ───▶ ┌ 一轮（_run_turn）
+  │◀── text delta × N（流式）       │   history.json 载入 → 追加 user → 落盘
+  │◀── tool_card(running)          │   run_agent(on_text/on_tool_start/on_tool_use,
+  │◀── tool_card(done,files[])     │            steer_queue, cancel_event, approver)
+  │◀── usage × N（≈1s 一帧）        │   结束：assistant 回复写回 history.json
+  │◀── {"result",stop_reason,turns}┘   SessionStore.finish(status, 预算快照)
+  │── steer/approval/stop ────────▶ 泵任务并发接收分发（轮次期间）
+  │── 断开 ──────────────────────▶ cancel_event 置位 + 问询队列投 None（等效拒绝）
+```
+
+### 10.5 内核适配说明
+
+- **流式**：run_agent 传入 `on_text` 即走流式路径（on_chunk 逐段回调），故 `text` 帧为真实增量；
+- **多轮历史**：run_agent 每轮从全新 messages 起步，无初始历史参数——由模块内
+  `_HistoryClient` 包装层补足：检测到本轮首个请求形态（单条 user 消息）时把
+  history.json 的归约历史前置拼接（重试同样展开；用量按含历史的真实请求计量）；
+- **auto_continue=False**（有意偏离 generate 流程）：一条用户消息一轮回复，自然停即停；
+  max_tokens 截断续跑不受影响（内核自行注入 Continue），长文档产出在会话内仍连贯；
+- **预算作用域**：BudgetGuard 每连接一份（跨轮累计），上限自 `RA_MAX_*` 继承（D4 不放宽）；
+  断连重连后重新起算，run.json 保留最近一次落盘的快照供参考。
+

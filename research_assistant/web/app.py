@@ -29,12 +29,16 @@ async def lifespan(app: FastAPI):
 def create_app() -> FastAPI:
     app = FastAPI(title="研究助手", lifespan=lifespan)
 
+    from .chat import router as chat_router
     from .routes import router as api_router
     from .workspace import router as workspace_router
     from .ws import router as ws_router
 
     app.include_router(api_router, prefix="/api")
     app.include_router(workspace_router, prefix="/api")
+    # chat 挂两次：REST 走 /api 前缀；/ws/chat 由前端硬编码，需再裸挂一次（见 protocol.md §10）
+    app.include_router(chat_router, prefix="/api")
+    app.include_router(chat_router)
     app.include_router(ws_router)
 
     static_dir = Path(__file__).parent / "static"
