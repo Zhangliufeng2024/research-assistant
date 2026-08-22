@@ -3,86 +3,44 @@
 <head>
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>研究助手</title>
+  <title>研究助手 · RA Console</title>
+  <meta name="color-scheme" content="dark">
+  <link rel="icon" href="favicon.svg" type="image/svg+xml">
+  <link rel="preload" href="fonts/chakra-petch-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
+  <link rel="preload" href="fonts/jetbrains-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
 
-<header class="navbar">
-  <span class="navbar-title">研究助手</span>
-  <nav class="navbar-tabs">
-    <button class="tab active" data-view="task">新建任务</button>
-    <button class="tab" data-view="papers">历史文档</button>
-  </nav>
-</header>
+<div id="app">
+  <header class="topbar">
+    <a class="brand" href="#/task">
+      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
+        <path d="M7 7h18v4.5H11.5V25H7z" fill="currentColor"/>
+        <rect x="16" y="16" width="9" height="9" fill="currentColor" opacity=".55"/>
+      </svg>
+      <span class="brand-name">RA·CONSOLE</span>
+      <span class="brand-sub">研究助手</span>
+    </a>
 
-<main class="container">
+    <nav class="topnav" id="topnav" aria-label="主导航">
+      <a href="#/task" data-route="task">任务</a>
+      <a href="#/papers" data-route="papers">文库</a>
+      <a href="#/settings" data-route="settings">设置</a>
+    </nav>
 
-  <!-- View 1: New Task -->
-  <section id="view-task" class="view active">
-    <div class="task-form">
-      <label class="form-label" for="query">请描述您需要生成的文档</label>
-      <textarea id="query" class="form-textarea" rows="4" placeholder="例如：写一篇关于复合结构在土木工程中应用的综述论文"></textarea>
-      <div class="form-actions">
-        <label class="checkbox-label">
-          <input type="checkbox" id="multi-agent"> 多智能体模式
-        </label>
-        <input type="number" id="max-cost" class="form-input-cost" placeholder="预算上限 USD（可选）"
-               min="0.1" step="0.5" style="width: 160px;">
-        <button id="btn-generate" class="btn btn-primary">开始生成</button>
-        <button id="btn-stop" class="btn btn-danger hidden">停止</button>
-      </div>
+    <div class="topbar-status" id="conn-status" title="服务连接">
+      <span class="conn-dot" id="conn-dot"></span>
+      <span class="conn-model" id="model-label">…</span>
     </div>
+  </header>
 
-    <!-- Progress Panel (hidden by default) -->
-    <div id="progress-panel" class="progress-panel hidden">
-      <div class="progress-header">
-        <span class="progress-title">生成进度</span>
-        <span id="progress-stage" class="progress-stage">初始化</span>
-      </div>
-      <div class="progress-bar-track">
-        <div id="progress-bar" class="progress-bar-fill" style="width: 0%"></div>
-      </div>
-      <div id="progress-log" class="progress-log"></div>
-    </div>
+  <main id="main" class="main"></main>
+</div>
 
-    <!-- Result Card (hidden by default) -->
-    <div id="result-card" class="result-card hidden">
-      <div class="result-header">
-        <span class="result-icon">&#10003;</span>
-        <span class="result-title">文档生成完成</span>
-      </div>
-      <div id="result-meta" class="result-meta"></div>
-      <div id="result-actions" class="result-actions"></div>
-    </div>
+<div id="toasts" class="toasts" aria-live="polite"></div>
+<div id="modal-root"></div>
 
-    <!-- Error Card -->
-    <div id="error-card" class="error-card hidden">
-      <div class="error-header">&#10007; 生成失败</div>
-      <div id="error-message" class="error-message"></div>
-    </div>
-  </section>
-
-  <!-- View 2: Papers Browser -->
-  <section id="view-papers" class="view">
-    <div class="papers-layout">
-      <aside class="papers-list">
-        <div class="papers-list-header">
-          <span>历史文档</span>
-          <span id="papers-count" class="papers-count"></span>
-        </div>
-        <div id="papers-items" class="papers-items">
-          <div class="loading">加载中...</div>
-        </div>
-      </aside>
-      <div class="papers-detail" id="papers-detail">
-        <div class="detail-placeholder">选择左侧文档查看详情</div>
-      </div>
-    </div>
-  </section>
-
-</main>
-
-<script src="app.js"></script>
+<script type="module" src="js/main.js"></script>
 </body>
 </html>
