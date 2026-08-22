@@ -3,10 +3,9 @@
 from collections.abc import Awaitable, Callable
 from typing import Any
 
-from .bash import run_bash
 from .citation_verify import verify_citations
+from .exec_provider import ExecProvider, LocalExecProvider
 from .file_ops import edit_file, glob_files, grep_search, read_file, write_file
-from .python_exec import run_python
 
 TOOL_DEFINITIONS: list[dict[str, Any]] = [
     {
@@ -134,10 +133,8 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
     "read_file": read_file,
     "write_file": write_file,
     "edit_file": edit_file,
-    "bash": run_bash,
     "glob_files": glob_files,
     "grep_search": grep_search,
-    "run_python": run_python,
     "verify_citations": verify_citations,
 }
 
@@ -145,15 +142,49 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
 class ToolRegistry:
     """Manages tool definitions and dispatches tool calls."""
 
-    def __init__(self, work_dir: str = "."):
+    def __init__(self, work_dir: str = ".", exec_provider: ExecProvider | None = None):
         self.work_dir = work_dir
         self._handlers = dict(_TOOL_HANDLERS)
+        # Execution-world seam: defaults to the local provider. Swapping in a
+        # container/remote provider moves bash/run_python wholesale.
+        self.exec_provider: ExecProvider = exec_provider if exec_provider is not None else LocalExecProvider()
 
     def get_schemas(self) -> list[dict[str, Any]]:
         return TOOL_DEFINITIONS
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool by name and return the result as a string."""
+        # Execution-provider tools are dispatched through the seam *before* the
+        # handler lookup: bash/run_python no longer live in _TOOL_HANDLERS, so
+        # swapping self.exec_provider moves the whole execution world (container,
+        # remote sandbox) without touching tool definitions. Argument
+        # normalization below is identical to what the local handlers received
+        # before the seam was introduced (no duplication, no loss).
+        if name == "bash":
+            if "path" not in arguments or not arguments.get("path"):
+                arguments["path"] = self.work_dir
+            arguments["cwd"] = arguments.pop("path", self.work_dir)
+            try:
+                return await self.exec_provider.run_bash(
+                    command=arguments.get("command", ""),
+                    timeout=int(arguments.get("timeout", 120)),
+                    cwd=arguments.get("cwd", self.work_dir),
+                )
+            except Exception as e:
+                return f"Error executing {name}: {e}"
+
+        if name == "run_python":
+            if "cwd" not in arguments:
+                arguments["cwd"] = self.work_dir
+            try:
+                return await self.exec_provider.run_python(
+                    code=arguments.get("code", ""),
+                    timeout=int(arguments.get("timeout", 120)),
+                    cwd=arguments.get("cwd", self.work_dir),
+                )
+            except Exception as e:
+                return f"Error executing {name}: {e}"
+
         handler = self._handlers.get(name)
         if handler is None:
             return f"Error: Unknown tool '{name}'. Available tools: {list(self._handlers.keys())}"
@@ -165,15 +196,9 @@ class ToolRegistry:
             if "sandbox" not in arguments:
                 arguments["sandbox"] = self.work_dir
 
-        if name in ("bash", "glob_files", "grep_search"):
+        if name in ("glob_files", "grep_search"):
             if "path" not in arguments or not arguments.get("path"):
                 arguments["path"] = self.work_dir
-            if name == "bash":
-                arguments["cwd"] = arguments.pop("path", self.work_dir)
-
-        if name == "run_python":
-            if "cwd" not in arguments:
-                arguments["cwd"] = self.work_dir
 
         try:
             result = await handler(**arguments)
