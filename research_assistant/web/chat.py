@@ -56,11 +56,11 @@ router = APIRouter()
 SESSIONS_SUBDIR = Path(".ra") / "sessions"
 HISTORY_FILE = "history.json"
 
-MAX_USER_LENGTH = 8_000    # 单条用户消息上限（与前端 slice(0, 8000) 对齐）
-MAX_STEER_LENGTH = 2_000   # steer 上限（与 ws.py generate 端点一致）
-PREVIEW_LIMIT = 400        # tool_card.result_preview 最大字符数
-LAST_MESSAGE_LIMIT = 80    # 会话列表 last_message 摘要长度
-ARTIFACT_PATH_LIMIT = 8    # 单张工具卡最多提取的产物文件数
+MAX_USER_LENGTH = 8_000  # 单条用户消息上限（与前端 slice(0, 8000) 对齐）
+MAX_STEER_LENGTH = 2_000  # steer 上限（与 ws.py generate 端点一致）
+PREVIEW_LIMIT = 400  # tool_card.result_preview 最大字符数
+LAST_MESSAGE_LIMIT = 80  # 会话列表 last_message 摘要长度
+ARTIFACT_PATH_LIMIT = 8  # 单张工具卡最多提取的产物文件数
 
 #: 同一会话的并发连接登记表：sid → 当前持有 socket。
 #: 并发策略选择「后连者踢前者」：新连接 close 旧 socket（close code 4001），
@@ -72,6 +72,7 @@ _LIVE: dict[str, WebSocket] = {}
 # ---------------------------------------------------------------------------
 # history.json 读写（D2 唯一权威）
 # ---------------------------------------------------------------------------
+
 
 def _read_history(run_dir: Path) -> list[dict]:
     """容错读取归约历史；损坏/缺失一律返回空列表（不阻塞会话进入）。"""
@@ -101,7 +102,8 @@ def _write_history(run_dir: Path, messages: list[dict]) -> None:
         run_dir.mkdir(parents=True, exist_ok=True)
         payload = {"schema_version": 1, "messages": messages}
         (run_dir / HISTORY_FILE).write_text(
-            json.dumps(payload, ensure_ascii=False), encoding="utf-8",
+            json.dumps(payload, ensure_ascii=False),
+            encoding="utf-8",
         )
     except OSError:
         pass
@@ -110,6 +112,7 @@ def _write_history(run_dir: Path, messages: list[dict]) -> None:
 # ---------------------------------------------------------------------------
 # 会话目录辅助（REST 与 WS 共用）
 # ---------------------------------------------------------------------------
+
 
 def _sessions_root(cwd: Path) -> Path:
     return Path(cwd) / SESSIONS_SUBDIR
@@ -135,8 +138,13 @@ def _new_session_dir(root: Path, title: str) -> Path:
 
 def _valid_session_id(name: str) -> bool:
     """会话 ID 即目录名：拒绝路径分隔符与点号目录引用。"""
-    return bool(name) and name not in (".", "..") and \
-        "/" not in name and "\\" not in name and ":" not in name
+    return (
+        bool(name)
+        and name not in (".", "..")
+        and "/" not in name
+        and "\\" not in name
+        and ":" not in name
+    )
 
 
 def _resolve_session_dir(cwd: Path, session_id: str) -> Path:
@@ -187,6 +195,7 @@ def _session_summary(run_dir: Path) -> dict:
 # C1: 会话 REST（app.py 以 prefix="/api" 挂载本 router）
 # ---------------------------------------------------------------------------
 
+
 def _cwd_of(request_or_ws) -> Path:
     """工作区根：lifespan 写入的 app.state.cwd，缺省回退进程 CWD。"""
     return getattr(request_or_ws.app.state, "cwd", None) or Path.cwd()
@@ -206,7 +215,10 @@ async def create_session(request: Request):
     cwd = _cwd_of(request)
     run_dir = _new_session_dir(_sessions_root(cwd), title)
     store = SessionStore.create(
-        run_dir, query=title, model=resolve_model(None), mode="chat",
+        run_dir,
+        query=title,
+        model=resolve_model(None),
+        mode="chat",
     )
     store.log_event("session_create", {"title": title})
     _write_history(run_dir, [])
@@ -261,6 +273,7 @@ async def delete_session(session_id: str, request: Request):
 # 适配层：既往对话注入 + 产物提取 + 系统指令
 # ---------------------------------------------------------------------------
 
+
 class _HistoryClient(LLMClient):
     """LLM client 包装层：把 history.json 的归约历史前置进本轮首个请求。
 
@@ -303,8 +316,13 @@ class _HistoryClient(LLMClient):
         if self._prefix and len(messages) == 1 and messages[0].get("role") == "user":
             messages = [*self._prefix, *messages]
         return await self._inner.chat(
-            messages, system=system, tools=tools, temperature=temperature,
-            max_tokens=max_tokens, on_chunk=on_chunk, on_activity=on_activity,
+            messages,
+            system=system,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            on_chunk=on_chunk,
+            on_activity=on_activity,
         )
 
     async def close(self) -> None:
@@ -357,23 +375,38 @@ def extract_artifact_paths(
 
 
 def _chat_system_instructions(work_dir: Path) -> str:
-    """WRITER.md 基座 + 会话模式附录。
+    """WRITER.md 基座 + 会话模式附录（R8 反馈 #4：cowork 化）。
 
     不复用 config.build_system_instructions——那会把输出钉死到某个
     writing_outputs/<ts> 论文目录，与会话「工作区即画布」的模式冲突。
     """
     base = load_system_instructions(work_dir)
-    return base + f"""
+    return (
+        base
+        + f"""
 
-## 会话模式补充指令（chat mode）
+## 会话模式补充指令（cowork mode）
 
-当前是交互式对话工作区，不是一次性文档生成任务：
-- 工作目录是 {work_dir}；所有文件读写以它为根，写出的文件会在界面上以卡片展示、可预览。
+你是与用户并肩工作的 agent：能动手就直接动手，交付看得见的产物，而不是只给建议。
+
+**执行原则**
+- 工作目录是 {work_dir}；所有文件读写以它为根。写出的文件会自动以卡片展示、可预览——优先把工作成果落成文件。
+- 能用工具完成的事不要停留在口头描述：读数据、跑分析、画图、写文档，直接做，完成后简要汇报结果与产物路径。
 - 用户每发一条消息，回复一轮即停下等下一条；除非用户明确要求连续产出长文档，不要自行连写。
-- 需要读数据、跑分析、画图、建文件时直接使用工具，完成后简要汇报结果与产物路径。
-- 引用文献时只使用真实可查证的论文，禁止编造 DOI 或参考文献。
+- 遇到需要多步的请求（如"帮我整理这批数据并出报告"），先给一句两三步的计划，然后在本轮内直接执行到底。
+
+**产物规范（重要）**
+- 正式文档写入 writing_outputs/ 下的子目录（如 writing_outputs/20260822_主题/）；草稿、图表、脚本等中间产物放同处即可。
+- 用 run_python 生成 matplotlib 图表时保存为 PNG 到同一目录，并在回复中给出文件名。
+- 回合结束时若本轮产出了文件，在回复末尾附「交付物」清单：每行一个相对路径加一句说明。
+
+**引用纪律**
+- 引用文献时只使用真实可查证的论文，禁止编造 DOI 或参考文献；不确定就说明不确定。
+
+**语言与风格**
 - 用用户的语言回复；正文简洁，可用 Markdown。
 """
+    )
 
 
 def _jsonable_arguments(args: dict | None) -> dict:
@@ -391,6 +424,7 @@ def _jsonable_arguments(args: dict | None) -> dict:
 # C2/C3/C4: WS /ws/chat — 会话循环
 # ---------------------------------------------------------------------------
 
+
 @router.websocket("/ws/chat")
 async def ws_chat(websocket: WebSocket, session: str | None = None):
     """通用 agentic 会话端点。
@@ -401,7 +435,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
     await websocket.accept()
 
     cancel_event = asyncio.Event()  # 断连兜底：任何阶段置位都终止底层运行
-    send_lock = asyncio.Lock()      # 多任务共用一个 socket，串行化发送帧
+    send_lock = asyncio.Lock()  # 多任务共用一个 socket，串行化发送帧
     sid = ""
     llm_client: _HistoryClient | None = None
 
@@ -443,7 +477,10 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             store.state.mode = "chat"  # 兼容：老目录补齐 mode 标记
         else:
             store = SessionStore.create(
-                run_dir, query="", model=resolve_model(None), mode="chat",
+                run_dir,
+                query="",
+                model=resolve_model(None),
+                mode="chat",
             )
         store.save()
         store.log_event("session_open", {"via": "ws"})
@@ -460,14 +497,12 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         # ---- 组装循环依赖（照 ws.py generate 的方式） ----------------------
         approvals: asyncio.Queue = asyncio.Queue()
         steers: asyncio.Queue = asyncio.Queue()
-        model = resolve_model(getattr(websocket.app.state, "model", None))
-        budget = BudgetGuard(model=model)  # limits 缺省自 RA_MAX_* 环境变量继承
-        try:
-            llm_client = _HistoryClient(build_llm_client(model=model))
-        except ValueError as exc:  # 无 API key 等 config 层错误 → 错误帧收场
-            await _send({"type": "error", "message": str(exc)})
-            await websocket.close()
-            return
+        # 连接期仅确定预算的初始计价模型；LLM 客户端改为**每轮实时构建**
+        # （见 _run_turn 开头）。不能用 lifespan 的 app.state.model 快照——
+        # 它会把「启动时未配置而回退的默认模型名」永久钉死在会话上；
+        # 也不能只在连接时构建一次——那样设置页保存的新 Key/模型对已打开
+        # 的会话永远不生效（R7 反馈 #3 主因 + 残留路径一并修掉）。
+        budget = BudgetGuard(model=resolve_model(None))  # limits 自 RA_MAX_* 继承
         tools = ToolRegistry(work_dir=str(cwd))
         system_instructions = _chat_system_instructions(cwd)
 
@@ -476,23 +511,31 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         def _push_approval(req: ToolApprovalRequest) -> None:
             ask_id = uuid.uuid4().hex[:8]
             ask_state["current"] = ask_id
-            asyncio.get_running_loop().create_task(_send({
-                "type": "approval_request", "id": ask_id,
-                "tool": req.tool_name, "summary": req.summary(),
-            }))
+            asyncio.get_running_loop().create_task(
+                _send(
+                    {
+                        "type": "approval_request",
+                        "id": ask_id,
+                        "tool": req.tool_name,
+                        "summary": req.summary(),
+                    }
+                )
+            )
 
         approver = QueueApprover(approvals, timeout=120.0, on_request=_push_approval)
 
         tasks_reg = getattr(websocket.app.state, "active_tasks", None)
         if isinstance(tasks_reg, dict):  # 注册到任务表：REST stop 可达（可选能力）
             tasks_reg[f"chat:{sid}"] = {
-                "status": "running", "query": sid[:100],
+                "status": "running",
+                "query": sid[:100],
                 "cancel_event": cancel_event,
-                "approvals": approvals, "steers": steers,
+                "approvals": approvals,
+                "steers": steers,
             }
 
-        card_seq = itertools.count(1)          # 卡片 ID 连接内唯一（跨轮不重置：
-        pending_cards: deque[str] = deque()    # 前端 cards 映射按 id 合并）
+        card_seq = itertools.count(1)  # 卡片 ID 连接内唯一（跨轮不重置：
+        pending_cards: deque[str] = deque()  # 前端 cards 映射按 id 合并）
 
         async def _on_text(delta: str) -> None:
             # 流式路径：run_agent 把该回调作为 on_chunk 传给 LLM client，
@@ -503,31 +546,59 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         async def _on_tool_start(tool: str, args: dict) -> None:
             cid = f"c{next(card_seq)}"
             pending_cards.append(cid)  # 工具顺序执行：FIFO 配对结束回调
-            await _send({
-                "type": "tool_card", "id": cid, "tool": tool,
-                "arguments": _jsonable_arguments(args), "status": "running",
-                "result_preview": "", "files": [],
-            })
+            await _send(
+                {
+                    "type": "tool_card",
+                    "id": cid,
+                    "tool": tool,
+                    "arguments": _jsonable_arguments(args),
+                    "status": "running",
+                    "result_preview": "",
+                    "files": [],
+                }
+            )
 
         async def _on_tool_use(tool: str, args: dict, result: object) -> None:
             text = result if isinstance(result, str) else str(result)
             # 被拒/出错的调用不会触发 on_tool_start，这里兜底补发终态卡
             cid = pending_cards.popleft() if pending_cards else f"c{next(card_seq)}"
             status = "error" if text.startswith(("Error", "[DENIED")) else "done"
-            await _send({
-                "type": "tool_card", "id": cid, "tool": tool,
-                "arguments": _jsonable_arguments(args), "status": status,
-                "result_preview": text[:PREVIEW_LIMIT],
-                "files": extract_artifact_paths(tool, args, text),
-            })
+            await _send(
+                {
+                    "type": "tool_card",
+                    "id": cid,
+                    "tool": tool,
+                    "arguments": _jsonable_arguments(args),
+                    "status": status,
+                    "result_preview": text[:PREVIEW_LIMIT],
+                    "files": extract_artifact_paths(tool, args, text),
+                }
+            )
 
         async def _run_turn(text: str) -> None:
             """一轮完整对话：载入历史 → 追加用户消息 → run_agent → 写回。"""
+            nonlocal llm_client
             cancel_event.clear()  # 新回合重置上一轮遗留的停止信号
+            # ---- 每轮实时构建客户端：设置页保存 / 工作区切换即刻生效 -------
+            model_now = resolve_model(None)
+            budget.model = model_now  # 计价跟随实际模型，预算口径不漂移
+            try:
+                fresh_client = _HistoryClient(build_llm_client(model=model_now))
+            except ValueError as exc:  # 未配置 Key 等 → 错误帧收场，不踢连接
+                store.finish("failed", budget.snapshot())
+                await _send({"type": "error", "message": str(exc)})
+                return
+            if llm_client is not None:  # 释放上一轮客户端，防连接句柄泄漏
+                try:
+                    await llm_client.close()
+                except Exception:
+                    pass
+            llm_client = fresh_client
+
             messages = _read_history(run_dir)
             messages.append({"role": "user", "content": text})
             _write_history(run_dir, messages)  # 用户消息先落盘（崩溃可恢复）
-            store.save()                       # 刷新 run.json updated_at
+            store.save()  # 刷新 run.json updated_at
             store.log_event("turn_start", {"chars": len(text)})
             llm_client.set_prefix(messages[:-1])  # 注入既往对话（适配层）
 
@@ -575,14 +646,15 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 messages.append({"role": "assistant", "content": reply})
                 _write_history(run_dir, messages)
             # stop 动作/断连取消时内核正常返回，stop_reason=cancelled —— 状态如实落盘
-            final_status = "cancelled" if agent_result.stop_reason == "cancelled" \
-                else "complete"
+            final_status = "cancelled" if agent_result.stop_reason == "cancelled" else "complete"
             store.finish(final_status, budget.snapshot())
-            await _send({
-                "type": "result",
-                "stop_reason": agent_result.stop_reason,
-                "turns": agent_result.turns,
-            })
+            await _send(
+                {
+                    "type": "result",
+                    "stop_reason": agent_result.stop_reason,
+                    "turns": agent_result.turns,
+                }
+            )
 
         async def _dispatch(msg: dict) -> None:
             """处理非 user 类动作：审批回执 / steer / stop（泵与空闲态共用）。"""
@@ -598,10 +670,12 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 if not message:
                     await _send({"type": "error", "message": "steer 内容不能为空"})
                 elif len(message) > MAX_STEER_LENGTH:
-                    await _send({
-                        "type": "error",
-                        "message": f"steer 过长（最大 {MAX_STEER_LENGTH} 字符）",
-                    })
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": f"steer 过长（最大 {MAX_STEER_LENGTH} 字符）",
+                        }
+                    )
                 else:
                     steers.put_nowait(message)
             elif action == "stop":
@@ -634,10 +708,12 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 if not text:
                     await _send({"type": "error", "message": "消息不能为空"})
                 elif len(text) > MAX_USER_LENGTH:
-                    await _send({
-                        "type": "error",
-                        "message": f"消息过长（最大 {MAX_USER_LENGTH} 字符）",
-                    })
+                    await _send(
+                        {
+                            "type": "error",
+                            "message": f"消息过长（最大 {MAX_USER_LENGTH} 字符）",
+                        }
+                    )
                 else:
                     pump = asyncio.create_task(_pump())
                     try:

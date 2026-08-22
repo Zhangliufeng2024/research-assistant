@@ -19,11 +19,20 @@ async def run_python(
     Writes the code to a temporary file in cwd and runs it with the
     current Python interpreter (inheriting venv site-packages).
 
+    冻结版（PyInstaller）没有独立解释器——sys.executable 是应用自身，
+    子进程方式会变成「重启整个应用」；改走进程内执行器（frozen_exec），
+    使打包进来的 numpy/matplotlib/pandas 真正可用于会话画图与分析。
+
     Args:
         code: Python source code to execute.
         timeout: Timeout in seconds.
         cwd: Working directory for execution.
     """
+    if getattr(sys, "frozen", False):
+        from .frozen_exec import run_python_inprocess
+
+        return await run_python_inprocess(code, timeout=timeout, cwd=cwd)
+
     temp_name = f"_ra_exec_{uuid.uuid4().hex[:8]}.py"
     temp_path = Path(cwd) / temp_name
 

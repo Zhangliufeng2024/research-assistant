@@ -1,18 +1,23 @@
 """模型设置 API（R6 计划：图形化配置普通用户的入口）。
 
-读写**工作目录**下的 ``.env``（与 ``config.load_project_env`` 同一存储，
-CLI / Web / 桌面壳三种入口共享一份配置，见计划 D1）。仅管理 LLM 四键：
+R8 起读写**全局配置** ``%APPDATA%/ResearchAssistant/.env``（跨工作区
+共享——切换工作目录不丢配置），工作区 ``.env`` 降级为可选的按项目
+覆盖层（``config.load_project_env`` 全局先行、工作区覆盖）。仅管理
+LLM 四键：
 
     LLM_API_KEY / LLM_BASE_URL / LLM_MODEL / LLM_PROVIDER
 
 约定：
 - GET 返回的 api key 一律掩码（D2），其余三键为非敏感值原样返回供表单预填；
-- POST 行式改写 ``.env``：已知键原地更新，用户手工添加的其它行/注释原样
-  保留（D3），并同步 ``os.environ`` 使运行中的服务即刻生效（免重启）；
+- POST 行式改写全局 ``.env``：已知键原地更新，用户手工添加的其它行/注释
+  原样保留（D3），并同步 ``os.environ`` 使运行中的服务即刻生效（免重启）；
+- 读写前先跑 ``config.ensure_global_config``：老版本把配置存在工作区
+  ``.env`` 的，首次访问自动上移到全局（一次性、单向）；
 - ``/test`` 用表单当前值临时建 client 发一次最小请求，**不落盘**（D4）。
 
 路由不带 ``/api`` 前缀，由 app.py 以 ``prefix="/api"`` 挂载（与
-workspace.py 同一惯例）。
+workspace.py 同一惯例）。测试通过覆写 ``app.state.env_file`` 指向临时
+文件来隔离；缺省回退 ``app.state.cwd/.env``。
 """
 
 from __future__ import annotations
@@ -23,6 +28,8 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
+
+from ..config import ensure_global_config, resolve_model
 
 router = APIRouter()
 
@@ -41,7 +48,10 @@ class SettingsPayload(BaseModel):
 
 
 def _env_path(request: Request) -> Path:
-    """工作目录 .env：与 workspace.py 一致取 app.state.cwd（lifespan 赋值）。"""
+    """全局配置 .env（R8）；lifespan 赋值，测试可覆写，缺省回退工作区。"""
+    override = getattr(request.app.state, "env_file", None)
+    if override:
+        return Path(override)
     return Path(getattr(request.app.state, "cwd", None) or Path.cwd()) / ".env"
 
 
@@ -112,6 +122,10 @@ def _apply_environ(values: dict[str, str]) -> None:
 
 @router.get("/settings")
 async def get_settings(request: Request):
+    # 老配置一次性上移（幂等）：服务未重启也会在首次打开设置页时完成
+    cwd = getattr(request.app.state, "cwd", None)
+    if cwd:
+        ensure_global_config(Path(cwd))
     values = _read_managed(_env_path(request))
     return {
         "configured": bool(values["LLM_API_KEY"]),
@@ -138,6 +152,8 @@ async def save_settings(payload: SettingsPayload, request: Request):
     }
     _rewrite_env(path, values)
     _apply_environ(values)
+    # 刷新 lifespan 快照，保证任何仍读 app.state.model 的消费方同步（R7 反馈 #2）
+    request.app.state.model = resolve_model(None)
     return {
         "ok": True,
         "env_file": path.name,

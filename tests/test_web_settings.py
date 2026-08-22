@@ -17,6 +17,11 @@ from research_assistant.web.settings import router as settings_router  # noqa: E
 FULL_KEY = "sk-abcdefghijklmnop1234"
 
 
+@pytest.fixture(autouse=True)
+def _isolated_appdata(isolated_appdata):
+    """R8：settings 读写会触碰全局配置目录——一律重定向到 tmp。"""
+
+
 def _app(tmp_path) -> TestClient:
     app = FastAPI()
     app.include_router(settings_router, prefix="/api")
@@ -71,22 +76,20 @@ class TestSaveSettings:
 
     def test_rewrite_preserves_unknown_lines_and_comments(self, tmp_path):
         (tmp_path / ".env").write_text(
-            "# my custom setup\n"
-            "LLM_MODEL=old-model\n"
-            "PARALLEL_API_KEY=para-keep-me\n",
-            encoding="utf-8")
+            "# my custom setup\nLLM_MODEL=old-model\nPARALLEL_API_KEY=para-keep-me\n",
+            encoding="utf-8",
+        )
         c = _app(tmp_path)
         c.post("/api/settings", json=_payload(llm_model="new-model"))
         env = (tmp_path / ".env").read_text(encoding="utf-8")
-        assert "# my custom setup" in env                      # 注释保留
-        assert "PARALLEL_API_KEY=para-keep-me" in env          # 无关键保留
-        assert "LLM_MODEL=new-model" in env                    # 托管键原地更新
-        assert "old-model" not in env                          # 不残留旧值
-        assert env.count("LLM_MODEL=") == 1                    # 不重复追加
+        assert "# my custom setup" in env  # 注释保留
+        assert "PARALLEL_API_KEY=para-keep-me" in env  # 无关键保留
+        assert "LLM_MODEL=new-model" in env  # 托管键原地更新
+        assert "old-model" not in env  # 不残留旧值
+        assert env.count("LLM_MODEL=") == 1  # 不重复追加
 
     def test_duplicate_managed_keys_collapsed_to_first(self, tmp_path):
-        (tmp_path / ".env").write_text(
-            "LLM_MODEL=a\nLLM_MODEL=b\n", encoding="utf-8")
+        (tmp_path / ".env").write_text("LLM_MODEL=a\nLLM_MODEL=b\n", encoding="utf-8")
         _app(tmp_path).post("/api/settings", json=_payload(llm_model="z"))
         env = (tmp_path / ".env").read_text(encoding="utf-8")
         assert env.count("LLM_MODEL=") == 1
@@ -98,12 +101,31 @@ class TestSaveSettings:
         r = c.post("/api/settings", json=_payload(llm_api_key="", llm_model="qwen-plus"))
         assert r.json()["ok"] is True
         env = (tmp_path / ".env").read_text(encoding="utf-8")
-        assert f"LLM_API_KEY={FULL_KEY}" in env                # 原 Key 未丢
+        assert f"LLM_API_KEY={FULL_KEY}" in env  # 原 Key 未丢
         assert "LLM_MODEL=qwen-plus" in env
 
     def test_empty_key_without_existing_rejected(self, tmp_path):
         r = _app(tmp_path).post("/api/settings", json=_payload(llm_api_key=""))
         assert r.status_code == 422
+
+    def test_state_env_file_takes_precedence(self, tmp_path, isolated_appdata):
+        """R8：lifespan 会把 env_file 指到全局配置——state 覆写必须生效。"""
+        custom = isolated_appdata / "custom.env"
+        custom.write_text("LLM_API_KEY=sk-custom-1234\n", encoding="utf-8")
+        app = FastAPI()
+        app.include_router(settings_router, prefix="/api")
+        app.state.cwd = tmp_path
+        app.state.env_file = custom
+        c = TestClient(app)
+
+        body = c.get("/api/settings").json()
+        assert body["configured"] is True
+        assert body["llm_api_key_masked"] == "sk-c***1234"
+
+        # 保存也写进 env_file 指向的文件，而非工作区
+        c.post("/api/settings", json=_payload(llm_model="m1"))
+        assert "LLM_MODEL=m1" in custom.read_text(encoding="utf-8")
+        assert not (tmp_path / ".env").exists()
 
 
 class TestTestEndpoint:
@@ -124,14 +146,15 @@ class TestTestEndpoint:
                 if type(self).programmed_exc:
                     raise type(self).programmed_exc
                 from research_assistant.llm.base import LLMResponse
+
                 return LLMResponse(content=type(self).reply)
 
             async def close(self):
                 pass
 
         monkeypatch.setattr(
-            "research_assistant.llm.factory.create_llm_client",
-            lambda **kw: FakeClient(**kw))
+            "research_assistant.llm.factory.create_llm_client", lambda **kw: FakeClient(**kw)
+        )
         return {"calls": calls, "cls": FakeClient}
 
     def test_ok_reply(self, tmp_path, fake_factory):
@@ -155,7 +178,5 @@ class TestTestEndpoint:
     def test_empty_key_falls_back_to_configured(self, tmp_path, fake_factory):
         c = _app(tmp_path)
         c.post("/api/settings", json=_payload())
-        body = c.post(
-            "/api/settings/test",
-            json=_payload(llm_api_key="", llm_base_url="")).json()
+        body = c.post("/api/settings/test", json=_payload(llm_api_key="", llm_base_url="")).json()
         assert body["ok"] is True

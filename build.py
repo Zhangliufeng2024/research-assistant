@@ -103,8 +103,14 @@ HIDDEN_IMPORTS = [
     "clr_loader", "clr_loader.netfx", "pythonnet", "clr",
 ]
 
+# R8 反馈 #4（cowork 交付物）：numpy/pandas/matplotlib/PIL 不再排除——
+# 冻结版 run_python 走进程内执行器（tools/frozen_exec.py），会话里能真正
+# 画图与跑数据分析。代价是体积增加约 60-90MB（压缩后）。scipy/cv2/深度
+# 学习框架仍然排除（体积失控且研究助手场景极少用到）。
+HIDDEN_IMPORTS += ["numpy", "pandas", "matplotlib", "PIL"]
+
 EXCLUDES = [
-    "matplotlib", "numpy", "pandas", "scipy", "PIL", "cv2",
+    "scipy", "cv2",
     "torch", "tensorflow", "pytest", "IPython", "notebook", "jupyter",
 ]
 

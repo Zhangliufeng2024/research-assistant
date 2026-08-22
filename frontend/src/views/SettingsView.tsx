@@ -126,6 +126,8 @@ export function SettingsView() {
       setCfg({ ...(cfg || ({} as SettingsData)), configured: true });
       setKey("");
       setStatus({ kind: "ok", text: `✓ 已保存到 ${r.env_file}，即刻生效（${r.llm_api_key_masked}）` });
+      // 刷新「模型与端点」等信息卡：其数据来自挂载时的一次性快照（R7 反馈 #2）
+      api.get<StatusInfo>("/api/status").then(setSys).catch(() => {});
     } catch (e) {
       setStatus({ kind: "err", text: `✗ 保存失败：${(e as Error).message}` });
     } finally {
@@ -217,8 +219,10 @@ export function SettingsView() {
           </div>
 
           <p className="text-[11.5px] leading-5 text-ink-3">
-            配置写入当前工作目录的 .env 文件（与 CLI 共享），保存即刻生效。
-            图像 / 搜索等高级配置请直接编辑该文件。
+            配置保存在应用数据目录（%APPDATA%\ResearchAssistant\.env），所有工作
+            目录共享一份，切换工作目录不会丢失；保存即刻生效。旧版本写在某个工作
+            目录里的配置会在首次打开本页时自动迁移。图像 / 搜索等高级配置请直接
+            编辑该文件。
           </p>
         </div>
       </Card>

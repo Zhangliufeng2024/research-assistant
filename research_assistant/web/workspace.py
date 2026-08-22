@@ -1,4 +1,4 @@
-"""工作区 API（R5 计划 R1：W1-W4）。
+"""工作区 API（R5 计划 R1：W1-W4；R8 增运行时切换 POST /workspace/root）。
 
 约定：**服务启动目录即工作区根** —— 与 ``web/app.py`` lifespan 中
 ``app.state.cwd = Path.cwd()`` 的赋值一致，本模块统一以 ``Path.cwd()``
@@ -6,6 +6,10 @@
 :func:`research_assistant.core.safe_resolve` 围栏校验：越界一律 403、
 目标不存在 404。路由本身不带 ``/api`` 前缀，由 app.py 以
 ``prefix="/api"`` 挂载（与 web/routes.py 同一惯例）。
+
+R8 运行时切换（POST /workspace/root）通过 ``os.chdir`` 落地——本模块
+所有读取都跟随进程 CWD，天然生效；``app.state.cwd/output_folder/model``
+由切换端点同步刷新。
 """
 
 import mimetypes
@@ -16,8 +20,10 @@ from pathlib import Path
 
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
+from pydantic import BaseModel
 
-from ..core import safe_resolve
+from ..config import load_project_env, resolve_model
+from ..core import ensure_output_folder, safe_resolve, setup_claude_skills
 
 router = APIRouter()
 
@@ -31,12 +37,42 @@ TEXT_PREVIEW_LIMIT = 256 * 1024
 DOCX_PARAGRAPH_LIMIT = 200
 
 #: W3 视为文本读取的扩展名（小写、含点）；无扩展名的小文件同样按文本处理。
-_TEXT_EXTENSIONS = frozenset({
-    ".txt", ".md", ".markdown", ".rst", ".py", ".js", ".mjs", ".cjs",
-    ".ts", ".tsx", ".jsx", ".json", ".csv", ".tsv", ".bib", ".log",
-    ".yaml", ".yml", ".tex", ".html", ".htm", ".css", ".scss", ".xml",
-    ".toml", ".ini", ".cfg", ".conf", ".sh", ".bat", ".ps1", ".sql",
-})
+_TEXT_EXTENSIONS = frozenset(
+    {
+        ".txt",
+        ".md",
+        ".markdown",
+        ".rst",
+        ".py",
+        ".js",
+        ".mjs",
+        ".cjs",
+        ".ts",
+        ".tsx",
+        ".jsx",
+        ".json",
+        ".csv",
+        ".tsv",
+        ".bib",
+        ".log",
+        ".yaml",
+        ".yml",
+        ".tex",
+        ".html",
+        ".htm",
+        ".css",
+        ".scss",
+        ".xml",
+        ".toml",
+        ".ini",
+        ".cfg",
+        ".conf",
+        ".sh",
+        ".bat",
+        ".ps1",
+        ".sql",
+    }
+)
 
 
 def _fence(path: str | None, root: Path) -> Path:
@@ -89,8 +125,7 @@ def _docx_preview(target: Path, size: int) -> dict:
     except Exception:
         return FileResponse(
             path=str(target),
-            media_type="application/vnd.openxmlformats-officedocument"
-                       ".wordprocessingml.document",
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
             headers={"Content-Disposition": f'attachment; filename="{target.name}"'},
         )
     data = "\n".join(parts).encode("utf-8")
@@ -111,6 +146,64 @@ async def get_workspace(request: Request):
         "output_folder": output_folder,
         "has_git": (root / ".git").exists(),
     }
+
+
+class SwitchRootPayload(BaseModel):
+    path: str
+
+
+@router.post("/workspace/root")
+async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
+    """R8 反馈 #1：运行时切换工作区根（Claude Desktop 式界面内添加工作目录）。
+
+    落地方式是进程级 ``os.chdir``：workspace.py 全部端点读 ``Path.cwd()``
+    即刻跟随；随后重建输出目录与技能、重载配置（全局 .env + 新工作区
+    覆盖层），并刷新 ``app.state`` 的 cwd / output_folder / model。
+
+    语义边界（有意为之）：
+    - 生成任务运行中一律 409 拒绝——chdir 是进程级状态，任务中途换根会让
+      相对路径写入落进新目录，风险不可控；完成后再切。
+    - 已打开的会话连接不受影响：其 ToolRegistry 在连接时捕获了旧工作区
+      的**绝对路径**，进行中的回合继续写原目录（会话属于原工作区，语义
+      正确）；新建会话/重连即用新根。
+    """
+    raw = payload.path.strip().strip('"').strip("'")
+    if not raw:
+        raise HTTPException(status_code=422, detail="请提供工作目录路径")
+    target = Path(os.path.expandvars(raw)).expanduser()
+    if not target.is_absolute():
+        raise HTTPException(status_code=422, detail="请提供绝对路径")
+    target = target.resolve()
+    if not target.is_dir():
+        raise HTTPException(status_code=404, detail=f"目录不存在：{target}")
+
+    if Path.cwd().resolve() == target:
+        return {"ok": True, "root": str(target), "unchanged": True}
+
+    tasks_reg = getattr(request.app.state, "active_tasks", None)
+    busy = [
+        tid
+        for tid, t in (tasks_reg or {}).items()
+        if not tid.startswith("chat:") and t.get("status") in ("running", "stopping")
+    ]
+    if busy:
+        raise HTTPException(
+            status_code=409, detail="有生成任务正在运行，请等待完成（或先停止）再切换工作目录"
+        )
+
+    os.chdir(target)
+    # 技能随新根重同步：冻结包内 .claude 在 research_assistant/ 下，
+    # 开发态在仓库根——两级探测与 desktop.bundle_root 的取法互补。
+    package_dir = Path(__file__).parent.parent.absolute()
+    if not (package_dir / ".claude").exists():
+        package_dir = package_dir.parent
+    setup_claude_skills(package_dir, target)
+    output_folder = ensure_output_folder(target)  # writing_outputs 就绪
+    load_project_env(target)  # 全局 + 新工作区 .env
+    request.app.state.cwd = target
+    request.app.state.output_folder = output_folder
+    request.app.state.model = resolve_model(None)
+    return {"ok": True, "root": str(target), "output_folder": str(output_folder)}
 
 
 @router.get("/workspace/tree")
@@ -145,13 +238,15 @@ async def get_workspace_tree(path: str = "", depth: int = 1):
         except (ValueError, OSError):
             continue  # 越界或竞态消失的条目直接跳过
         is_dir = resolved.is_dir()
-        items.append({
-            "name": name,
-            "path": _rel_posix(resolved, root),
-            "type": "dir" if is_dir else "file",
-            "size": None if is_dir else stat.st_size,
-            "mtime": stat.st_mtime,
-        })
+        items.append(
+            {
+                "name": name,
+                "path": _rel_posix(resolved, root),
+                "type": "dir" if is_dir else "file",
+                "size": None if is_dir else stat.st_size,
+                "mtime": stat.st_mtime,
+            }
+        )
 
     items.sort(key=lambda item: (item["type"] != "dir", item["name"].lower()))
     return {"path": _rel_posix(target, root), "items": items}
@@ -202,9 +297,7 @@ async def open_in_system(path: str = ""):
     不等待其退出。
     """
     if os.getenv("RA_ALLOW_SHELL_OPEN", "").strip() != "1":
-        raise HTTPException(
-            status_code=403, detail="未启用：需设置环境变量 RA_ALLOW_SHELL_OPEN=1"
-        )
+        raise HTTPException(status_code=403, detail="未启用：需设置环境变量 RA_ALLOW_SHELL_OPEN=1")
     root = Path.cwd()
     target = _fence(path, root)
     if not (target.is_file() or target.is_dir()):

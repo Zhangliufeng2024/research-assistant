@@ -14,6 +14,7 @@ from urllib.parse import urlsplit
 from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse, Response
 
+from ..config import resolve_model
 from ..core import get_api_key, safe_resolve
 from ..llm.factory import detect_provider
 from ..utils import (
@@ -135,7 +136,8 @@ def _package_version() -> str:
 @router.get("/status")
 async def get_status(request: Request):
     return {
-        "model": request.app.state.model,
+        # 实时解析而非 lifespan 快照：设置页保存后免刷新即反映（R7 反馈 #2）
+        "model": resolve_model(None),
         "output_folder": str(request.app.state.output_folder),
         "active_tasks": len(request.app.state.active_tasks),
         # --- B7 追加的系统信息字段（只增不改） ---

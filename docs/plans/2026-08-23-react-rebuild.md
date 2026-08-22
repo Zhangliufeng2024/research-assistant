@@ -51,3 +51,32 @@ vanilla 手搓 DOM 无组件框架、Markdown 简化实现、极客风视觉错�
 - 验证：pytest 553 passed；ruff 全绿（`.claude/` 已排除）；dist exe 与
   setup.exe（44.9MB）均实测：静默安装 → 记忆工作区直启 → 技能同步 →
   服务就绪 → UI v3.3.0，卸载干净
+
+## R8 交付记录（2026-08-22，v3.3.1）
+
+用户实测 v3.3.0 反馈四项，全部修复：
+
+1. **免选夹启动**（反馈 #1）：desktop.py 启动不再弹选夹——CLI 参数 > 上次
+   记忆 > 默认目录（文档/研究助手，自动创建）。换目录改为界面内操作：
+   会话页输入框下方「工作目录」入口 → 原生选夹（pywebview js_api
+   DesktopBridge）或手动输路径 → POST /api/workspace/root 运行时切换
+   （os.chdir + 技能重同步 + 配置重载 + app.state 刷新；生成任务运行中 409）。
+2. **设置保存即刷新**（反馈 #2）：/api/status 改为实时 resolve_model；
+   SettingsView save() 成功后重拉 /api/status；POST /api/settings 同步刷新
+   app.state.model。
+3. **配置真正生效**（反馈 #3）：ws_chat 的 LLM 客户端改为**每轮实时构建**
+   （原为连接期一次，保存的新 Key/模型对已开会话永不生效）；错误帧在
+   ChatView 以横幅可见（原来完全吞掉，表现为"无任何反应"）。
+4. **会话 cowork 化**（反馈 #4）：系统提示强化执行原则与交付物规范
+   （writing_outputs/ 落盘、图表 PNG、回合末「交付物」清单）；build.py 不再
+   排除 numpy/pandas/matplotlib/PIL；run_python 冻结版改为 spawn 子进程
+   执行器（tools/frozen_exec.py，freeze_support 引导、超时强杀）——线程方案
+   会偷 GIL 且杀不掉，已废弃。任务面板架构未动。
+
+配套改造：模型配置上移全局 %APPDATA%/ResearchAssistant/.env（切换工作目录
+不丢；工作区 .env 降级为覆盖层；v3.3.0 工作区配置与 v3.2.0 config.json 两条
+一次性迁移并存）。
+
+验证：pytest 575 passed（新增 workspace-switch / config-global / frozen-exec /
+settings env_file 用例）；vitest 20/20；tsc/ruff 全绿；live smoke 实测
+status→settings 保存即生效→workspace/root 切换链。

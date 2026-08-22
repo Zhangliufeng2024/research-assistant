@@ -126,3 +126,13 @@ export interface SettingsData {
   cost_cap_enforceable?: boolean;
   [k: string]: unknown;
 }
+
+/* ---------- 工作区（R8：界面内切换工作目录） ---------- */
+
+/** GET /api/workspace 名片；POST /api/workspace/root 切换后同构返回。 */
+export interface WorkspaceInfo {
+  root: string;
+  name: string;
+  output_folder: string | null;
+  has_git: boolean;
+}

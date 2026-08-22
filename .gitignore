@@ -69,3 +69,4 @@ _ra_exec_*.py
 
 # build.py --restricted 的 PyInstaller 产物 spec（每次构建重新生成）
 ResearchAssistant_Trial.spec
+*.spec

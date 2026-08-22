@@ -4,7 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
 import { sessionTitle } from "@/lib/format";
-import type { SettingsData } from "@/lib/types";
+import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { BudgetBar } from "@/components/chat/BudgetBar";
@@ -12,6 +12,7 @@ import { Composer } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
 import { MessageList } from "@/components/chat/MessageList";
 import { SessionList } from "@/components/chat/SessionList";
+import { WorkspaceModal } from "@/components/chat/WorkspaceModal";
 
 const PHASE_DOT: Record<string, string> = {
   idle: "bg-ink-3",
@@ -38,6 +39,8 @@ export function ChatView() {
 
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
+  const [wsOpen, setWsOpen] = useState(false);
   const [toast, setToast] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
@@ -49,6 +52,10 @@ export function ChatView() {
       .get<SettingsData>("/api/settings")
       .then((s) => setConfigured(!!s.configured))
       .catch(() => setConfigured(null));
+    api
+      .get<WorkspaceInfo>("/api/workspace")
+      .then(setWsInfo)
+      .catch(() => {});
   }, [refreshSessions]);
 
   // 自动滚动：仅在用户本就贴近底部时跟随（避免打断回看）
@@ -141,7 +148,7 @@ export function ChatView() {
         </div>
 
         {/* 横幅区 */}
-        {(configured === false || connBanner) && (
+        {(configured === false || connBanner || chat.error) && (
           <div className="shrink-0 space-y-px">
             {configured === false && (
               <Link
@@ -150,6 +157,11 @@ export function ChatView() {
               >
                 尚未配置模型服务——点击前往「设置」填写 API Key →
               </Link>
+            )}
+            {chat.error && (
+              <div className="bg-danger/10 px-5 py-2 text-center text-[12.5px] text-danger">
+                出错：{chat.error}（重新发送即可重试）
+              </div>
             )}
             {connBanner && (
               <div className="bg-danger/10 px-5 py-2 text-center text-[12.5px] text-danger">
@@ -186,7 +198,35 @@ export function ChatView() {
           disabled={conn === "connecting"}
           onSend={(t) => void handleSend(t)}
         />
+
+        {/* 工作目录入口（R8 反馈 #1：Claude Desktop 式，对话框下方随时更换） */}
+        <button
+          type="button"
+          onClick={() => setWsOpen(true)}
+          title={wsInfo?.root || ""}
+          className="mx-auto mb-2.5 flex max-w-full shrink-0 items-center gap-1.5 px-2 text-[11.5px] text-ink-3 transition-colors hover:text-accent"
+        >
+          <span aria-hidden>📁</span>
+          工作目录：
+          <span className="max-w-[16rem] truncate font-medium">
+            {wsInfo?.name ?? "…"}
+          </span>
+          · 点击更换
+        </button>
       </div>
+
+      {wsOpen && wsInfo && (
+        <WorkspaceModal
+          info={wsInfo}
+          onClose={() => setWsOpen(false)}
+          onSwitched={(next) => {
+            setWsInfo(next);
+            setWsOpen(false);
+            setToast(`已切换到「${next.name}」`);
+            refreshSessions().catch(() => {});
+          }}
+        />
+      )}
 
       {previewPath && (
         <FilePreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
