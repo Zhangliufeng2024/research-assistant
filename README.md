@@ -20,6 +20,10 @@ AI-powered research and writing assistant that combines deep research with publi
   audit timeline, paper library with search/gallery/zip export. Zero build step:
   vanilla ES modules served by FastAPI (`static/js/`), pure-function layers
   covered by `node --test tests/js/`
+- **会话工作台 + 桌面壳** — chat-first「会话」视图（`/ws/chat` 直连 agent 循环：流式
+  文本、内联工具/文件卡片、审批卡与 steer 注入）+ 工作区文件树浏览与泛化文件预览；
+  `pip install 'research-assistant[desktop]'` 后用 `research-assistant-desktop` 选一个
+  文件夹即可在原生窗口中开工（pywebview，零 node）
 - **26 specialized skills** — from scientific writing and venue templates to LCA/carbon analysis and infographics
 - **Built-in tools** — read_file, write_file, edit_file, bash, glob_files, grep_search, run_python
 - **Programmatic API** — async generator interface with streaming progress updates
