@@ -120,6 +120,12 @@ def _bool_env(name: str, default: bool) -> bool:
 
 
 def _package_version() -> str:
+    """版本号以包内 __version__ 为准——冻结环境里 dist-metadata 可能是
+    构建机上残留的旧安装（曾把 3.1.0 带进 exe），包内常量才与发布一致。"""
+    from .. import __version__
+
+    if __version__:
+        return __version__
     try:
         return importlib.metadata.version("research-assistant")
     except importlib.metadata.PackageNotFoundError:

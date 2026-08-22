@@ -1,6 +1,6 @@
 [project]
 name = "research-assistant"
-version = "3.2.0"
+version = "3.3.0"
 description = "Deep research and writing tool - combines AI-driven deep research with well-formatted written outputs. Supports Anthropic and OpenAI-compatible LLM APIs."
 readme = "README.md"
 requires-python = ">=3.10"
@@ -53,6 +53,8 @@ dev-dependencies = [
 [tool.ruff]
 line-length = 100
 target-version = "py310"
+# .claude/ 内是第三方技能脚本（非项目代码），不参与 lint。
+extend-exclude = [".claude"]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I", "UP", "B"]

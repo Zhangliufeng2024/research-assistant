@@ -1,8 +1,12 @@
 """Build script — creates standalone Windows .exe via PyInstaller.
 
+R7 起默认打包为**无黑框桌面应用**（--noconsole，单窗口 pywebview 壳，
+诊断走 <工作区>/.ra/logs/desktop.log）。调试时可加 --debug-console 保留控制台。
+
 Usage:
-    python build.py              # Build unrestricted version
-    python build.py --restricted # Build restricted version (3-month expiry)
+    python build.py                    # 无控制台桌面版（发布用）
+    python build.py --debug-console    # 保留控制台的调试版
+    python build.py --restricted       # restricted version (3-month expiry)
 """
 
 import re
@@ -92,7 +96,11 @@ HIDDEN_IMPORTS = [
     "research_assistant.tools", "research_assistant.tools.registry",
     "research_assistant.tools.file_ops", "research_assistant.tools.bash",
     "research_assistant.tools.python_exec",
-    "research_assistant.launcher",
+    "research_assistant.launcher", "research_assistant.launcher_desktop",
+    "research_assistant.desktop",
+    # pywebview 桌面壳：Windows 后端与 .NET 桥均为运行期动态导入，必须显式声明
+    "webview", "webview.platforms.winforms", "webview.platforms.edgechromium",
+    "clr_loader", "clr_loader.netfx", "pythonnet", "clr",
 ]
 
 EXCLUDES = [
@@ -101,7 +109,7 @@ EXCLUDES = [
 ]
 
 
-def build(restricted: bool = False):
+def build(restricted: bool = False, debug_console: bool = False):
     check_env_safety()
 
     if restricted:
@@ -110,15 +118,18 @@ def build(restricted: bool = False):
         print("Building RESTRICTED version (3-month expiry)...\n")
     else:
         app_name = "ResearchAssistant"
-        entry = PACKAGE / "launcher.py"
-        print("Building UNRESTRICTED version...\n")
+        # R7：桌面化入口——单窗口、无黑框、不跳浏览器（D10-D12）
+        entry = PACKAGE / "launcher_desktop.py"
+        print(f"Building UNRESTRICTED version ({'console' if debug_console else 'noconsole'})...\n")
 
     datas = _get_datas()
 
     cmd = [
         sys.executable, "-m", "PyInstaller",
         "--name", app_name,
-        "--noconfirm", "--clean", "--console", "--icon", "NONE",
+        "--noconfirm", "--clean",
+        "--console" if debug_console else "--noconsole",
+        "--icon", str(ROOT / "packaging" / "app_icon.ico"),
     ]
 
     for d in datas:
@@ -127,6 +138,11 @@ def build(restricted: bool = False):
         cmd.extend(["--hidden-import", imp])
     for exc in EXCLUDES:
         cmd.extend(["--exclude-module", exc])
+
+    # pywebview 的 .NET 桥携带数据/二进制（WinForms.dll、WebView2Loader 等），
+    # 整体收集以免运行期缺文件
+    for pkg in ("webview", "clr_loader", "pythonnet"):
+        cmd.extend(["--collect-all", pkg])
 
     cmd.append(str(entry))
 
@@ -180,4 +196,5 @@ def _check_for_leaked_keys(dist_dir: Path) -> list[str]:
 
 if __name__ == "__main__":
     restricted = "--restricted" in sys.argv
-    build(restricted=restricted)
+    debug_console = "--debug-console" in sys.argv
+    build(restricted=restricted, debug_console=debug_console)

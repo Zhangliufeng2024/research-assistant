@@ -14,12 +14,12 @@ AI-powered research and writing assistant that combines deep research with publi
 - **Figure generation** — schematics, data plots, AI-generated images via NVIDIA NIM (free) or any OpenAI-compatible image API
 - **Document review** — reads generated .docx to verify content completeness; optional PDF conversion via LibreOffice
 - **Multi-agent mode** — resumable pipeline state machine: PLAN → RESEARCH∥ → FIGURES∥ → ASSEMBLE → GATES → REVISION → FINALIZE
-- **Web console（「墨台」暗色控制台）** — stage timeline, live activity & LLM output
-  stream, real-time budget gauges, mid-run steer injection, tool approval cards,
-  run history with one-click resume (ArtifactStore checkpointing), events.jsonl
-  audit timeline, paper library with search/gallery/zip export. Zero build step:
-  vanilla ES modules served by FastAPI (`static/js/`), pure-function layers
-  covered by `node --test tests/js/`
+- **Web console（Claude 式现代界面，浅/深双主题）** — React 18 + TypeScript + Vite +
+  Tailwind v4 构建的前端（源码 `frontend/`，产物直出 `research_assistant/web/static/`）：
+  stage timeline, live activity & LLM output stream, real-time budget gauges,
+  mid-run steer injection, tool approval cards, run history with one-click resume
+  (ArtifactStore checkpointing), events.jsonl audit timeline, paper library with
+  zip export; GFM 表格 + KaTeX 公式 + 代码高亮；归约器等纯函数层由 vitest 覆盖
 - **会话工作台 + 桌面壳** — chat-first「会话」视图（`/ws/chat` 直连 agent 循环：流式
   文本、内联工具/文件卡片、审批卡与 steer 注入）+ 工作区文件树浏览与泛化文件预览；
   `pip install 'research-assistant[desktop]'` 后用 `research-assistant-desktop` 选一个
@@ -67,8 +67,8 @@ GitHub Releases 提供 `ResearchAssistant_setup_<版本>.exe`：安装后从开�
 首次运行选择一个工作文件夹即可开工；**模型 API Key 在「设置」页图形化配置**（含测试连接），
 无需手写 `.env`。卸载走系统「应用与功能」，用户工作目录数据不受影响。
 
-从源码构建安装包：`python -m PyInstaller packaging/ResearchAssistant.spec --noconfirm`，
-再运行 `ISCC packaging\installer.iss`（或一键：`python build.py`）。
+从源码构建安装包：先 `python build.py`（PyInstaller 打包，默认无控制台窗口、
+单原生窗体），再运行 `ISCC packaging\installer.iss` 生成 setup.exe。
 
 #### 从源码安装
 

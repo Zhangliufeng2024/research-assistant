@@ -1,14 +1,14 @@
 ; Research Assistant Windows 安装程序（R6 计划交付物）。
 ;
 ; 用法：
-;   1) python -m PyInstaller ResearchAssistant.spec --noconfirm   ; 先产出 dist/ResearchAssistant/
-;   2) ISCC build\installer.iss                                   ; 产出 dist/ResearchAssistant_setup_<ver>.exe
+;   1) python build.py                       ; 先产出 dist/ResearchAssistant/
+;   2) ISCC packaging\installer.iss          ; 产出 dist/ResearchAssistant_setup_<ver>.exe
 ;
 ; 数据安全说明：会话、写作产物与 .env 全部存放在**用户自选的工作目录**，
 ; 不写入 {app}；卸载只移除程序文件，不触碰任何用户数据。
 
 #define MyAppName "Research Assistant"
-#define MyAppVersion "3.2.0"
+#define MyAppVersion "3.3.0"
 #define MyAppPublisher "Zhangliufeng2024"
 #define MyAppExeName "ResearchAssistant.exe"
 
@@ -22,6 +22,7 @@ DefaultDirName={autopf}\{#MyAppName}
 DefaultGroupName={#MyAppName}
 UninstallDisplayName={#MyAppName} {#MyAppVersion}
 LicenseFile=..\LICENSE
+SetupIconFile=app_icon.ico
 OutputDir=..\dist
 OutputBaseFilename=ResearchAssistant_setup_{#MyAppVersion}
 Compression=lzma2/max

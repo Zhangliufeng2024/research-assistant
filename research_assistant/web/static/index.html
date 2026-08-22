@@ -1,47 +1,23 @@
-<!DOCTYPE html>
+<!doctype html>
 <html lang="zh-CN">
-<head>
-  <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1.0">
-  <title>研究助手 · RA Console</title>
-  <meta name="color-scheme" content="dark">
-  <link rel="icon" href="favicon.svg" type="image/svg+xml">
-  <link rel="preload" href="fonts/chakra-petch-latin-600-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="preload" href="fonts/jetbrains-mono-latin-400-normal.woff2" as="font" type="font/woff2" crossorigin>
-  <link rel="stylesheet" href="style.css">
-</head>
-<body>
-
-<div id="app">
-  <header class="topbar">
-    <a class="brand" href="#/chat">
-      <svg class="brand-mark" viewBox="0 0 32 32" aria-hidden="true">
-        <path d="M7 7h18v4.5H11.5V25H7z" fill="currentColor"/>
-        <rect x="16" y="16" width="9" height="9" fill="currentColor" opacity=".55"/>
-      </svg>
-      <span class="brand-name">RA·CONSOLE</span>
-      <span class="brand-sub">研究助手</span>
-    </a>
-
-    <nav class="topnav" id="topnav" aria-label="主导航">
-      <a href="#/chat" data-route="chat">会话</a>
-      <a href="#/task" data-route="task">任务</a>
-      <a href="#/papers" data-route="papers">文库</a>
-      <a href="#/settings" data-route="settings">设置</a>
-    </nav>
-
-    <div class="topbar-status" id="conn-status" title="服务连接">
-      <span class="conn-dot" id="conn-dot"></span>
-      <span class="conn-model" id="model-label">…</span>
-    </div>
-  </header>
-
-  <main id="main" class="main"></main>
-</div>
-
-<div id="toasts" class="toasts" aria-live="polite"></div>
-<div id="modal-root"></div>
-
-<script type="module" src="js/main.js"></script>
-</body>
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 64 64'%3E%3Crect width='64' height='64' rx='14' fill='%23D97757'/%3E%3Cpath d='M32 12 Q34.5 29.5 52 32 Q34.5 34.5 32 52 Q29.5 34.5 12 32 Q29.5 29.5 32 12 Z' fill='%23FBF7EE'/%3E%3C/svg%3E" />
+    <title>研究助手</title>
+    <script>
+      // 首屏防闪烁：先于 React 挂载确定主题（localStorage > 系统偏好）
+      try {
+        var t = localStorage.getItem("ra-theme");
+        if (t === "dark" || (!t && matchMedia("(prefers-color-scheme: dark)").matches)) {
+          document.documentElement.classList.add("dark");
+        }
+      } catch (e) {}
+    </script>
+    <script type="module" crossorigin src="/assets/index-Bf8Za2hb.js"></script>
+    <link rel="stylesheet" crossorigin href="/assets/index-B704K630.css">
+  </head>
+  <body>
+    <div id="root"></div>
+  </body>
 </html>

@@ -1,9 +1,10 @@
 """全量在线冒烟（人工运维工具——会真实调用 LLM 产生费用，勿入 CI）：静态资源 + REST 全端点 + 双 WS 通道 + 真实一轮对话 + 受控生成/停止。
 
-运行：PYTHONIOENCODING=utf-8 python _smoke_full.py
+运行：PYTHONIOENCODING=utf-8 python scripts/smoke_live.py
 """
 import asyncio
 import json
+import re
 import threading
 import time
 import urllib.error
@@ -55,18 +56,22 @@ def req(method, path, body=None, raw=False, timeout=15):
 
 import websockets  # noqa: E402
 
-# ============ 1. 静态资源 ============
-for path, marker in [
-    ("/", b'id="main"'),
-    ("/style.css", b"--amber"),
-    ("/js/main.js", b"initRouter"),
-    ("/js/views/chat.js", b"renderChatView"),
-    ("/js/protocol_chat.js", b"reduceChat"),
-    ("/favicon.svg", b"<svg"),
-    ("/fonts/jetbrains-mono-latin-400-normal.woff2", b"wOF2"),
-]:
-    s, data, _ = req("GET", path, raw=True)
-    check(f"static {path}", s == 200 and marker in data[:4000], f"status={s}")
+# ============ 1. 静态资源（React 构建产物，R7 起） ============
+s, html, _ = req("GET", "/", raw=True)
+check("static index.html",
+      s == 200 and b'id="root"' in html[:4000] and b"/assets/index-" in html[:4000],
+      f"status={s}")
+
+_m_js = re.search(rb'src="(/assets/index-[^"]+\.js)"', html or b"")
+_m_css = re.search(br'href="(/assets/index-[^"]+\.css)"', html or b"")
+check("static app bundle", bool(_m_js), "index.html 未引用 /assets/index-*.js")
+if _m_js:
+    s, js, _ = req("GET", _m_js.group(1).decode(), raw=True)
+    check("static bundle js", s == 200 and not js.lstrip().startswith(b"<!"), f"status={s}")
+check("static bundle css", bool(_m_css), "index.html 未引用 /assets/index-*.css")
+if _m_css:
+    s, css, _ = req("GET", _m_css.group(1).decode(), raw=True)
+    check("static bundle css content", s == 200 and b"--ra-accent" in css, f"status={s}")
 
 # ============ 2. REST ============
 s, st, _ = req("GET", "/api/status")
@@ -97,8 +102,8 @@ s, tree2, _ = req("GET", "/api/workspace/tree?path=research_assistant&depth=1")
 check("workspace subtree", s == 200 and any(i["name"] == "web" for i in tree2.get("items", [])))
 s, f1, _ = req("GET", "/api/workspace/file?path=README.md")
 check("workspace text preview", s == 200 and f1.get("kind") == "text" and "Research Assistant" in f1.get("content", ""))
-s, f2, h2 = req("GET", "/api/workspace/file?path=research_assistant/web/static/fonts/jetbrains-mono-latin-400-normal.woff2", raw=True)
-check("workspace binary attachment", s == 200 and f2[:4] == b"wOF2",
+s, f2, h2 = req("GET", "/api/workspace/file?path=packaging/app_icon.ico", raw=True)
+check("workspace binary attachment", s == 200 and f2[:4] == b"\x00\x00\x01\x00",
       f"status={s} ct={getattr(h2, 'get', lambda *_: '')('Content-Type')}")
 s, _, _ = req("GET", "/api/workspace/file?path=..%2F..%2F.env")
 check("fence blocks traversal", s == 403, f"status={s}")

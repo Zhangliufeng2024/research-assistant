@@ -1,0 +1,187 @@
+/* ============================================================
+   研究助手 · 设计系统基座（R7 / Claude 式现代风）
+   暖中性底 + 赤陶强调色；浅/深双主题经 .dark 类切换。
+   令牌命名 --ra-* 为运行时变量；@theme inline 映射为工具类。
+   ============================================================ */
+@import "tailwindcss";
+
+@custom-variant dark (&:where(.dark, .dark *));
+
+:root {
+  --ra-rail: #f2f0e9;        /* 侧栏底 */
+  --ra-canvas: #faf9f5;      /* 主区底（暖象牙） */
+  --ra-surface: #ffffff;     /* 卡片 */
+  --ra-surface-2: #f4f2ea;   /* 次级填充/悬停 */
+  --ra-border: #e7e3d8;
+  --ra-ink: #1f1e1d;
+  --ra-ink-2: #605e54;
+  --ra-ink-3: #98958a;
+  --ra-accent: #d97757;      /* 赤陶 */
+  --ra-accent-hover: #c25f3c;
+  --ra-accent-tint: #f6e7dd; /* 强调色浅底 */
+  --ra-ok: #52845c;
+  --ra-warn: #b07c22;
+  --ra-danger: #c94f42;
+  --ra-shadow-card: 0 1px 2px rgb(31 30 29 / 0.05), 0 4px 16px rgb(31 30 29 / 0.06);
+  color-scheme: light;
+}
+
+.dark {
+  --ra-rail: #20201e;
+  --ra-canvas: #292927;
+  --ra-surface: #333230;
+  --ra-surface-2: #3c3b37;
+  --ra-border: #413f39;
+  --ra-ink: #ecebe3;
+  --ra-ink-2: #b3b1a5;
+  --ra-ink-3: #7f7d72;
+  --ra-accent: #d97757;
+  --ra-accent-hover: #e28a66;
+  --ra-accent-tint: #46352c;
+  --ra-ok: #85b590;
+  --ra-warn: #d3a04a;
+  --ra-danger: #e07a6d;
+  --ra-shadow-card: 0 1px 2px rgb(0 0 0 / 0.25), 0 4px 16px rgb(0 0 0 / 0.22);
+  color-scheme: dark;
+}
+
+@theme inline {
+  --color-rail: var(--ra-rail);
+  --color-canvas: var(--ra-canvas);
+  --color-surface: var(--ra-surface);
+  --color-surface-2: var(--ra-surface-2);
+  --color-edge: var(--ra-border);
+  --color-ink: var(--ra-ink);
+  --color-ink-2: var(--ra-ink-2);
+  --color-ink-3: var(--ra-ink-3);
+  --color-accent: var(--ra-accent);
+  --color-accent-hover: var(--ra-accent-hover);
+  --color-accent-tint: var(--ra-accent-tint);
+  --color-ok: var(--ra-ok);
+  --color-warn: var(--ra-warn);
+  --color-danger: var(--ra-danger);
+
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, Consolas, "Cascadia Mono",
+    monospace;
+
+  --shadow-card: var(--ra-shadow-card);
+}
+
+@layer base {
+  html,
+  body,
+  #root {
+    height: 100%;
+  }
+
+  body {
+    @apply bg-canvas font-sans text-ink antialiased;
+    text-rendering: optimizeLegibility;
+  }
+
+  ::selection {
+    background-color: color-mix(in srgb, var(--ra-accent) 28%, transparent);
+  }
+
+  /* 细滚动条（Chromium / WebView2） */
+  *::-webkit-scrollbar {
+    width: 8px;
+    height: 8px;
+  }
+  *::-webkit-scrollbar-thumb {
+    background: color-mix(in srgb, var(--ra-ink-3) 45%, transparent);
+    border-radius: 9999px;
+  }
+  *::-webkit-scrollbar-thumb:hover {
+    background: color-mix(in srgb, var(--ra-ink-3) 70%, transparent);
+  }
+  *::-webkit-scrollbar-track,
+  *::-webkit-scrollbar-corner {
+    background: transparent;
+  }
+
+  :focus-visible {
+    outline: 2px solid color-mix(in srgb, var(--ra-accent) 70%, transparent);
+    outline-offset: 2px;
+  }
+}
+
+/* ---------- Markdown 正文（会话气泡 / 文档预览共用） ---------- */
+.prose-ra {
+  @apply text-[15px] leading-7 text-ink;
+}
+.prose-ra > * + * {
+  margin-top: 0.9em;
+}
+.prose-ra h1,
+.prose-ra h2,
+.prose-ra h3,
+.prose-ra h4 {
+  @apply font-semibold tracking-tight text-ink;
+  margin-top: 1.5em;
+}
+.prose-ra h1 { @apply text-xl; }
+.prose-ra h2 { @apply text-lg; }
+.prose-ra h3 { @apply text-base; }
+.prose-ra p { @apply whitespace-pre-wrap; }
+.prose-ra a {
+  @apply text-accent underline decoration-accent/40 underline-offset-2 hover:decoration-accent;
+}
+.prose-ra ul { @apply list-disc pl-6; }
+.prose-ra ol { @apply list-decimal pl-6; }
+.prose-ra li + li { margin-top: 0.3em; }
+.prose-ra blockquote {
+  @apply border-l-2 border-edge pl-4 text-ink-2;
+}
+.prose-ra hr { @apply my-6 border-edge; }
+.prose-ra table {
+  @apply w-full border-collapse text-sm;
+}
+.prose-ra th {
+  @apply border-b border-edge px-3 py-2 text-left font-semibold text-ink-2;
+}
+.prose-ra td {
+  @apply border-b border-edge/60 px-3 py-2 align-top;
+}
+.prose-ra code:not(pre code) {
+  @apply rounded-md bg-surface-2 px-1.5 py-0.5 font-mono text-[13px] text-accent-hover dark:text-accent;
+}
+.prose-ra pre {
+  @apply overflow-x-auto rounded-xl bg-surface-2 p-4 font-mono text-[13px] leading-6;
+}
+.prose-ra pre code {
+  @apply bg-transparent p-0 text-inherit;
+}
+.prose-ra .katex-display {
+  @apply overflow-x-auto py-1;
+}
+
+/* ---------- 代码高亮（自绘双主题令牌，随 .dark 切换） ---------- */
+.hljs-comment,
+.hljs-quote { @apply text-ink-3 italic; }
+.hljs-keyword,
+.hljs-selector-tag,
+.hljs-literal,
+.hljs-section { @apply text-[#b3552f] dark:text-[#ef8a63]; }
+.hljs-string,
+.hljs-regexp,
+.hljs-addition { @apply text-[#58703f] dark:text-[#a3c48a]; }
+.hljs-number,
+.hljs-symbol,
+.hljs-bullet { @apply text-[#8a5bc0] dark:text-[#c9a3ec]; }
+.hljs-title,
+.hljs-name,
+.hljs-function .hljs-title,
+.hljs-function { @apply text-[#2f6fa3] dark:text-[#7fb3e3]; }
+.hljs-attr,
+.hljs-attribute,
+.hljs-variable,
+.hljs-template-variable { @apply text-[#8a6a1f] dark:text-[#dfba72]; }
+.hljs-type,
+.hljs-class .hljs-title { @apply text-[#0f7d7d] dark:text-[#6cc4c4]; }
+.hljs-meta,
+.hljs-deletion { @apply text-ink-2; }
+.hljs-emphasis { @apply italic; }
+.hljs-strong { @apply font-semibold; }

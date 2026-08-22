@@ -1,24 +1,234 @@
-"""桌面壳（R3）：pywebview 原生窗口包住本地 FastAPI。
+"""桌面壳（R3 建立骨架，R7 桌面化）：pywebview 原生窗口包住本地 FastAPI。
 
-零 node 依赖；Windows 一级支持（WebView2 运行时随 Win11 内置），
-macOS/Linux 尽力支持。工作区 = 一个文件夹：agent 的读写与产物都落在其中。
+目标形态（R7 D10-D12）——正式桌面应用：
+- **单窗口**：原生窗口即应用，不打开浏览器、不弹黑色控制台；
+- **无黑框**：PyInstaller 以 --noconsole 冻结，所有诊断写入文件日志；
+- **可诊断**：日志落在 `<工作区>/.ra/logs/desktop.log`，启动失败弹原生错误框；
+- **零依赖门槛**：Windows 启动前检测 WebView2 运行时，缺失时给出图形化指引。
 
 用法：
     research-assistant-desktop [工作区目录]
 
-- 不带目录参数时弹原生选夹对话框（tkinter，标准库）；
-- 无 GUI / 未安装 pywebview 时打印说明并以 CLI/Web 模式回退（D3 降级路径）；
-- 服务只绑定 127.0.0.1 随机端口，随窗口关闭而停止。
+- 不带目录参数时优先复用上次的工作区（记忆在 %APPDATA%/ResearchAssistant/desktop.json），
+  无记忆则弹原生选夹对话框（tkinter，标准库）；取消选择则安静退出；
+- 服务只绑定 127.0.0.1 随机端口，随窗口关闭而停止；
+- pip 环境下未装 pywebview 时给出说明并以非零码退出；冻结版同样走图形提示。
 """
 
 import argparse
+import json
+import logging
 import os
 import socket
 import sys
 import threading
 import time
+from logging.handlers import RotatingFileHandler
 from pathlib import Path
 
+APP_DATA_DIR = (
+    Path(os.environ.get("APPDATA") or (Path.home() / "AppData" / "Roaming"))
+    / "ResearchAssistant"
+)
+WORKSPACE_FILE = APP_DATA_DIR / "desktop.json"
+
+LOG = logging.getLogger("ra.desktop")
+
+
+# ---------------------------------------------------------------- 日志 ----
+
+def setup_logging(workspace: Path) -> Path:
+    """文件日志：<workspace>/.ra/logs/desktop.log（滚动 1MB × 3）。
+
+    --noconsole 冻结后没有可见控制台，这是唯一的诊断出口，必须尽早建立。
+    """
+    log_dir = workspace / ".ra" / "logs"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = log_dir / "desktop.log"
+
+    handler = RotatingFileHandler(
+        log_file, maxBytes=1_000_000, backupCount=3, encoding="utf-8")
+    handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s %(message)s"))
+    root = logging.getLogger()
+    root.setLevel(logging.INFO)
+    root.addHandler(handler)
+    LOG.info("=== Research Assistant desktop 启动 ===")
+    LOG.info("workspace=%s frozen=%s", workspace, bool(getattr(sys, "frozen", False)))
+    return log_file
+
+
+# ------------------------------------------------------------ GUI 提示框 ----
+
+def _tk_root():
+    import tkinter as tk
+
+    root = tk.Tk()
+    root.withdraw()
+    root.attributes("-topmost", True)
+    return root
+
+
+def gui_error(title: str, msg: str) -> None:
+    """原生错误对话框；tkinter 不可用时退化为仅写日志。"""
+    LOG.error("GUI error: %s | %s", title, msg.replace("\n", " ⏎ "))
+    try:
+        from tkinter import messagebox
+
+        root = _tk_root()
+        messagebox.showerror(title, msg, parent=root)
+        root.destroy()
+    except Exception as e:  # pragma: no cover - 无显示环境
+        LOG.error("无法弹出错误框：%s", e)
+
+
+def gui_confirm(title: str, msg: str) -> bool:
+    """原生是/否对话框；不可用时视为否。"""
+    try:
+        from tkinter import messagebox
+
+        root = _tk_root()
+        ans = messagebox.askyesno(title, msg, parent=root)
+        root.destroy()
+        return ans
+    except Exception as e:  # pragma: no cover
+        LOG.error("无法弹出确认框：%s", e)
+        return False
+
+
+# --------------------------------------------------------- WebView2 检测 ----
+
+_WEBVIEW2_KEY = r"Software\Microsoft\EdgeUpdate\Clients\{F3017226-FE2A-4295-8BDF-00C3A9A7E4C5}"
+
+
+def webview2_runtime_missing() -> bool:
+    """检测 WebView2 Evergreen 运行时（仅 Windows 有意义）。
+
+    依次查：用户显式指定的 WEBVIEW2_BROWSER_EXECUTABLE_FOLDER → 注册表
+    HKLM/HKCU ×（WOW6432Node 与原生视图）。找不到固定 GUID 的 pv 值即视为缺失。
+    """
+    if sys.platform != "win32":
+        return False
+    if os.environ.get("WEBVIEW2_BROWSER_EXECUTABLE_FOLDER"):
+        return False
+
+    try:
+        import winreg
+
+        for hive in (winreg.HKEY_LOCAL_MACHINE, winreg.HKEY_CURRENT_USER):
+            for view in (winreg.KEY_WOW64_32KEY, winreg.KEY_WOW64_64KEY):
+                try:
+                    with winreg.OpenKey(hive, _WEBVIEW2_KEY, 0,
+                                        winreg.KEY_READ | view) as key:
+                        pv = winreg.QueryValueEx(key, "pv")[0]
+                    if pv and pv != "0.0.0.0":
+                        return False
+                except OSError:
+                    continue
+    except ImportError:  # 非 Windows（不会到这里）
+        return False
+    return True
+
+
+def guide_webview2_install() -> None:
+    """D12：运行时缺失时的图形化指引——说明 + 可选打开官方下载页。"""
+    LOG.warning("WebView2 运行时未检出")
+    opened = gui_confirm(
+        "研究助手 · 需要一次性的系统组件",
+        "运行桌面窗口需要 Microsoft WebView2 运行时。\n\n"
+        "Windows 11 通常已内置；你的系统似乎缺少该组件。\n"
+        "点击「是」将打开微软官网下载页（Evergreen 引导程序，约 2MB，\n"
+        "安装完成后重新启动本应用即可）。",
+    )
+    if opened:
+        import webbrowser
+
+        webbrowser.open("https://developer.microsoft.com/microsoft-edge/webview2/")
+
+
+# ----------------------------------------------------------- 工作区记忆 ----
+
+def load_last_workspace() -> str | None:
+    try:
+        data = json.loads(WORKSPACE_FILE.read_text(encoding="utf-8"))
+        p = data.get("last_workspace")
+        if p and Path(p).is_dir():
+            return p
+    except Exception:
+        pass
+    return None
+
+
+def remember_workspace(path: str) -> None:
+    try:
+        APP_DATA_DIR.mkdir(parents=True, exist_ok=True)
+        WORKSPACE_FILE.write_text(
+            json.dumps({"last_workspace": path}, ensure_ascii=False),
+            encoding="utf-8")
+    except Exception as e:
+        LOG.warning("无法记住工作区：%s", e)
+
+
+def pick_workspace(initial: str | None) -> str | None:
+    """原生选夹对话框；tkinter 不可用或用户取消返回 None。"""
+    try:
+        from tkinter import filedialog
+
+        root = _tk_root()
+        chosen = filedialog.askdirectory(
+            title="选择工作区文件夹（研究产物将保存在这里）",
+            initialdir=initial or os.getcwd())
+        root.destroy()
+        return chosen or None
+    except Exception as e:
+        LOG.error("文件夹选择器不可用：%s", e)
+        return None
+
+
+_LEGACY_CONFIG_KEYS = (
+    "LLM_API_KEY", "LLM_BASE_URL", "LLM_MODEL", "LLM_PROVIDER",
+    "IMAGE_API_KEY", "IMAGE_BASE_URL", "IMAGE_MODEL", "IMAGE_REVIEW_MODEL",
+    "PARALLEL_API_KEY", "SEMANTIC_SCHOLAR_API_KEY",
+)
+
+
+def migrate_legacy_config(workspace: Path) -> None:
+    """v3.2.0 → R7 升级兼容（一次性、单向）。
+
+    旧版桌面端把模型密钥存在 %APPDATA%/ResearchAssistant/config.json；
+    R7 起统一存工作区 .env（与设置页同一存储）。仅当工作区还没有
+    LLM_API_KEY 时才迁移，绝不覆盖用户已有配置。
+    """
+    env_file = workspace / ".env"
+    try:
+        if env_file.exists():
+            for raw in env_file.read_text(encoding="utf-8").splitlines():
+                line = raw.strip()
+                if line and not line.startswith("#") and "=" in line:
+                    k, _, v = line.partition("=")
+                    if k.strip() == "LLM_API_KEY" and v.strip():
+                        return  # 工作区已配置，不动
+
+        cfg_file = APP_DATA_DIR / "config.json"
+        if not cfg_file.exists():
+            return
+        legacy = json.loads(cfg_file.read_text(encoding="utf-8"))
+        pairs = [(k, str(legacy[k]).strip()) for k in _LEGACY_CONFIG_KEYS
+                 if legacy.get(k)]
+        if not any(k.startswith("LLM_") for k, _ in pairs):
+            return
+
+        with open(env_file, "a", encoding="utf-8") as f:
+            if env_file.exists() and env_file.stat().st_size > 0:
+                f.write("\n")
+            f.write("# 迁移自 v3.2.0 桌面配置（%APPDATA%/ResearchAssistant/config.json）\n")
+            for k, v in pairs:
+                f.write(f"{k}={v}\n")
+        LOG.info("已从旧版 config.json 迁移 %d 个配置键到工作区 .env", len(pairs))
+    except Exception as e:
+        LOG.warning("旧配置迁移跳过：%s", e)
+
+
+# ---------------------------------------------------------------- 主流程 ----
 
 def _free_port() -> int:
     with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
@@ -26,94 +236,107 @@ def _free_port() -> int:
         return s.getsockname()[1]
 
 
-def _pick_workspace(initial: str | None) -> str | None:
-    """原生选夹对话框；tkinter 不可用或用户取消返回 None。"""
-    try:
-        import tkinter as tk
-        from tkinter import filedialog
-
-        root = tk.Tk()
-        root.withdraw()
-        root.attributes("-topmost", True)
-        chosen = filedialog.askdirectory(
-            title="选择工作区文件夹", initialdir=initial or os.getcwd())
-        root.destroy()
-        return chosen or None
-    except Exception as e:  # 无显示环境等
-        print(f"[desktop] 文件夹选择器不可用（{e}），改用当前目录。", file=sys.stderr)
-        return None
+def bundle_root() -> Path:
+    """冻结版返回解包目录（含打包进来的 .claude 技能），开发态返回仓库根。"""
+    if getattr(sys, "frozen", False):
+        return Path(sys._MEIPASS)  # type: ignore[attr-defined]
+    return Path(__file__).parent.parent
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(description="Research Assistant Desktop")
-    parser.add_argument("workspace", nargs="?", help="工作区目录（缺省弹选夹）")
+    parser.add_argument("workspace", nargs="?", help="工作区目录（缺省用上次记忆或弹选夹）")
     args = parser.parse_args()
 
-    workspace = args.workspace
-    if workspace:
-        workspace = str(Path(workspace).expanduser().resolve())
+    # ---- 解析工作区（此阶段尚无文件日志，出错只能靠弹框）----
+    workspace: str | None = None
+    if args.workspace:
+        workspace = str(Path(args.workspace).expanduser().resolve())
         if not Path(workspace).is_dir():
-            print(f"[desktop] 目录不存在：{workspace}", file=sys.stderr)
+            gui_error("研究助手", f"目录不存在：\n{workspace}")
             return 2
     else:
-        workspace = _pick_workspace(os.getcwd())
-        if workspace is None and not sys.stdin.isatty():
-            return 2
+        workspace = load_last_workspace()
+
+    if workspace is None:
+        workspace = pick_workspace(os.getcwd())
         if not workspace:
-            workspace = os.getcwd()
+            return 0  # 用户取消，安静退出
     os.chdir(workspace)
+    workspace_path = Path(workspace).resolve()
+
+    # ---- 从这里起有日志了 ----
+    log_file = setup_logging(workspace_path)
+    remember_workspace(str(workspace_path))
 
     try:
+        (workspace_path / "writing_outputs").mkdir(exist_ok=True)
+        migrate_legacy_config(workspace_path)
+
+        # 同步内置技能到工作区（冻结包内 .claude → <workspace>/.claude，
+        # 与 create_app 的 lifespan 中 package_dir 同步互补：冻结时包目录不含根级 .claude）
+        from .core import setup_claude_skills
+
+        setup_claude_skills(bundle_root(), workspace_path)
+        LOG.info("技能同步完成")
+
         import webview  # pywebview
-    except ImportError:
-        print("[desktop] 未安装 pywebview，无法启动桌面窗口。\n"
-              "           安装：pip install 'research-assistant[desktop]'\n"
-              "           回退：research-assistant-web 直接使用浏览器模式。",
-              file=sys.stderr)
-        return 2
 
-    # ---- 后台起本地服务（随机端口，仅回环）----
-    import uvicorn
+        if webview2_runtime_missing():
+            guide_webview2_install()
+            return 3
 
-    from .web.app import create_app
+        # ---- 后台起本地服务（随机端口，仅回环）----
+        import uvicorn
 
-    port = _free_port()
-    server = uvicorn.Server(uvicorn.Config(
-        create_app(), host="127.0.0.1", port=port, log_level="warning"))
-    thread = threading.Thread(target=server.run, daemon=True)
-    thread.start()
+        from .web.app import create_app
 
-    deadline = time.time() + 15
-    while not server.started and time.time() < deadline:
-        if not thread.is_alive():
-            print("[desktop] 本地服务启动失败，详见上方日志。", file=sys.stderr)
+        port = _free_port()
+        server = uvicorn.Server(uvicorn.Config(
+            create_app(), host="127.0.0.1", port=port, log_level="warning"))
+        thread = threading.Thread(target=server.run, daemon=True)
+        thread.start()
+
+        deadline = time.time() + 15
+        while not server.started and time.time() < deadline:
+            if not thread.is_alive():
+                gui_error(
+                    "研究助手 · 启动失败",
+                    f"本地服务未能启动，请把日志发给开发者：\n{log_file}")
+                return 1
+            time.sleep(0.1)
+        if not server.started:
+            gui_error("研究助手 · 启动超时",
+                      f"本地服务 15 秒内未就绪，请查看日志：\n{log_file}")
             return 1
-        time.sleep(0.1)
-    if not server.started:
-        print("[desktop] 本地服务启动超时。", file=sys.stderr)
-        return 1
 
-    # ---- 主线程跑窗口（pywebview 要求主线程）----
-    webview.create_window(
-        "研究助手 · RA Console",
-        f"http://127.0.0.1:{port}",
-        width=1440, height=900, min_size=(1024, 640))
-    try:
-        webview.start()
-    except Exception as e:
-        print(f"[desktop] 窗口启动失败（{e}）。\n"
-              f"           回退：浏览器打开 http://127.0.0.1:{port}",
-              file=sys.stderr)
-        try:  # 窗口起不来时保底把服务拉到前台供浏览器访问
-            while thread.is_alive():
-                time.sleep(1)
-        except KeyboardInterrupt:
-            pass
+        LOG.info("服务就绪 http://127.0.0.1:%d，打开主窗口", port)
+
+        # ---- 主线程跑窗口（pywebview 要求主线程）----
+        webview.create_window(
+            "研究助手 · Research Assistant",
+            f"http://127.0.0.1:{port}",
+            width=1440, height=900, min_size=(1024, 640))
+        try:
+            webview.start()
+            LOG.info("主窗口关闭，退出")
+        except Exception as e:
+            LOG.exception("窗口启动失败")
+            gui_error(
+                "研究助手 · 无法创建窗口",
+                f"{e}\n\n请查看日志了解详情：\n{log_file}")
+            return 1
+        finally:
+            server.should_exit = True
+            thread.join(timeout=5)
+        return 0
+    except SystemExit:
+        raise
+    except Exception:
+        LOG.exception("未捕获异常")
+        gui_error("研究助手 · 发生错误",
+                  f"发生未预期的错误，请把日志发给开发者：\n{log_file}")
         return 1
-    finally:
-        server.should_exit = True
-        thread.join(timeout=5)
-    return 0
 
 
 if __name__ == "__main__":
