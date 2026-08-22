@@ -16,6 +16,7 @@ dependencies = [
 
 [project.optional-dependencies]
 web = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
+desktop = ["pywebview>=5.0"]
 
 # System Dependencies (must be installed separately):
 #
@@ -29,6 +30,7 @@ web = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
 [project.scripts]
 research-assistant = "research_assistant.cli:cli_main"
 research-assistant-web = "research_assistant.web:main"
+research-assistant-desktop = "research_assistant.desktop:main"
 
 [build-system]
 requires = ["hatchling"]
