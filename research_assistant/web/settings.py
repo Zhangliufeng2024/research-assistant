@@ -181,17 +181,31 @@ async def test_settings(payload: SettingsPayload, request: Request):
         model=model,
         provider=payload.llm_provider.strip() or None,
     )
+    # R9：带 on_chunk 探测 → 走 stream:true 分支，与会话真实路径对称。
+    # 旧实现测的是非流式——不少网关对流式表现不同（缓冲不出/挂起），
+    # 出现过「测试连接通过、会话却永久思考中」的错位。
+    chunks: list[str] = []
+
+    def _probe_chunk(delta: str) -> None:
+        if delta:
+            chunks.append(delta)
+
     try:
         resp = await asyncio.wait_for(
             client.chat([{"role": "user", "content": "请只回复两个字：正常"}],
-                        max_tokens=32),
+                        max_tokens=32, on_chunk=_probe_chunk),
             timeout=TEST_TIMEOUT_S,
         )
     except asyncio.TimeoutError:
-        return {"ok": False, "error": f"连接超时（{TEST_TIMEOUT_S}s）"}
+        return {
+            "ok": False,
+            "error": f"连接超时（{TEST_TIMEOUT_S}s）——端点不可达或流式无响应；"
+                    "请核对 Base URL 与网络连通性",
+        }
     except Exception as exc:  # 网络/鉴权/模型名错误等，原文透传给前端
         return {"ok": False, "error": str(exc)[:300]}
     finally:
         await client.close()
 
-    return {"ok": True, "model": model, "reply": (resp.content or "")[:60]}
+    reply = (resp.content or "") or "".join(chunks)
+    return {"ok": True, "model": model, "reply": reply[:60]}

@@ -12,6 +12,7 @@ import { create } from "zustand";
 import { api } from "@/lib/api";
 import {
   applyApprovalResponse,
+  applySendFailure,
   applyUserMessage,
   emptyChat,
   historyToItems,
@@ -80,6 +81,11 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     const running = get().chat.phase === "running";
     // 乐观上屏（与旧版一致：本地先归约，不等服务端回显）
     set((s) => ({ chat: applyUserMessage(s.chat, v) }));
+    // 连接失败兜底（R9）：乐观置位的 running 必须复位，否则界面永远「思考中」
+    const failOffline = () =>
+      set((s) => ({
+        chat: applySendFailure(s.chat, "无法建立与服务端的连接——请重启应用；若反复出现请把日志发给开发者"),
+      }));
 
     if (running) {
       if (!wsSend({ action: "steer", message: v.slice(0, MAX_STEER_LENGTH) }, "chat")) {
@@ -102,10 +108,12 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         await connectSocket(`session=${encodeURIComponent(sid)}`);
       } catch {
         set({ conn: "error" });
+        failOffline();
         return "offline";
       }
     }
     if (!wsSend({ action: "user", text: v.slice(0, MAX_USER_LENGTH) }, "chat")) {
+      failOffline();
       return "offline";
     }
     return "ok";

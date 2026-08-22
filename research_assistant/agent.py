@@ -36,6 +36,8 @@ from .retry import (
     _is_context_limit,
     _is_model_error,
     _is_retryable,
+    get_attempt_wall_timeout,
+    get_first_byte_timeout,
     get_heartbeat_timeout,
     get_max_retries,
     get_retry_base_delay,
@@ -139,40 +141,107 @@ def _supports_on_activity(client: LLMClient) -> bool:
 
 
 class _ActivityWatchdog:
-    """Silence detector for one LLM call.
+    """Silence detector for one LLM call（R9 重构：两阶段 + 墙钟兜底）.
 
-    Any client ``on_activity`` beat resets the timer. Only when no beat
-    arrives for *timeout* seconds is the request cancelled and
-    :class:`HeartbeatTimeoutError` raised — a healthy long stream is never
-    killed just because it is long.
+    - **首字节阶段**（尚无任何 ``on_activity`` 心跳）：连接+TLS+请求排队期间
+      没有可续期的心跳，用 *first_byte_timeout* 短窗快失败——旧实现要等满
+      静默窗口（300s）才报错，用户面对永久「思考中」；
+    - **静默阶段**（已有心跳）：连续 *timeout* 秒无心跳才判死——健康长流不误杀；
+    - **墙钟兜底**：单次调用总时长超 *wall_timeout* 即终止。防住「网关每
+      <300s 滴一行 keepalive 无限续期」的唯一真·无限挂起路径。
     """
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(
+        self,
+        timeout: float,
+        first_byte_timeout: float | None = None,
+        wall_timeout: float | None = None,
+    ) -> None:
         self.timeout = timeout
+        self.first_byte_timeout = (
+            first_byte_timeout if first_byte_timeout is not None else timeout
+        )
+        self.wall_timeout = wall_timeout  # None = 不限（保持旧行为）
         self._activity = asyncio.Event()
 
     def beat(self) -> None:
         self._activity.set()
 
+    @staticmethod
+    async def _swallow(task: "asyncio.Task[Any]") -> None:
+        task.cancel()
+        try:
+            await task
+        except BaseException:
+            pass
+
     async def call(self, coro_factory: Callable[[], Any]) -> LLMResponse:
         task = asyncio.create_task(coro_factory())
+        started = time.time()
+        ever_beaten = False
         try:
             while True:
+                window = self.timeout if ever_beaten else self.first_byte_timeout
                 try:
-                    return await asyncio.wait_for(asyncio.shield(task), timeout=self.timeout)
+                    return await asyncio.wait_for(asyncio.shield(task), timeout=window)
                 except asyncio.TimeoutError:
                     if self._activity.is_set():
                         self._activity.clear()
+                        ever_beaten = True
+                        # 心跳在续期也要服从墙钟：keepalive 滴流不能无限续命
+                        if (
+                            self.wall_timeout is not None
+                            and time.time() - started >= self.wall_timeout
+                        ):
+                            await self._swallow(task)
+                            raise HeartbeatTimeoutError(
+                                self.wall_timeout, phase="总时长"
+                            ) from None
                         continue
-                    task.cancel()
-                    try:
-                        await task
-                    except (asyncio.CancelledError, Exception):
-                        pass
-                    raise HeartbeatTimeoutError(self.timeout) from None
+                    await self._swallow(task)
+                    raise HeartbeatTimeoutError(
+                        window,
+                        phase="" if ever_beaten else "首字节",
+                    ) from None
+                except asyncio.CancelledError:
+                    # 外部（停止/断连）取消：连带杀掉内层请求后原样上抛
+                    if not task.done():
+                        await self._swallow(task)
+                    raise
         finally:
             if not task.done():
                 task.cancel()
+
+
+class _TurnCancelled(Exception):
+    """用户停止 / 连接断开打断在途 LLM 调用（run_agent 转为 cancelled 停止）。"""
+
+
+async def _cancelable(coro: Any, cancel_event: asyncio.Event | None) -> LLMResponse:
+    """让一次完整 LLM 调用（含重试退避）可被 cancel_event 立即打断。
+
+    旧实现里 cancel_event 只在轮次/工具边界检查——若进程阻塞在流读取或重试
+    sleep 中，点「停止」毫无作用（R9 反馈的体感即「只能干等」）。这里把
+    等待与 cancel_event.wait() 做成赛跑，先到者赢；被取消路径连内层 httpx
+    流一起终止（watchdog 的 finally 会收尾内层任务）。
+    """
+    if cancel_event is None:
+        return await coro
+    runner = asyncio.ensure_future(coro)
+    waiter = asyncio.ensure_future(cancel_event.wait())
+    try:
+        done, _ = await asyncio.wait({runner, waiter}, return_when=asyncio.FIRST_COMPLETED)
+        if runner in done:
+            return runner.result()
+        raise _TurnCancelled()
+    finally:
+        waiter.cancel()
+        if not runner.done():
+            runner.cancel()
+            try:
+                await runner
+            except BaseException:
+                pass
 
 
 async def run_agent(
@@ -358,24 +427,35 @@ async def run_agent(
             })
             _slog("invariant_warning", expected=expected_len, actual=len(messages))
 
-        watchdog = _ActivityWatchdog(heartbeat_timeout)
+        watchdog = _ActivityWatchdog(
+            heartbeat_timeout,
+            # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
+            first_byte_timeout=min(heartbeat_timeout, get_first_byte_timeout()),
+            wall_timeout=get_attempt_wall_timeout(),
+        )
 
         async def _do_call(watchdog=watchdog, messages=messages) -> LLMResponse:
             kwargs: dict[str, Any] = {}
             if use_activity:
                 kwargs["on_activity"] = watchdog.beat
+            # watchdog 传入重试循环内部：监督每次尝试（R9，见函数 docstring）
             return await _llm_call_with_retry(
                 llm_client, messages, system_prompt, tool_schemas,
                 cfg.temperature, cfg.max_tokens, heartbeat_timeout,
                 max_retries, base_delay,
                 on_chunk=on_text if streaming else None,
                 extra_kwargs=kwargs,
+                watchdog=watchdog,
             )
 
         await _emit(EventKind.LLM_REQUEST, turn=turn + 1,
                     payload={"messages": len(messages)})
         try:
-            response = await watchdog.call(_do_call)
+            # _cancelable：停止/断连可立即打断在途调用（含尝试间退避期）
+            response = await _cancelable(_do_call(), cfg.cancel_event)
+        except _TurnCancelled:
+            stop_reason = "cancelled"
+            break
         except BudgetExceededError:
             raise
         except Exception as exc:
@@ -598,22 +678,33 @@ async def _llm_call_with_retry(
     base_delay: float,
     on_chunk: OnChunkCallback | None = None,
     extra_kwargs: dict | None = None,
+    watchdog: "_ActivityWatchdog | None" = None,
 ) -> LLMResponse:
-    """Call the LLM with retry on transient errors and a silence watchdog."""
+    """Call the LLM with retry on transient errors and a silence watchdog.
+
+    R9：*watchdog* 监督**每次尝试**（而非整个重试循环）——否则心跳超时异常
+    会从循环外一击穿、绕过全部重试（retryable 形同虚设）。每次尝试都获得
+    完整的首字节窗口 / 静默窗口与墙钟。
+    """
     last_exc: BaseException | None = None
     extra_kwargs = extra_kwargs or {}
 
+    def _one_attempt() -> Any:
+        return client.chat(
+            messages,
+            system=system,
+            tools=tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            on_chunk=on_chunk,
+            **extra_kwargs,
+        )
+
     for attempt in range(max_retries + 1):
         try:
-            return await client.chat(
-                messages,
-                system=system,
-                tools=tools,
-                temperature=temperature,
-                max_tokens=max_tokens,
-                on_chunk=on_chunk,
-                **extra_kwargs,
-            )
+            if watchdog is not None:
+                return await watchdog.call(_one_attempt)
+            return await _one_attempt()
         except Exception as exc:
             last_exc = exc
 

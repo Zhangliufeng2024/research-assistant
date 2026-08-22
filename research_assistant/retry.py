@@ -26,6 +26,8 @@ import os
 
 from .constants import (
     DEFAULT_HEARTBEAT_TIMEOUT,
+    DEFAULT_LLM_ATTEMPT_WALL_TIMEOUT,
+    DEFAULT_LLM_FIRST_BYTE_TIMEOUT,
     DEFAULT_MAX_RETRIES,
     DEFAULT_RETRY_BASE_DELAY,
 )
@@ -67,6 +69,18 @@ def get_retry_base_delay() -> float:
 
 def get_heartbeat_timeout() -> float:
     return _safe_float(os.getenv("RA_HEARTBEAT_TIMEOUT"), DEFAULT_HEARTBEAT_TIMEOUT)
+
+
+def get_first_byte_timeout() -> float:
+    """流式首字节前的静默窗口（R9）：此阶段没有任何心跳可续期，短超时快失败。"""
+    return _safe_float(os.getenv("RA_LLM_FIRST_BYTE_TIMEOUT"), DEFAULT_LLM_FIRST_BYTE_TIMEOUT)
+
+
+def get_attempt_wall_timeout() -> float:
+    """单次 LLM 调用的墙钟上限（R9）：防 keepalive 滴流把静默看门狗无限续期。"""
+    return _safe_float(
+        os.getenv("RA_LLM_ATTEMPT_WALL_TIMEOUT"), DEFAULT_LLM_ATTEMPT_WALL_TIMEOUT
+    )
 
 
 # ---------------------------------------------------------------------------

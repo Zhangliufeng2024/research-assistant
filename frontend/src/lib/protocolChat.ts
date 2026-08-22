@@ -69,6 +69,19 @@ export function applyApprovalResponse(prev: ChatState): ChatState {
   return c;
 }
 
+/** 发送失败兜底（R9）：乐观置位的 running 必须有人复位。
+ * applyUserMessage 在连接建立前就把 phase 置为 running——若随后 WS 连不上，
+ * 旧逻辑只弹 toast，状态永远停在「思考中」（用户看到的褐色原点死转）。
+ * 这里把 running 显式落到 error，让红点与错误横幅如实呈现。 */
+export function applySendFailure(prev: ChatState, message: string): ChatState {
+  if (prev.phase !== "running") return prev;
+  const c = clone(prev);
+  c.phase = "error";
+  c.error = message;
+  c.finishedAt = Date.now();
+  return c;
+}
+
 /* ---- 服务端消息归约 ---- */
 
 /** 文本增量：接续最后一个 text 气泡；被工具卡/用户消息打断后另起新气泡。 */

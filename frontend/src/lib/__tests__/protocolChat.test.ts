@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import {
   APPROVAL_TIMEOUT_S,
   applyApprovalResponse,
+  applySendFailure,
   applyUserMessage,
   emptyChat,
   historyToItems,
@@ -146,5 +147,22 @@ describe("historyToItems", () => {
       { kind: "user", text: "q", t: 0 },
       { kind: "text", text: "a", t: 0 },
     ]);
+  });
+});
+
+describe("applySendFailure（R9 发送失败兜底）", () => {
+  it("running 落到 error 并带原因，不再停留「思考中」", () => {
+    const s1 = reduceChat(emptyChat(), { type: "connected", session_id: "s1" });
+    const running = applyUserMessage(s1, "你好");
+    expect(running.phase).toBe("running");
+    const failed = applySendFailure(running, "无法建立与服务端的连接");
+    expect(failed.phase).toBe("error");
+    expect(failed.error).toContain("无法建立");
+    expect(failed.finishedAt).not.toBeNull();
+  });
+
+  it("非 running 状态原样返回（幂等）", () => {
+    const idle = emptyChat();
+    expect(applySendFailure(idle, "x")).toBe(idle);
   });
 });

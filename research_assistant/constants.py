@@ -8,7 +8,9 @@ scattering them across the codebase.
 # HTTP / LLM
 # ---------------------------------------------------------------------------
 HTTP_TIMEOUT_SECONDS: float = 300.0
-HTTP_CONNECT_TIMEOUT_SECONDS: float = 30.0
+# 连接建立 15s 足够：被墙/填错端点应快失败（R9 前是 30s，叠加重试退避用户要
+# 干等两分多钟才见到错误帧——表现为永久「思考中」）。
+HTTP_CONNECT_TIMEOUT_SECONDS: float = 15.0
 DEFAULT_LLM_REQUEST_INTERVAL: float = 2.0
 DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
 DEFAULT_OPENAI_MODEL: str = "gpt-4o"
@@ -29,6 +31,11 @@ TASK_COMPLETE_MARKER: str = "[TASK_COMPLETE]"
 DEFAULT_MAX_RETRIES: int = 3
 DEFAULT_RETRY_BASE_DELAY: float = 5.0
 DEFAULT_HEARTBEAT_TIMEOUT: float = 300.0
+# R9 反馈「永久思考中」治理：流式首字节前的静默窗口（连接+TLS+排队期没有任何
+# on_activity 心跳）单独用短超时快失败；整个 attempt 再加墙钟上限，防住
+# 「网关每 <300s 滴一行 keepalive 无限续期」的唯一真·无限挂起路径。
+DEFAULT_LLM_FIRST_BYTE_TIMEOUT: float = 60.0   # env RA_LLM_FIRST_BYTE_TIMEOUT
+DEFAULT_LLM_ATTEMPT_WALL_TIMEOUT: float = 1800.0  # env RA_LLM_ATTEMPT_WALL_TIMEOUT
 
 # ---------------------------------------------------------------------------
 # Tool output limits

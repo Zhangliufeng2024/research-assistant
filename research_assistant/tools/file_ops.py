@@ -1,5 +1,6 @@
 """File operation tools: read, write, edit, glob, grep."""
 
+import asyncio
 import re
 from pathlib import Path
 
@@ -136,7 +137,10 @@ async def glob_files(pattern: str, path: str = ".") -> str:
     if not base.exists():
         return f"Error: Directory does not exist: {path}"
 
-    matches = sorted(base.glob(pattern))
+    # 目录遍历可能很重（海量文件/OneDrive 按需文件）：放线程池，
+    # 避免在 async def 里同步 rglob 卡死事件循环——那会让所有 WS/REST
+    # 一起失联（R9 任务页「无法建立连接」的候选共因）。
+    matches = await asyncio.to_thread(lambda: sorted(base.glob(pattern)))
     if not matches:
         return f"No files matching '{pattern}' in {path}"
 
@@ -147,27 +151,10 @@ async def glob_files(pattern: str, path: str = ".") -> str:
     return result
 
 
-async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
-    """Search for a regex pattern in files."""
-    base = Path(path)
-    if not base.exists():
-        return f"Error: Path does not exist: {path}"
-
-    try:
-        regex = re.compile(pattern)
-    except re.error as e:
-        return f"Error: Invalid regex pattern: {e}"
-
-    results = []
-
-    if base.is_file():
-        files = [base]
-    else:
-        if glob:
-            files = sorted(base.rglob(glob))
-        else:
-            files = sorted(base.rglob("*"))
-
+def _grep_scan(
+    regex: re.Pattern, files: list[Path], results: list[str]
+) -> None:
+    """同步扫描实现（在线程池中执行）：逐文件读入并按行匹配。"""
     for fp in files:
         if not fp.is_file():
             continue
@@ -181,9 +168,32 @@ async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
             if regex.search(line):
                 results.append(f"{fp}:{i}: {line.rstrip()}")
                 if len(results) >= GREP_MAX_RESULTS:
-                    break
+                    return
         if len(results) >= GREP_MAX_RESULTS:
-            break
+            return
+
+
+async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
+    """Search for a regex pattern in files."""
+    base = Path(path)
+    if not base.exists():
+        return f"Error: Path does not exist: {path}"
+
+    try:
+        regex = re.compile(pattern)
+    except re.error as e:
+        return f"Error: Invalid regex pattern: {e}"
+
+    if base.is_file():
+        files: list[Path] = [base]
+    else:
+        if glob:
+            files = await asyncio.to_thread(lambda: sorted(base.rglob(glob)))
+        else:
+            files = await asyncio.to_thread(lambda: sorted(base.rglob("*")))
+
+    results: list[str] = []
+    await asyncio.to_thread(_grep_scan, regex, files, results)
 
     if not results:
         return f"No matches for pattern '{pattern}'"

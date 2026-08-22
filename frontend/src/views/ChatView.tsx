@@ -4,6 +4,7 @@ import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
 import { sessionTitle } from "@/lib/format";
+import { shouldShowWaitHint } from "@/lib/waitHint";
 import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
@@ -44,6 +45,21 @@ export function ChatView() {
   const [toast, setToast] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+
+  // 等待看门狗（R9）：运行中若长时间没有任何可见输出（文本增量/工具卡），
+  // 给出渐进提示——端点不可达时服务端要经历 超时×重试 才报错，不能让用户
+  // 对着永久「思考中」干等。items 引用变化即视为有活动。
+  const [nowTick, setNowTick] = useState(() => Date.now());
+  const lastActivityAt = useRef(Date.now());
+  useEffect(() => {
+    if (chat.phase === "running") lastActivityAt.current = Date.now();
+  }, [chat.items]);
+  useEffect(() => {
+    if (chat.phase !== "running") return;
+    const t = setInterval(() => setNowTick(Date.now()), 1000);
+    return () => clearInterval(t);
+  }, [chat.phase]);
+  const silentSeconds = chat.phase === "running" ? Math.floor((nowTick - lastActivityAt.current) / 1000) : 0;
 
   useEffect(() => {
     document.title = "研究助手 · 会话";
@@ -148,7 +164,7 @@ export function ChatView() {
         </div>
 
         {/* 横幅区 */}
-        {(configured === false || connBanner || chat.error) && (
+        {(configured === false || connBanner || chat.error || shouldShowWaitHint(chat.phase, silentSeconds)) && (
           <div className="shrink-0 space-y-px">
             {configured === false && (
               <Link
@@ -166,6 +182,13 @@ export function ChatView() {
             {connBanner && (
               <div className="bg-danger/10 px-5 py-2 text-center text-[12.5px] text-danger">
                 {connBanner}
+              </div>
+            )}
+            {shouldShowWaitHint(chat.phase, silentSeconds) && (
+              <div className="bg-warn/10 px-5 py-2 text-center text-[12.5px] text-warn">
+                已等待 {silentSeconds} 秒未见模型输出——首次响应慢或网络较慢时会这样；
+                若持续停滞，多为网络无法直连模型端点，可到「设置 → 测试连接」验证，
+                或点右上角「停止」。
               </div>
             )}
           </div>

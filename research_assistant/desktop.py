@@ -298,6 +298,11 @@ def main() -> int:
     # 靠这行走入 multiprocessing bootstrap 而非重启桌面应用）；常规启动是 no-op。
     multiprocessing.freeze_support()
 
+    # WebView2 只访问本地回环服务，页面资源全在本地——系统代理对它毫无用处，
+    # 反而在某些 PAC/企业代理配置下拦截回环 WebSocket（R9 用户环境排查项）。
+    # 加载器原生支持该环境变量，等价于给浏览器加 --no-proxy-server。
+    os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--no-proxy-server")
+
     parser = argparse.ArgumentParser(description="Research Assistant Desktop")
     parser.add_argument("workspace", nargs="?", help="工作区目录（缺省用上次记忆或默认目录）")
     args = parser.parse_args()

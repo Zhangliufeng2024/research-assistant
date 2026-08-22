@@ -114,10 +114,13 @@ class HeartbeatTimeoutError(LLMError):
 
     retryable = True
 
-    def __init__(self, timeout: float) -> None:
+    def __init__(self, timeout: float, phase: str = "") -> None:
         self.timeout = timeout
+        # phase 说明卡在哪个阶段（R9）：「首字节」= 端点接受连接但迟迟不响应，
+        # 「静默」= 流开始后中断；「总时长」= keepalive 滴流无限续期的兜底。
+        label = f"{phase}（{timeout:.0f} 秒）" if phase else f"{timeout:.0f} 秒"
         super().__init__(
-            f"No output received from the LLM for {timeout:.0f} seconds. "
+            f"No output received from the LLM for {label}. "
             "The stream may be stuck."
         )
 

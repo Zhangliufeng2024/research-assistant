@@ -30,8 +30,10 @@ from __future__ import annotations
 import asyncio
 import itertools
 import json
+import logging
 import re
 import shutil
+import time
 import uuid
 from collections import deque
 from datetime import datetime
@@ -51,6 +53,10 @@ from ..session.store import SessionStore
 from ..tools.registry import ToolRegistry
 
 router = APIRouter()
+
+#: WS 生命周期诊断日志（R9）：桌面版唯一可观测出口是 <workspace>/.ra/logs/
+#: desktop.log——连接、回合起止与错误帧在此留痕，远端机器的问题不再靠猜。
+LOG = logging.getLogger("ra.web.chat")
 
 #: 会话根目录（相对工作区根）。
 SESSIONS_SUBDIR = Path(".ra") / "sessions"
@@ -420,6 +426,34 @@ def _jsonable_arguments(args: dict | None) -> dict:
         return {"repr": repr(args)[:400]}
 
 
+#: 网络类错误附带的可行动指引（R9：端点不可达曾表现为永久「思考中」，
+#: 错误帧必须告诉用户下一步做什么，而不是一句裸异常文本）。
+_NETWORK_HINT = (
+    "——无法连接模型端点。请检查：① Base URL 是否正确（设置页「测试连接」可验证）；"
+    "② 本机网络能否直连该端点——境内服务请确认代理已关闭，"
+    "境外服务需网络可达或设置 HTTPS_PROXY 环境变量后重启应用。"
+)
+
+
+def _is_network_error(exc: BaseException) -> bool:
+    """连接失败/超时类错误的宽松识别（用于追加用户指引，不影响重试逻辑）。"""
+    name = type(exc).__name__.lower()
+    text = str(exc).lower()
+    name_keys = ("connect", "timeout", "ssl", "socket", "network")
+    text_keys = (
+        "connect",
+        "timed out",
+        "timeout",
+        "ssl",
+        "socket",
+        "network",
+        "unreachable",
+        "refused",
+        "reset by peer",
+    )
+    return any(k in name for k in name_keys) or any(k in text for k in text_keys)
+
+
 # ---------------------------------------------------------------------------
 # C2/C3/C4: WS /ws/chat — 会话循环
 # ---------------------------------------------------------------------------
@@ -578,6 +612,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         async def _run_turn(text: str) -> None:
             """一轮完整对话：载入历史 → 追加用户消息 → run_agent → 写回。"""
             nonlocal llm_client
+            turn_t0 = time.monotonic()
             cancel_event.clear()  # 新回合重置上一轮遗留的停止信号
             # ---- 每轮实时构建客户端：设置页保存 / 工作区切换即刻生效 -------
             model_now = resolve_model(None)
@@ -586,6 +621,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 fresh_client = _HistoryClient(build_llm_client(model=model_now))
             except ValueError as exc:  # 未配置 Key 等 → 错误帧收场，不踢连接
                 store.finish("failed", budget.snapshot())
+                LOG.warning("回合配置缺失 sid=%s：%s", sid, exc)
                 await _send({"type": "error", "message": str(exc)})
                 return
             if llm_client is not None:  # 释放上一轮客户端，防连接句柄泄漏
@@ -600,6 +636,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             _write_history(run_dir, messages)  # 用户消息先落盘（崩溃可恢复）
             store.save()  # 刷新 run.json updated_at
             store.log_event("turn_start", {"chars": len(text)})
+            LOG.info("回合开始 sid=%s 字数=%d 模型=%s", sid, len(text), model_now)
             llm_client.set_prefix(messages[:-1])  # 注入既往对话（适配层）
 
             async def _invoke():
@@ -638,7 +675,10 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 return
             except Exception as exc:
                 store.finish("failed", budget.snapshot())
-                await _send({"type": "error", "message": str(exc)})
+                message = str(exc) + (_NETWORK_HINT if _is_network_error(exc) else "")
+                LOG.warning("回合失败 sid=%s 用时=%.1fs：%s",
+                            sid, time.monotonic() - turn_t0, str(exc)[:300])
+                await _send({"type": "error", "message": message})
                 return
 
             reply = (agent_result.text_output or "").strip()
@@ -647,6 +687,8 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 _write_history(run_dir, messages)
             # stop 动作/断连取消时内核正常返回，stop_reason=cancelled —— 状态如实落盘
             final_status = "cancelled" if agent_result.stop_reason == "cancelled" else "complete"
+            LOG.info("回合结束 sid=%s 状态=%s 用时=%.1fs 轮次=%s",
+                     sid, final_status, time.monotonic() - turn_t0, agent_result.turns)
             store.finish(final_status, budget.snapshot())
             await _send(
                 {
@@ -698,6 +740,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 cancel_event.set()
                 approvals.put_nowait(None)
 
+        LOG.info("会话连接建立 sid=%s", sid)
         await _send({"type": "connected", "session_id": sid})
 
         # ---- 主循环：空闲期直接接收，user 动作触发一轮 ---------------------
@@ -732,8 +775,10 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
 
     except WebSocketDisconnect:
         # 客户端离开 —— 确保底层运行停止消耗 token（与 ws.py 同构）
+        LOG.info("会话连接断开 sid=%s", sid)
         cancel_event.set()
     except Exception as exc:
+        LOG.warning("会话连接异常 sid=%s：%s", sid, str(exc)[:300])
         await _send({"type": "error", "message": str(exc)})
     finally:
         if sid:
