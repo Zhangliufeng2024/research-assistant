@@ -101,6 +101,7 @@ async def _run_stage_agent(
     max_continuations: int = 10,
     approver: Any | None = None,
     session_log: Any | None = None,
+    steer_queue: asyncio.Queue | None = None,
 ) -> LoopResult:
     """One sub-agent run inside the pipeline, sharing budget/hooks/cancel."""
     llm_client = create_llm_client(
@@ -122,6 +123,7 @@ async def _run_stage_agent(
                 approver=approver,
                 session_log=session_log,
             ),
+            steer_queue=steer_queue,  # B4: 中途转向注入当前子代理
         )
     finally:
         await llm_client.close()
@@ -156,8 +158,16 @@ async def run_pipeline(
     budget_limits: BudgetLimits | None = None,
     approver: Any | None = None,
     max_revision_rounds: int = 3,
+    steer_queue: asyncio.Queue | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Execute the full generation pipeline, yielding progress updates."""
+    """Execute the full generation pipeline, yielding progress updates.
+
+    Args:
+        steer_queue: Optional queue with mid-run user steering messages (B4).
+            All sub-agents share it — whoever is running at the moment consumes
+            the message, mirroring the CLI steer channel semantics.
+    """
+    from ..api import usage_ticks  # lazy: api 与本模块互相延迟导入避免循环
     from ..constants import OUTPUT_SUBDIRS
 
     total_start = time.time()
@@ -181,20 +191,41 @@ async def run_pipeline(
         yield _t("Cancelled before start.")
         return
 
-    async def _agent(stage: str, prompt: str, system_prompt: str, **kw) -> LoopResult:
-        result = await _run_stage_agent(
-            stage, prompt, system_prompt,
+    def _stage_kwargs(**kw: Any) -> dict[str, Any]:
+        return dict(
             model=model, work_dir=work_dir,
             api_key=api_key, base_url=base_url, provider=provider,
             budget=budget, hooks=hooks, cancel_event=cancel_event,
-            approver=approver, session_log=session,  # SessionStore has .log()
+            approver=approver,
+            # B4: 并行研究/图表阶段共享同一转向队列——谁在运行谁消费。
+            steer_queue=steer_queue,
+            session_log=session,  # SessionStore has .log()
             **kw,
         )
+
+    async def _run_stage(
+        stage: str, prompt: str, system_prompt: str, **kw: Any,
+    ) -> LoopResult:
+        result = await _run_stage_agent(stage, prompt, system_prompt, **_stage_kwargs(**kw))
         session.log_event(f"stage_{stage}", {
             "stop_reason": result.stop_reason, "turns": result.turns,
             "tokens": result.token_usage.input_tokens + result.token_usage.output_tokens,
         })
         return result
+
+    async def _agent(
+        stage: str, prompt: str, system_prompt: str, out: list, **kw: Any,
+    ) -> AsyncGenerator[dict[str, Any], None]:
+        """Run one top-level stage, streaming budget usage frames meanwhile (B5).
+
+        The :class:`LoopResult` is appended to *out* — callers pass a fresh
+        one-element list and read ``out[0]`` after the loop (an async generator
+        cannot both yield frames and return the result cleanly).
+        """
+        task = asyncio.ensure_future(_run_stage(stage, prompt, system_prompt, **kw))
+        async for frame in usage_ticks(task, budget):
+            yield frame
+        out.append(task.result())
 
     # ------------------------------------------------------------------ PLAN
     plan: Any = None
@@ -206,11 +237,14 @@ async def run_pipeline(
     else:
         session.mark_stage("plan", "running")
         yield _p("[Phase 1] Planning paper structure...", "planning")
-        result = await _agent(
+        box: list[LoopResult] = []
+        async for frame in _agent(
             "plan", _PLANNER_PROMPT.format(query=query),
             "You are a planning agent. Output only valid JSON.",
-            auto_continue=False, max_continuations=5,
-        )
+            box, auto_continue=False, max_continuations=5,
+        ):
+            yield frame
+        result = box[0]
         if _cancelled():
             session.finish("cancelled", budget.snapshot())
             yield _t("Cancelled.")
@@ -265,7 +299,7 @@ async def run_pipeline(
         started = time.time()
         out_bib = sources_dir / f"bib_{safe}.bib"
         out_sum = sources_dir / f"summary_{safe}.md"
-        r = await _agent(
+        r = await _run_stage(
             f"research_{safe}",
             _RESEARCH_PROMPT.format(
                 section_title=s.title, paper_title=plan.paper_title,
@@ -291,7 +325,7 @@ async def run_pipeline(
             return (fg.name, True, "resumed", 0.0)
         started = time.time()
         out = figures_dir / safe
-        r = await _agent(
+        r = await _run_stage(
             f"figure_{fg.name}",
             _FIGURE_PROMPT.format(
                 paper_title=plan.paper_title, figure_name=fg.name,
@@ -309,7 +343,13 @@ async def run_pipeline(
 
     tasks = [_limited(_research_one(s)) for s in plan.sections]
     tasks += [_limited(_figure_one(fg)) for fg in plan.figures]
-    outcomes = await asyncio.gather(*tasks, return_exceptions=True)
+    # B5: gather 期间没有其他 yield 点，用 usage_ticks 周期推送预算快照。
+    gather_task = asyncio.ensure_future(
+        asyncio.gather(*tasks, return_exceptions=True),
+    )
+    async for frame in usage_ticks(gather_task, budget):
+        yield frame
+    outcomes = gather_task.result()
 
     partial = False
     labels = [f"research:{s.name}" for s in plan.sections] + \
@@ -344,7 +384,8 @@ async def run_pipeline(
                 parts.append(f"### {s.title}\nFile: {entry.path}\n{body}")
         return "\n\n".join(parts) or "(no summaries found)"
 
-    assemble_result = await _agent(
+    box = []
+    async for frame in _agent(
         "assemble",
         _ASSEMBLE_PROMPT.format(
             paper_title=plan.paper_title, paper_type=plan.paper_type,
@@ -361,8 +402,10 @@ async def run_pipeline(
         ),
         "Write a complete paper using PaperBuilder via run_python. "
         "Include all figures and references.",
-        max_continuations=12,
-    )
+        box, max_continuations=12,
+    ):
+        yield frame
+    assemble_result = box[0]
     if _cancelled():
         session.finish("cancelled", budget.snapshot())
         yield _t("Cancelled.")
@@ -427,7 +470,8 @@ async def run_pipeline(
         revision_round += 1
         yield _p(f"[Phase 3b] Quality gates failed — revision round "
                  f"{revision_round}/{max_revision_rounds}", "revision")
-        await _agent(
+        box = []
+        async for frame in _agent(
             f"revision_{revision_round}",
             _REVISION_PROMPT.format(
                 output_dir=output_dir, docx_file=docx_file, bib_file=bib_file,
@@ -435,8 +479,9 @@ async def run_pipeline(
                 n=revision_round, n_next=revision_round + 1,
             ),
             "Fix every quality-gate failure. Regenerate the document.",
-            max_continuations=10,
-        )
+            box, max_continuations=10,
+        ):
+            yield frame
         latest = output_dir / "drafts" / f"v{revision_round + 1}_draft.docx"
         if latest.exists():
             docx_file = latest
@@ -455,12 +500,14 @@ async def run_pipeline(
 
     if not _cancelled():
         try:
-            await _agent(
+            box = []
+            async for frame in _agent(
                 "review",
                 _REVIEW_PROMPT.format(output_dir=output_dir, docx_file=final_docx),
                 "Review the paper document and write PEER_REVIEW.md and SUMMARY.md.",
-                auto_continue=False, max_continuations=8,
-            )
+                box, auto_continue=False, max_continuations=8,
+            ):
+                yield frame
         except Exception as e:  # review is best-effort
             yield _t(f"  [Review] skipped: {e}")
 

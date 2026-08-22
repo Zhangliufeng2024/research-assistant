@@ -40,6 +40,44 @@ from .utils import (
     scan_paper_directory,
 )
 
+#: Interval in seconds between budget usage frames pushed to stream consumers.
+USAGE_TICK_INTERVAL = 1.0
+
+
+def usage_frame(snapshot: dict[str, Any]) -> dict[str, Any]:
+    """Build a ``{"type": "usage", "budget": ...}`` frame from a snapshot.
+
+    The snapshot is the dict produced by :meth:`BudgetGuard.snapshot`; hosts
+    (web/CLI) forward the frame verbatim to their frontends.
+    """
+    return {"type": "usage", "budget": snapshot}
+
+
+async def usage_ticks(
+    task: asyncio.Future,
+    budget: Any,
+    interval: float = USAGE_TICK_INTERVAL,
+) -> AsyncGenerator[dict[str, Any], None]:
+    """Yield a budget usage frame every *interval* seconds until *task* settles.
+
+    A final frame is always emitted after completion so consumers get the last
+    snapshot. If the consumer abandons this generator early (GeneratorExit),
+    *task* is cancelled in the ``finally`` as a hard-stop backstop — hosts are
+    expected to set ``cancel_event`` cooperatively first.
+    """
+    try:
+        while True:
+            if not task.done():
+                # Poll the task without awaiting it directly so frames can be
+                # interleaved while the stage coroutine keeps running.
+                await asyncio.wait({task}, timeout=interval)
+            yield usage_frame(budget.snapshot())
+            if task.done():
+                return
+    finally:
+        if not task.done():
+            task.cancel()
+
 
 async def generate_paper(
     query: str,
@@ -57,8 +95,18 @@ async def generate_paper(
     budget_limits: Any | None = None,
     approver: Any | None = None,
     use_pipeline: bool | None = None,
+    steer_queue: asyncio.Queue | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
-    """Generate a scientific document asynchronously with progress updates."""
+    """Generate a scientific document asynchronously with progress updates.
+
+    Args:
+        steer_queue: Optional queue receiving mid-run user steering messages
+            (B4). Consumed by the agent loop(s); in pipeline mode all parallel
+            sub-agents share the queue — whoever is running consumes it.
+        output_dir: When given together with ``multi_agent=True``, reuses an
+            existing paper directory instead of creating a fresh timestamped
+            one (B3 resume; ArtifactStore skips already-completed stages).
+    """
     start_time = time.time()
 
     work_dir = Path(cwd).resolve() if cwd else Path.cwd().resolve()
@@ -83,6 +131,15 @@ async def generate_paper(
     ).to_dict()
 
     target_dir_name = generate_session_dir_name(query)
+    # B3 断点续跑：显式传入 output_dir 时直接复用既有 paper 目录（系统指令与
+    # 产物扫描落在同一目录）。此前 multi_agent 分支会忽略该参数并新建目录。
+    if output_dir:
+        paper_output_dir = Path(output_dir)
+        if not paper_output_dir.is_absolute():
+            paper_output_dir = work_dir / paper_output_dir
+        target_dir_name = paper_output_dir.name
+    else:
+        paper_output_dir = work_dir / "writing_outputs" / target_dir_name
     system_instructions = build_system_instructions(work_dir, target_dir_name)
 
     # Resolve data files once; reuse the list later for actual processing.
@@ -104,8 +161,6 @@ async def generate_paper(
     if multi_agent:
         if use_pipeline is None:
             use_pipeline = os.environ.get("RA_PIPELINE", "true").lower() in ("true", "1", "yes")
-        output_folder = ensure_output_folder(work_dir, output_dir)
-        paper_output_dir = work_dir / "writing_outputs" / target_dir_name
 
         yield ProgressUpdate(
             message=f"Multi-agent mode ({'pipeline' if use_pipeline else 'orchestrator'}): "
@@ -130,9 +185,11 @@ async def generate_paper(
                 hooks=HookBus(),
                 budget_limits=budget_limits,
                 approver=approver,
+                steer_queue=steer_queue,  # B4: 中途转向透传给各阶段子代理
             ):
                 yield update
         else:
+            # legacy orchestrator：不接 steer/usage 流（仅 pipeline 与单代理支持）。
             async for update in run_orchestrated_generation(
                 query=query,
                 model=model,
@@ -157,7 +214,7 @@ async def generate_paper(
 
     from .session.store import SessionStore
     single_session = SessionStore.create(
-        work_dir / "writing_outputs" / target_dir_name,
+        paper_output_dir,  # 与实际输出目录一致（无 output_dir 时即 writing_outputs/<ts>）
         query=query, model=model, mode="single",
     )
     single_session.log_event("run_start", {"query_chars": len(query)})
@@ -195,7 +252,7 @@ async def generate_paper(
 
         if budget_limits is not None:
             budget = BudgetGuard(limits=budget_limits, model=model)
-        agent_result = await run_agent(
+        agent_task = asyncio.ensure_future(run_agent(
             prompt=query,
             system_prompt=system_instructions,
             llm_client=llm_client,
@@ -209,7 +266,22 @@ async def generate_paper(
             ),
             on_text=_on_text,
             on_tool_use=_on_tool,
-        )
+            steer_queue=steer_queue,  # B4: 单代理中途转向
+        ))
+        try:
+            if budget is not None:
+                # B5: 生成期间每 ~1s 推送一次预算快照；结束时至少再发最终一帧。
+                async for frame in usage_ticks(agent_task, budget):
+                    yield frame
+            else:
+                await agent_task
+            agent_result = agent_task.result()
+        except (asyncio.CancelledError, GeneratorExit):
+            # 宿主放弃流/任务被取消：尽力把会话标记为 cancelled 再退出。
+            single_session.finish(
+                "cancelled", budget.snapshot() if budget is not None else None,
+            )
+            raise
         single_session.finish(
             "complete", budget.snapshot() if budget is not None else None,
         )
