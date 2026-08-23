@@ -60,6 +60,10 @@ export function wsConnect({
   const proto = location.protocol === "https:" ? "wss:" : "ws:";
   let opened = false;
   const sock = new WebSocket(`${proto}//${location.host}${path}`);
+  // R10 关键修复：socket 必须登记进 socks 表，否则 wsSend/wsConnected 永远
+  // 失败——会话/任务的帧根本发不出去（服务端握手成功却永远等不到首帧，
+  // 前端则表现为「永久思考中」或「无法建立与服务端的连接」）。
+  socks.set(channel, sock);
 
   sock.onopen = () => {
     opened = true;
@@ -78,7 +82,9 @@ export function wsConnect({
     onStatus?.("error");
   };
   sock.onclose = () => {
-    socks.delete(channel);
+    // 身份守卫：仅当表里仍是本 socket 才清除——重连竞态下旧 socket 的
+    // onclose 迟到触发时，不能误删已接任的新连接。
+    if (socks.get(channel) === sock) socks.delete(channel);
     onStatus?.(opened ? "closed" : "error");
   };
   return sock;
