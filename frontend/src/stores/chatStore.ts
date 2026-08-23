@@ -69,6 +69,20 @@ function connectSocket(query: string): Promise<void> {
   });
 }
 
+/** 补偿删除刚建的会话目录（§6.4）：连接失败/帧未发出时回合不可能开始，
+ * 该目录只会成为列表里的零轮次残骸。尽力而为——删除失败交给后端
+ * 列表清退（ZERO_TURN_TTL_S）兜底；同时复位本地 sessionId，让重发
+ * 重新走一遍干净的建目录流程。 */
+function discardJustCreated(sid: string): void {
+  void api
+    .del(`/api/chat/sessions/${encodeURIComponent(sid)}`)
+    .catch(() => {});
+  useChatStore.setState((s) => ({
+    chat:
+      s.chat.sessionId === sid ? { ...s.chat, sessionId: null } : s.chat,
+  }));
+}
+
 export const useChatStore = create<ChatStore>()((set, get) => ({
   conn: "idle",
   chat: emptyChat(),
@@ -95,6 +109,7 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     }
 
     // 空闲发送：确保有会话目录与活跃连接
+    let createdSid: string | null = null; // 本次调用新建的目录（失败需补偿删除）
     if (!wsConnected("chat")) {
       try {
         let sid = get().chat.sessionId;
@@ -103,16 +118,19 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
             title: v.slice(0, 40),
           });
           sid = created.id;
+          createdSid = created.id;
           set((s) => ({ chat: { ...s.chat, sessionId: sid } }));
         }
         await connectSocket(`session=${encodeURIComponent(sid)}`);
       } catch {
         set({ conn: "error" });
+        if (createdSid) discardJustCreated(createdSid);
         failOffline();
         return "offline";
       }
     }
     if (!wsSend({ action: "user", text: v.slice(0, MAX_USER_LENGTH) }, "chat")) {
+      if (createdSid) discardJustCreated(createdSid);
       failOffline();
       return "offline";
     }

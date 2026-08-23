@@ -1,9 +1,18 @@
 /* 展示格式化辅助。 */
 
+/** 时间戳归一为毫秒。后端契约是 epoch 秒（protocol.md：time.time()/st_mtime），
+ * 而前端 Date 体系用毫秒——§6.3 的「1月22日」即秒值被当毫秒、diff 变 56 年
+ * 落进绝对日期分支渲染出 1970 年所致。毫秒值自 1973-03 起恒 ≥ 1e11，
+ * 以此区分两种单位（秒值到 5138 年都不会误判）。 */
+function toMillis(t: number | string): number {
+  const v = typeof t === "number" ? t : Date.parse(t);
+  return v >= 0 && v < 1e11 ? v * 1000 : v;
+}
+
 /** 相对时间：刚刚 / n 分钟前 / n 小时前 / n 天前 / 具体日期。 */
 export function formatRelative(t: number | string | undefined | null): string {
   if (t === undefined || t === null || t === "") return "";
-  const ts = typeof t === "number" ? t : Date.parse(String(t));
+  const ts = toMillis(typeof t === "number" ? t : String(t));
   if (!Number.isFinite(ts)) return "";
   const diff = Date.now() - ts;
   const min = 60_000;

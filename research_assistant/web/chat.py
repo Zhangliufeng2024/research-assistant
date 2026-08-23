@@ -67,6 +67,9 @@ MAX_STEER_LENGTH = 2_000  # steer 上限（与 ws.py generate 端点一致）
 PREVIEW_LIMIT = 400  # tool_card.result_preview 最大字符数
 LAST_MESSAGE_LIMIT = 80  # 会话列表 last_message 摘要长度
 ARTIFACT_PATH_LIMIT = 8  # 单张工具卡最多提取的产物文件数
+#: 零轮次会话清退时限（§6.4）：POST 建目录后从未收到用户帧的残骸，
+#: 超过此时限在列表时整目录删除。远大于 建目录→连 WS→首帧 的正常间隔。
+ZERO_TURN_TTL_S = 3600.0
 
 #: 同一会话的并发连接登记表：sid → 当前持有 socket。
 #: 并发策略选择「后连者踢前者」：新连接 close 旧 socket（close code 4001），
@@ -231,10 +234,42 @@ async def create_session(request: Request):
     return {"id": run_dir.name, "created_at": store.state.created_at}
 
 
+def _sweep_zero_turn_sessions(root: Path) -> None:
+    """列表前清退零轮次且过期的会话目录（§6.4 空会话治理）。
+
+    安全性：用户消息在回合开始前先落盘（_run_turn），因此「history.json
+    无用户消息」严格等价于「从未收到任何用户帧」——只可能是 POST 建目录后
+    连接失败 / 应用被杀的残骸，整目录删除不丢对话内容。TTL 保护刚建目录、
+    尚在连 WS 的 in-flight 会话。清退失败静默跳过（下次列表再试）。
+    """
+    if not root.is_dir():
+        return
+    now = time.time()
+    for child in root.iterdir():
+        try:
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            state = _load_run_state(child)
+            if state is None:
+                continue  # 与 list 的准入口径一致：无 run.json 不算会话
+            age = now - (state.get("updated_at") or child.stat().st_mtime)
+            if age <= ZERO_TURN_TTL_S:
+                continue
+            if any(m["role"] == "user" for m in _read_history(child)):
+                continue
+            shutil.rmtree(child, ignore_errors=True)
+        except OSError:
+            continue
+
+
 @router.get("/chat/sessions")
 async def list_sessions(request: Request):
-    """全部会话摘要，按 updated_at 倒序（最近活跃在前）。"""
+    """全部会话摘要，按 updated_at 倒序（最近活跃在前）。
+
+    零轮次且超过 ZERO_TURN_TTL_S 的残骸目录先被清退（§6.4）。
+    """
     root = _sessions_root(_cwd_of(request))
+    _sweep_zero_turn_sessions(root)
     items: list[dict] = []
     if root.is_dir():
         for child in sorted(root.iterdir()):

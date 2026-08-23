@@ -209,6 +209,56 @@ class TestSessionRest:
         assert client.delete(f"/api/chat/sessions/{sid}").status_code == 404
 
 
+class TestZeroTurnGc:
+    """§6.4 空会话治理：列表时清退「零轮次且过期」的会话目录。
+
+    背景：前端先 POST 建目录再连 WS，连接失败的残骸是零轮次目录；
+    用户消息在回合开始前先落盘（_run_turn），故零轮次严格等价于
+    「从未收到任何用户消息」，整目录删除不丢任何对话内容。
+    """
+
+    @staticmethod
+    def _backdate(tmp_path: Path, sid: str, seconds: float) -> Path:
+        """把会话的 run.json updated_at 回拨 *seconds* 秒，返回目录路径。"""
+        run_dir = tmp_path / ".ra" / "sessions" / sid
+        path = run_dir / "run.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["updated_at"] = time.time() - seconds
+        path.write_text(json.dumps(state), encoding="utf-8")
+        return run_dir
+
+    def test_stale_zero_turn_swept_from_list_and_disk(self, tmp_path):
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions", json={"title": "残骸"}).json()["id"]
+        run_dir = self._backdate(tmp_path, sid, seconds=7200)
+
+        items = client.get("/api/chat/sessions").json()
+        assert all(i["id"] != sid for i in items)
+        assert not run_dir.exists()  # 目录一并清退，不留磁盘垃圾
+
+    def test_fresh_zero_turn_kept(self, tmp_path):
+        """刚建目录尚未开回合的会话必须保留（in-flight 保护）。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions").json()["id"]
+
+        items = client.get("/api/chat/sessions").json()
+        assert [i["id"] for i in items] == [sid]
+
+    def test_old_session_with_user_message_kept(self, tmp_path):
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions").json()["id"]
+        run_dir = self._backdate(tmp_path, sid, seconds=7200)
+        chat_mod._write_history(
+            run_dir, [{"role": "user", "content": "真实对话"}])
+
+        items = client.get("/api/chat/sessions").json()
+        assert [i["id"] for i in items] == [sid]
+        assert run_dir.exists()
+
+
 # ---------------------------------------------------------------------------
 # C2/C3: WS 会话循环
 # ---------------------------------------------------------------------------

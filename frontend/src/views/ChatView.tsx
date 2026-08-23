@@ -188,7 +188,9 @@ export function ChatView() {
               <div className="bg-warn/10 px-5 py-2 text-center text-[12.5px] text-warn">
                 已等待 {silentSeconds} 秒未见模型输出——首次响应慢或网络较慢时会这样；
                 若持续停滞，多为网络无法直连模型端点，可到「设置 → 测试连接」验证，
-                或点右上角「停止」。
+                或点右上角「停止」。网络确属偏慢时，可在全局配置文件
+                （%APPDATA%\ResearchAssistant\.env）中加 RA_LLM_FIRST_BYTE_TIMEOUT=30
+                缩短首字节等待（单位秒）。
               </div>
             )}
           </div>
@@ -245,6 +247,10 @@ export function ChatView() {
           onSwitched={(next) => {
             setWsInfo(next);
             setWsOpen(false);
+            // §6.4 空会话治理：会话目录属于工作区，切走后旧 sessionId 失效——
+            // 若残留，下一条消息带旧 id 连入会触发服务端「幂等重建」，在新
+            // 工作区造出无标题空目录。复位为全新会话（与删除活跃会话同语义）。
+            newSession();
             setToast(`已切换到「${next.name}」`);
             refreshSessions().catch(() => {});
           }}

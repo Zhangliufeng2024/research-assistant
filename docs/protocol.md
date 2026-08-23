@@ -187,7 +187,7 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
 | POST | `/api/chat/sessions` | body 可选 `{"title": str}` | `{"id", "created_at"(epoch 秒)}` |
-| GET | `/api/chat/sessions` | — | `[{id, title?null, last_message(≤80字), turns(用户消息数), created_at, updated_at}]` 按 updated_at 倒序 |
+| GET | `/api/chat/sessions` | — | `[{id, title?null, last_message(≤80字), turns(用户消息数), created_at, updated_at}]` 按 updated_at 倒序。列表前先清退**零轮次且 updated_at 距今 > 1h** 的目录（用户消息回合开始前先落盘，零轮次 = 从未收到用户帧，删除不丢内容；§6.4 空会话治理） |
 | GET | `/api/chat/sessions/{id}` | — | `{id, messages:[{role,content}...]}`（history.json 全量）；未知 404、非法 ID 403 |
 | DELETE | `/api/chat/sessions/{id}` | — | `{ok:true}` 删除整个目录 |
 
