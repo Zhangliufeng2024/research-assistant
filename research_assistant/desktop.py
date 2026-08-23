@@ -293,6 +293,28 @@ def bundle_root() -> Path:
     return Path(__file__).parent.parent
 
 
+def workspace_arg_error(candidate: str) -> str | None:
+    """分类工作区参数错误并给出针对性文案；合法目录返回 None。
+
+    R12 P1/A5：目标机事故里脚本把 ``sys.executable``（应用自身）当 Python
+    解释器启动、把 .py 文件当工作区参数传进来——对「参数是已存在的文件」
+    给出解释成因的定向指引，而不是泛泛的「目录不存在」。
+    """
+    target = Path(candidate)
+    if target.is_dir():
+        return None
+    if target.is_file():
+        return (
+            f"该路径是文件而非工作区目录：\n{candidate}\n\n"
+            "这通常是脚本把 sys.executable（本应用自身）当作 Python 解释器"
+            "启动所致——打包版没有独立 Python，应用被当成了解释器、.py 文件"
+            "被当成了启动参数。\n"
+            "请在应用的会话/任务中使用 run_python 工具执行 Python 代码，"
+            "不要经 bash/subprocess 调用 python。"
+        )
+    return f"目录不存在：\n{candidate}"
+
+
 def main() -> int:
     # spawn 子进程引导（frozen_exec 的 run_python 派生进程会再次执行本入口，
     # 靠这行走入 multiprocessing bootstrap 而非重启桌面应用）；常规启动是 no-op。
@@ -302,6 +324,9 @@ def main() -> int:
     # 反而在某些 PAC/企业代理配置下拦截回环 WebSocket（R9 用户环境排查项）。
     # 加载器原生支持该环境变量，等价于给浏览器加 --no-proxy-server。
     os.environ.setdefault("WEBVIEW2_ADDITIONAL_BROWSER_ARGUMENTS", "--no-proxy-server")
+    # 桌面壳受信：解锁 /api/workspace/open（dock 的「打开所在文件夹」）。
+    # Web 模式不经此入口，仍保持默认门禁 403。
+    os.environ.setdefault("RA_ALLOW_SHELL_OPEN", "1")
 
     parser = argparse.ArgumentParser(description="Research Assistant Desktop")
     parser.add_argument("workspace", nargs="?", help="工作区目录（缺省用上次记忆或默认目录）")
@@ -312,8 +337,9 @@ def main() -> int:
     # （文档/研究助手，不存在即创建）。换目录改为界面内操作。
     if args.workspace:
         candidate = str(Path(args.workspace).expanduser().resolve())
-        if not Path(candidate).is_dir():
-            gui_error("研究助手", f"目录不存在：\n{candidate}")
+        err = workspace_arg_error(candidate)
+        if err:
+            gui_error("研究助手", err)
             return 2
     else:
         remembered = load_last_workspace()

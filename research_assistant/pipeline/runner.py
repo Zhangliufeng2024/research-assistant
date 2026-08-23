@@ -23,6 +23,7 @@ from typing import Any
 
 from ..agent import AgentResult as LoopResult
 from ..agent import RunConfig, run_agent
+from ..core import execution_contract_addendum
 from ..kernel.budget import BudgetGuard, BudgetLimits
 from ..kernel.events import HookBus
 from ..llm.factory import create_llm_client
@@ -102,16 +103,18 @@ async def _run_stage_agent(
     approver: Any | None = None,
     session_log: Any | None = None,
     steer_queue: asyncio.Queue | None = None,
+    write_anchor: str | None = None,
 ) -> LoopResult:
     """One sub-agent run inside the pipeline, sharing budget/hooks/cancel."""
     llm_client = create_llm_client(
         api_key=api_key, base_url=base_url, model=model, provider=provider,
     )
-    tools = _tools_for(work_dir)
+    tools = _tools_for(work_dir, write_anchor)
     try:
         return await run_agent(
             prompt=prompt,
-            system_prompt=system_prompt,
+            # R12 P1：全部阶段在此单点收口注入执行契约（含 resume 重放）
+            system_prompt=system_prompt + execution_contract_addendum(),
             llm_client=llm_client,
             tools=tools,
             config=RunConfig(
@@ -129,9 +132,11 @@ async def _run_stage_agent(
         await llm_client.close()
 
 
-def _tools_for(work_dir: Path):
+def _tools_for(work_dir: Path, write_anchor: str | None = None):
+    """阶段工具集：sandbox 恒为工作区根；R12 P2/B5 起相对写入归巢论文目录
+    （*write_anchor*），exec_cwd 不传保持 CWD=工作区根的既有语义。"""
     from ..tools.registry import ToolRegistry
-    return ToolRegistry(work_dir=str(work_dir))
+    return ToolRegistry(work_dir=str(work_dir), write_anchor=write_anchor)
 
 
 def _p(msg: str, stage: str) -> dict:
@@ -199,6 +204,8 @@ async def run_pipeline(
             approver=approver,
             # B4: 并行研究/图表阶段共享同一转向队列——谁在运行谁消费。
             steer_queue=steer_queue,
+            # R12 P2/B5：杂散相对写自然落入论文目录（exec_cwd 不动）
+            write_anchor=str(output_dir),
             session_log=session,  # SessionStore has .log()
             **kw,
         )

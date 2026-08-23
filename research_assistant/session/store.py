@@ -39,6 +39,8 @@ class SessionState:
     stages: dict[str, dict] = field(default_factory=dict)
     budget: dict[str, Any] = field(default_factory=dict)
     usage: dict[str, Any] = field(default_factory=dict)
+    #: chat 模式产物目录（相对工作区根的 POSIX 路径）；任务模式留空。
+    outputs_dir: str = ""
     created_at: float = field(default_factory=time.time)
     updated_at: float = field(default_factory=time.time)
 

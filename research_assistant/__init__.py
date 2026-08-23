@@ -25,7 +25,7 @@ from .config import build_llm_client, resolve_model
 from .models import PaperFiles, PaperMetadata, PaperResult, ProgressUpdate, TextUpdate, TokenUsage
 from .orchestrator import run_orchestrated_generation
 
-__version__ = "3.3.3"
+__version__ = "3.4.0"
 __author__ = "zhangliufeng"
 __license__ = "MIT"
 

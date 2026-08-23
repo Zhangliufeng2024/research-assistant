@@ -1,6 +1,6 @@
 # Research Assistant Harness 协议规格
 
-> 版本：schema_version = **1** · 更新日期：2026-08-22
+> 版本：schema_version = **1** · 更新日期：2026-08-23
 > 风格参照 `openai/codex` 的 `codex-rs/docs/protocol_v1.md`。
 > 本文描述的每个字段与枚举值均以仓库源码为准：`session/store.py`、`kernel/events.py`、`kernel/approval.py`、`kernel/guards.py`、`pipeline/artifacts.py`、`tools/exec_provider.py`。
 
@@ -28,9 +28,12 @@ Kernel      agent.run_agent(RunConfig)          循环 + Hook/预算/取消/上�
 {
   "schema_version": 1,
   "session_id": "<run_dir 名称或 uuid>",
-  "query": "...", "model": "...", "mode": "pipeline | single",
+  "query": "...", "model": "...", "mode": "pipeline | single | chat",
   "stage": "<最后活动的阶段名>",
   "status": "running | complete | failed | cancelled",
+  // R12（B4）：仅 chat 会话写入——相对工作区根的产物目录（"outputs/<sid>"）。
+  // WS 连接时创建并落盘；旧会话/任务运行缺省为 ""，消费方按 null 处理。
+  "outputs_dir": "outputs/<sid>",
   "stages": {
     "<name>": {
       "status": "pending | running | done | failed | skipped | partial",
@@ -44,7 +47,7 @@ Kernel      agent.run_agent(RunConfig)          循环 + Hook/预算/取消/上�
 ```
 
 Pipeline 固定阶段：`plan → research_figures → assemble → gates → finalize`
-（修订轮记为 `revision_<n>` 子代理）。单代理模式只产生 `mode:"single"` 与事件日志，无阶段记录。
+（修订轮记为 `revision_<n>` 子代理）。单代理模式只产生 `mode:"single"` 与事件日志，无阶段记录。chat 会话无阶段记录，但带 `outputs_dir`（§10.1、§11）。
 
 ## 3. events.jsonl 目录
 
@@ -139,10 +142,17 @@ manifest 位于 `<output_dir>/.ra/artifacts/manifest.json`：
 ```python
 class ExecProvider(Protocol):
     async def run_bash(self, command: str, timeout: int, cwd: str) -> str: ...
-    async def run_python(self, code: str, timeout: int, cwd: str) -> str: ...
+    async def run_python(
+        self, code: str, timeout: int, cwd: str,
+        *, workspace_root: str | None = None,
+    ) -> str: ...
 ```
 
 `ToolRegistry(exec_provider=None)` 默认装配 `LocalExecProvider`（委托现有本地实现）。替换 provider 即把 bash/run_python 整体迁移到其他执行世界（容器/远程沙箱），工具定义与提示词零改动。扩展点仅此一处，暂无远程实现。
+
+R12 加性扩展：`run_python` 的 `workspace_root=None` 关键字参数由 registry 固定传
+`self.work_dir`（§11.3）——冻结执行器用它给子进程注入全局常量 `WS`。自定义 provider
+可忽略该参数（签名带 `**kwargs` 或同名默认参即可兼容）。
 
 ## 8. 环境变量总表
 
@@ -158,6 +168,8 @@ class ExecProvider(Protocol):
 | `RA_AUTO_CONTINUE` | `true` | 自然停止时是否自动续跑 |
 | `LLM_REQUEST_INTERVAL` | `2.0`s | 同一 client 相邻请求最小间隔 |
 | `RA_MAX_RETRIES` / `RA_RETRY_BASE_DELAY` | `3` / `5.0`s | 瞬态错误重试参数 |
+| `RA_LLM_FIRST_BYTE_TIMEOUT` | `60`s | 模型端点首字节等待；网络偏慢时可调小（前端等待提示文案引用此变量） |
+| `RA_ALLOW_SHELL_OPEN` | 关闭 | `"1"` 时 `/api/workspace/open` 才允许调系统文件管理器，否则 403。**桌面壳 main() 自动置 1**（受信本地进程）；纯 web 部署保持默认关闭——前端 dock 按钮 403 时 toast 提示而非隐藏 |
 
 ## 9. 版本化承诺
 
@@ -182,12 +194,18 @@ class ExecProvider(Protocol):
 
 slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 
+**产物目录（R12 双轨制）**：chat 会话的工具产物落 `<workdir>/outputs/<sid>/`（与任务
+模式的 `writing_outputs/` 分轨）；WS 连接即创建，`run.json.outputs_dir` 记相对路径。
+清退（零轮次）与会话删除均**配对删除** `outputs/<sid>`——零轮次 ⇒ 从未执行过工具 ⇒
+产物目录不可能含用户数据，配对删除安全；孤儿 outputs 目录（会话目录已不在）惰性无害，
+不主动清扫。
+
 ### 10.2 REST（挂载于 `/api` 前缀下）
 
 | 方法 | 路径 | 请求 | 响应 |
 |---|---|---|---|
 | POST | `/api/chat/sessions` | body 可选 `{"title": str}` | `{"id", "created_at"(epoch 秒)}` |
-| GET | `/api/chat/sessions` | — | `[{id, title?null, last_message(≤80字), turns(用户消息数), created_at, updated_at}]` 按 updated_at 倒序。列表前先清退**零轮次且 updated_at 距今 > 1h** 的目录（用户消息回合开始前先落盘，零轮次 = 从未收到用户帧，删除不丢内容；§6.4 空会话治理） |
+| GET | `/api/chat/sessions` | — | `[{id, title?null, last_message(≤80字), turns(用户消息数), created_at, updated_at, outputs_dir?null}]` 按 updated_at 倒序。列表前先清退**零轮次且 updated_at 距今 > 1h** 的目录（用户消息回合开始前先落盘，零轮次 = 从未收到用户帧，删除不丢内容；§6.4 空会话治理；R12 起配对删 `outputs/<sid>`）。`outputs_dir` 取 run.json，旧会话为 null（恢复期兜底；权威源是 connected 帧，见 §10.3） |
 | GET | `/api/chat/sessions/{id}` | — | `{id, messages:[{role,content}...]}`（history.json 全量）；未知 404、非法 ID 403 |
 | DELETE | `/api/chat/sessions/{id}` | — | `{ok:true}` 删除整个目录 |
 
@@ -199,7 +217,7 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 
 | type | 字段 | 说明 |
 |---|---|---|
-| `connected` | `session_id` | 握手完成，可发消息 |
+| `connected` | `session_id`, `outputs_dir` | 握手完成，可发消息。R12 起带 `outputs_dir`（相对工作区根的产物目录，如 `"outputs/<sid>"`）——**前端产出 dock 的权威源**（REST 列表在工作区切换后会错接到另一工作区的同名目录）；旧会话为 null |
 | `text` | `delta` | 流式正文增量；接续最后一个 text 气泡（前端合并） |
 | `tool_card` | `id`, `tool`, `arguments`, `status: running\|done\|error`, `result_preview`(≤400字), `files:[{path}]` | 同 `id` 多次推送按卡合并；`files` 从 write_file/edit_file 的 `file_path` 与 bash/run_python 结果文本的扩展名启发式提取（去重保序，≤8 条） |
 | `usage` | `budget`: BudgetGuard.snapshot() | 运行期约每 1s 一帧，结束至少一帧（复用 B5 usage_ticks） |
@@ -224,8 +242,9 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 浏览器                                ws_chat 服务端
   │── GET /ws/chat?session=<id> ──▶ accept；定位/新建会话目录
   │                                  同会话并发：后连者 close(4001) 踢前者
-  │◀── {"connected", session_id} ──┤ 组装：BudgetGuard(RA_MAX_* 继承)、
-  │                                  QueueApprover、ToolRegistry(cwd 围栏)
+  │◀── {"connected", session_id, outputs_dir} ──┤ 组装：BudgetGuard(RA_MAX_* 继承)、
+  │                                  QueueApprover、ToolRegistry(work_dir=根围栏,
+  │                                  write_anchor=exec_cwd=outputs/<sid>，§11.2)
   │── {"action":"user","text"} ───▶ ┌ 一轮（_run_turn）
   │◀── text delta × N（流式）       │   history.json 载入 → 追加 user → 落盘
   │◀── tool_card(running)          │   run_agent(on_text/on_tool_start/on_tool_use,
@@ -246,4 +265,58 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
   max_tokens 截断续跑不受影响（内核自行注入 Continue），长文档产出在会话内仍连贯；
 - **预算作用域**：BudgetGuard 每连接一份（跨轮累计），上限自 `RA_MAX_*` 继承（D4 不放宽）；
   断连重连后重新起算，run.json 保留最近一次落盘的快照供参考。
+
+## 11. 执行环境契约（R12）
+
+> 实现权威：`core.execution_contract_addendum()`（提示层）、`tools/bash.py`（拦截层）、
+> `tools/frozen_exec.py`（运行时层）、`desktop.workspace_arg_error()`（入口层）。
+> 背景：打包版目标机没有独立 Python，v3.3.3 验证时模型自创
+> `subprocess([sys.executable, script.py])` 把应用 exe 再启动一遍，弹「目录不存在」对话框。
+> 契约把「正确行为」从模型临场发挥升级为产品保证——四层防御。
+
+### 11.1 提示层（addendum 注入）
+
+`execution_contract_addendum()` 按 `sys.frozen` 返回冻结契约或一行开发态说明。冻结文本要点：
+
+1. 禁止经 bash/subprocess 调用任何 python/pip/python3/py——`sys.executable` 是本应用自身，
+   当解释器启动会重启整个桌面应用；
+2. 一切 Python 经 **run_python** 工具（进程内沙箱，内置 numpy/pandas/matplotlib 等）；
+3. 运行 .py 脚本文件用 run_python 内可直接调用的助手 **`run_script(路径, argv=None)`**
+   （正确设置 sys.argv / `__name__="__main__"` / `__file__`，可导入兄弟模块）；
+4. 全局常量 **`WS`** = 工作区根绝对路径；产物写入系统提示给出的产物目录，跨目录读写用绝对路径。
+
+注入三 choke point（一处函数、三处消费）：`config.build_system_instructions`、
+pipeline `_run_stage_agent`（覆盖全部阶段与 resume 重放）、chat `_chat_system_instructions`。
+旧 orchestrator 助手提示同加。
+
+### 11.2 双目录口径（会话模式）
+
+会话 ToolRegistry：`work_dir=工作区根`（sandbox 围栏不变）+ `write_anchor=exec_cwd=outputs/<sid>`：
+
+- **write_file 相对路径一律解析到 anchor**（确定性归巢，仍过 safe_resolve 围栏）；anchor 内/
+  sandbox 内绝对路径原样；越界报错不变。成功回执回显**最终绝对路径**。
+- **edit_file 保持根解析**：「改共享文件」语义响亮且正确；write_file 一律归巢保证会话永不静默覆写共享文件。
+- **bash/run_python 默认 cwd = anchor**；显式 path 参数仍优先。
+- 会话系统提示明确：产物进专属目录、读共享数据用绝对路径或 `WS`、不要写进 `writing_outputs/`（任务领地）。
+- 任务流水线只加 `write_anchor=<paper_dir>`（exec_cwd 不动=CWD 根）——阶段提示词全绝对路径，
+  杂散相对写自然落入论文目录。
+
+### 11.3 运行时层
+
+- **frozen_exec 子进程 globals** = `{__name__, __file__, WS, run_script}`（pickle 传递
+  `workspace_root`；registry 的 run_python 分支恒传 `self.work_dir`）。`cwd` 不存在仍硬失败
+  （B4 已保证连接时 mkdir）。
+- **bash python 守卫**（仅 `sys.frozen`）：按操作符（`&& || | & ;`）切段，逐段跳过前导
+  `KEY=VALUE` 后取 basename（去 `.exe`），命中 `python/python3/py/pip/pip3` 或 `python*`
+  前缀（不误伤 ipython）→ **不 spawn**，返回中文替代路径指引。残余旁路（`where python`
+  等无害读命令）有意放行。
+- **入口防线**：desktop 位置参数为文件 → 定向文案（解释 sys.executable 成因 + 指向
+  run_python），非目录 → 目录不存在文案；均 exit 2。桌面壳 main() 自动置
+  `RA_ALLOW_SHELL_OPEN=1`（§8）。
+
+### 11.4 已知缺口
+
+- `verify_citations` 处理器以相对路径写 output_file 时不经过 write_anchor（独立处理器路径，
+  未走 registry 注入）——调用方需传绝对路径。
+- bash 守卫只在冻结态生效；开发态系统 Python 存在，无需拦截。
 

@@ -1,6 +1,7 @@
-import { useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { formatRelative, sessionTitle } from "@/lib/format";
+import { loadDockCollapsed, saveDockCollapsed } from "@/lib/artifacts";
 import {
   RUN_STATUS_LABEL,
   TL_STAGES,
@@ -8,6 +9,7 @@ import {
 import type { ActivityEntry, TaskState } from "@/lib/types";
 import { useTaskStore, type RunSummary } from "@/stores/taskStore";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
+import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
 
 /* ---------- 时间轴 ---------- */
@@ -114,18 +116,30 @@ const RUN_BADGE: Record<string, string> = {
 
 function RunItem({
   run,
+  selected,
+  onSelect,
   onResume,
 }: {
   run: RunSummary;
+  selected: boolean;
+  onSelect: (name: string) => void;
   onResume: (name: string) => void;
 }) {
   const resumable = run.status !== "running" && run.status !== "legacy";
   const title =
     run.paper?.title || sessionTitle(run.query || null, run.query || "");
   return (
-    <div className="rounded-xl border border-edge bg-surface px-3.5 py-2.5 transition-colors hover:border-accent/30">
+    <div
+      onClick={() => onSelect(run.name)}
+      className={`cursor-pointer rounded-xl border bg-surface px-3.5 py-2.5 transition-colors ${
+        selected
+          ? "border-accent/50 bg-accent-tint/40"
+          : "border-edge hover:border-accent/30"
+      }`}
+      aria-pressed={selected}
+    >
       <div className="flex items-center gap-2">
-        <span className="min-w-0 flex-1 truncate text-[12.5px] font-medium">{title}</span>
+        <span className={`min-w-0 flex-1 truncate text-[12.5px] font-medium ${selected ? "text-accent-hover dark:text-accent" : ""}`}>{title}</span>
         <span className={`shrink-0 rounded-md px-1.5 py-0.5 text-[10.5px] font-medium ${RUN_BADGE[run.status] || RUN_BADGE.legacy}`}>
           {RUN_STATUS_LABEL[run.status] || run.status}
         </span>
@@ -135,7 +149,10 @@ function RunItem({
         {resumable && (
           <button
             type="button"
-            onClick={() => onResume(run.name)}
+            onClick={(e) => {
+              e.stopPropagation();
+              onResume(run.name);
+            }}
             className="ml-auto rounded-md border border-edge px-2 py-0.5 text-[11px] transition-colors hover:border-accent/50 hover:text-accent"
           >
             续跑
@@ -167,6 +184,37 @@ export function TasksView() {
   const [steerText, setSteerText] = useState("");
   const [notice, setNotice] = useState("");
   const running = task.phase === "running";
+
+  // ---- 运行选中 + 产出 dock（R12 P3/C6）：行点击=选中，dock 展示该次运行目录 --
+  const [selectedRun, setSelectedRun] = useState<string | null>(null);
+  useEffect(() => {
+    // 默认选最近一次；选中项从历史中消失（清空/刷新）时回退
+    setSelectedRun((cur) =>
+      cur && runs.some((r) => r.name === cur) ? cur : (runs[0]?.name ?? null),
+    );
+  }, [runs]);
+
+  const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
+  const toggleDock = useCallback(() => {
+    setDockCollapsed((prev) => {
+      const next = !prev;
+      saveDockCollapsed(next);
+      return next;
+    });
+  }, []);
+
+  // 回合结束（离开 running）→ 刷新信号 + 拉取历史（新运行入列、状态徽标更新）
+  const [dockRefreshKey, setDockRefreshKey] = useState(0);
+  const prevPhaseRef = useRef(task.phase);
+  useEffect(() => {
+    if (prevPhaseRef.current === "running" && task.phase !== "running") {
+      setDockRefreshKey((k) => k + 1);
+      refreshRuns().catch(() => {});
+    }
+    prevPhaseRef.current = task.phase;
+  }, [task.phase, refreshRuns]);
+
+  const dockRoot = selectedRun ? `writing_outputs/${selectedRun}` : null;
 
   useEffect(() => {
     document.title = "研究助手 · 任务";
@@ -240,6 +288,8 @@ export function TasksView() {
               <RunItem
                 key={r.name}
                 run={r}
+                selected={r.name === selectedRun}
+                onSelect={setSelectedRun}
                 onResume={(name) => {
                   void resume(name).then((res) => {
                     if (res === "offline") setNotice("无法建立与服务端的连接");
@@ -334,6 +384,45 @@ export function TasksView() {
                 注入
               </button>
             </div>
+          </div>
+        )}
+      </div>
+
+      {/* 右侧产出 dock（R12 P3/C6）：展示选中运行的 writing_outputs/<name> 目录 */}
+      <div className="hidden shrink-0 border-l border-edge bg-canvas md:block">
+        {dockCollapsed ? (
+          <button
+            type="button"
+            onClick={toggleDock}
+            title="展开产出文件"
+            aria-label="展开产出文件面板"
+            className="flex h-full w-8 flex-col items-center gap-2 pt-3 text-ink-3 transition-colors hover:text-accent"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+              strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+            <span
+              className="text-[11px] font-medium"
+              style={{ writingMode: "vertical-rl" }}
+            >
+              产出文件
+            </span>
+          </button>
+        ) : (
+          <div className="flex h-full w-72 flex-col">
+            <ArtifactsPanel
+              rootRelPath={dockRoot}
+              refreshKey={dockRefreshKey}
+              emptyRootHint={
+                <>
+                  暂无选中的运行。
+                  <br />
+                  从左侧选择一次运行，或启动新任务。
+                </>
+              }
+              onCollapse={toggleDock}
+            />
           </div>
         )}
       </div>

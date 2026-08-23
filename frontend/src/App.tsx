@@ -9,6 +9,7 @@ import {
   LogoMark,
 } from "@/components/icons";
 import { useTheme } from "@/hooks/useTheme";
+import { APP_VERSION } from "@/lib/version";
 import { ChatView } from "@/views/ChatView";
 import { PapersView } from "@/views/PapersView";
 import { SettingsView } from "@/views/SettingsView";
@@ -62,7 +63,7 @@ export default function App() {
 
           {/* 底栏：版本 + 主题切换 */}
           <div className="flex items-center justify-between px-4 py-3">
-            <span className="text-[11px] text-ink-3">v3.3.0</span>
+            <span className="text-[11px] text-ink-3">v{APP_VERSION}</span>
             <button
               type="button"
               onClick={toggle}

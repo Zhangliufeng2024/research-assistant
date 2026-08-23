@@ -1,5 +1,7 @@
 """Tests for research_assistant.orchestrator — plan parsing and data models."""
 
+from pathlib import Path
+
 import pytest
 
 from research_assistant.orchestrator import (
@@ -145,3 +147,69 @@ class TestSanitizeFilename:
     def test_dots_only(self):
         result = _sanitize_filename("...")
         assert result == "..."
+
+
+# ---------------------------------------------------------------------------
+# R12 P1：legacy orchestrator 路径同样注入执行契约
+# ---------------------------------------------------------------------------
+
+class TestLegacySubAgentContractInjection:
+    async def test_sub_agent_system_prompt_carries_frozen_contract(self, monkeypatch):
+        import sys
+        from types import SimpleNamespace
+
+        from research_assistant import orchestrator
+
+        captured: dict = {}
+
+        async def fake_run_agent(**kwargs):
+            captured["system_prompt"] = kwargs["system_prompt"]
+            return SimpleNamespace(
+                text_output="", files_written=[], duration_seconds=0.0,
+                token_usage=None,
+            )
+
+        class _FakeClient:
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(orchestrator, "run_agent", fake_run_agent)
+        monkeypatch.setattr(orchestrator, "create_llm_client", lambda **kw: _FakeClient())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+        result = await orchestrator._run_sub_agent(
+            "a1", "planner", "prompt here", "LEGACY BASE PROMPT",
+            model="m", work_dir=Path("."),
+        )
+        assert result.success is True
+        assert captured["system_prompt"].startswith("LEGACY BASE PROMPT")
+        assert "run_script" in captured["system_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# R12 P1/A2：_FIGURE_PROMPT 契约（run_python 主路径，不再教裸 python）
+# ---------------------------------------------------------------------------
+
+class TestFigurePromptContract:
+    def _fmt(self) -> str:
+        from research_assistant.orchestrator import _FIGURE_PROMPT
+
+        return _FIGURE_PROMPT.format(
+            paper_title="T", figure_name="F", figure_description="D",
+            figure_type="data", output_file="C:/out/f1.png",
+            cwd="/w", description="desc",
+        )
+
+    def test_mentions_run_python_and_run_script(self):
+        text = self._fmt()
+        assert "run_python" in text
+        assert "run_script" in text
+
+    def test_no_bare_python_or_ghost_scripts(self):
+        text = self._fmt()
+        assert "nvidia_image_gen" not in text      # 幽灵脚本引用清除
+        assert "matplotlib via bash" not in text   # bash 跑图路径废除
+        assert "python /w/" not in text            # 裸 python 命令行废除
+
+    def test_output_file_placeholder_survives(self):
+        assert "C:/out/f1.png" in self._fmt()

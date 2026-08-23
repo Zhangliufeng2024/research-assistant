@@ -12,7 +12,7 @@ from pathlib import Path
 from dotenv import load_dotenv
 
 from .constants import DEFAULT_ANTHROPIC_MODEL
-from .core import load_system_instructions
+from .core import execution_contract_addendum, load_system_instructions
 from .llm.base import LLMClient
 from .llm.factory import create_llm_client
 
@@ -36,6 +36,8 @@ IMPORTANT - WORKING DIRECTORY:
 - NEVER write to /tmp/ or any other directory.
 - For all papers, reports, or research summaries, the root output folder is: writing_outputs/{target_dir_name}/
 """
+    # R12 P1：打包态执行契约（bash 禁 python / run_python / run_script / WS）
+    instructions += execution_contract_addendum()
     return instructions
 
 

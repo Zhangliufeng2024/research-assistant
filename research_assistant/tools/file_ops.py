@@ -59,21 +59,34 @@ async def write_file(
     file_path: str,
     content: str,
     sandbox: str | None = None,
+    write_anchor: str | None = None,
 ) -> str:
     """Write content to a file, creating parent directories if needed.
+
+    R12 P2 写入归巢：``write_anchor`` 设置时，**相对路径一律解析到
+    ``<anchor>/<relpath>``**（确定性落地——产物进产物目录，且会话永不
+    静默覆写共享文件；修改既有共享文件走 edit_file，它仍按 sandbox 根
+    解析）。无 anchor 时相对路径按 sandbox 根解析（生产中进程 CWD=根的
+    旧语义，此处不再依赖进程状态）。sandbox 内绝对路径原样写入。
+    成功回执回显最终绝对路径，供模型后续读写与前端 files 启发式定位。
 
     Args:
         file_path: Absolute or relative path to the file.
         content: The content to write.
         sandbox: If set, restricts writes to this directory tree.
+        write_anchor: 归巢目录（相对路径的确定性落点），须位于 sandbox 内。
     """
     p = Path(file_path)
     if sandbox:
         try:
             # Resolve against sandbox — parent must also be inside sandbox
             sandbox_path = Path(sandbox)
-            resolved_parent = safe_resolve(Path(file_path).parent, sandbox_path)
-            p = resolved_parent / Path(file_path).name
+            raw = Path(file_path)
+            if not raw.is_absolute():
+                base = Path(write_anchor) if write_anchor is not None else sandbox_path
+                raw = base / raw
+            resolved_parent = safe_resolve(raw.parent, sandbox_path)
+            p = resolved_parent / raw.name
         except ValueError as e:
             return f"Error: {e}"
     else:
@@ -81,7 +94,7 @@ async def write_file(
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(content, encoding="utf-8")
-        return f"Successfully wrote {len(content)} bytes to {file_path}"
+        return f"Successfully wrote {len(content)} bytes to {p}"
     except Exception as e:
         return f"Error writing file: {e}"
 

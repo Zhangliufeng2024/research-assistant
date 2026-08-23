@@ -1,17 +1,24 @@
-import { useRef, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 
-/** 输入区：Enter 发送 / Shift+Enter 换行；运行中占位符切换为引导语义。 */
+/** 输入区：Enter 发送 / Shift+Enter 换行；运行中占位符切换为引导语义。
+ * focusSignal 自增时把焦点拉回输入框（草稿入列点击聚焦，R12 P4）。 */
 export function Composer({
   running,
   disabled,
+  focusSignal = 0,
   onSend,
 }: {
   running: boolean;
   disabled?: boolean;
+  focusSignal?: number;
   onSend: (text: string) => void;
 }) {
   const [value, setValue] = useState("");
   const ref = useRef<HTMLTextAreaElement>(null);
+
+  useEffect(() => {
+    if (focusSignal > 0) ref.current?.focus();
+  }, [focusSignal]);
 
   function submit() {
     const v = value.trim();

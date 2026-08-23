@@ -138,7 +138,8 @@ def _make_fake_agent(calls: list, workdir_holder: dict):
     async def fake_agent(stage_name, prompt, system_prompt, *, model, work_dir,
                          api_key, base_url, provider, budget, hooks, cancel_event,
                          auto_continue=True, max_continuations=10,
-                         approver=None, session_log=None, steer_queue=None):
+                         approver=None, session_log=None, steer_queue=None,
+                         write_anchor=None):  # R12 B5：任务侧写入归巢（fake 忽略）
         calls.append(stage_name)
         from research_assistant.agent import AgentResult
 
@@ -317,3 +318,135 @@ async def test_pipeline_records_budget_snapshot(tmp_path, monkeypatch, gate_stub
     state = SessionStore(out_dir).state
     assert state.budget["model"] == "claude-sonnet-4-6"
     assert state.budget["limits"]["max_turns"] == 100
+
+
+# ---------------------------------------------------------------------------
+# R12 P1：执行契约注入（阶段子代理 system_prompt 收口处）
+# ---------------------------------------------------------------------------
+
+class TestStageContractInjection:
+    async def test_stage_system_prompt_carries_frozen_contract(self, monkeypatch):
+        import sys
+
+        from research_assistant.pipeline import runner
+
+        captured: dict = {}
+
+        async def fake_run_agent(**kwargs):
+            captured["system_prompt"] = kwargs["system_prompt"]
+            return object()  # runner 原样返回，占位即可
+
+        class _FakeClient:
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+        monkeypatch.setattr(runner, "create_llm_client", lambda **kw: _FakeClient())
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+
+        await runner._run_stage_agent(
+            "plan",
+            "do the plan",
+            "BASE STAGE PROMPT",
+            model="m",
+            work_dir=Path("."),
+            api_key=None,
+            base_url=None,
+            provider=None,
+            budget=None,
+            hooks=None,
+            cancel_event=None,
+        )
+        # 原阶段提示词保留在前，契约追加在后
+        assert captured["system_prompt"].startswith("BASE STAGE PROMPT")
+        assert "run_script" in captured["system_prompt"]
+        assert "sys.executable" in captured["system_prompt"]
+
+
+# ---------------------------------------------------------------------------
+# R12 P2/B1：SessionState.outputs_dir 字段（chat 模式产物目录落盘）
+# ---------------------------------------------------------------------------
+
+class TestSessionStateOutputsDir:
+    def test_field_roundtrip(self, tmp_path):
+        store = SessionStore.create(tmp_path / "run", "q", "m")
+        store.state.outputs_dir = "outputs/20260823_100000_demo"
+        store.save()
+        reloaded = SessionStore(tmp_path / "run")
+        assert reloaded.state.outputs_dir == "outputs/20260823_100000_demo"
+
+    def test_old_run_json_without_field_loads(self, tmp_path):
+        run_dir = tmp_path / "run"
+        run_dir.mkdir()
+        (run_dir / "run.json").write_text(json.dumps({
+            "schema_version": 1, "session_id": "run", "query": "q",
+            "model": "m", "mode": "chat", "status": "complete",
+        }), encoding="utf-8")
+        assert SessionStore(run_dir).state.outputs_dir == ""
+
+
+# ---------------------------------------------------------------------------
+# R12 P2/B5：任务侧写入归巢——write_anchor=paper 目录，exec_cwd 语义不变
+# ---------------------------------------------------------------------------
+
+
+class TestStageWriteAnchor:
+    async def _run_stage(self, monkeypatch, tmp_path, **extra):
+        from research_assistant.pipeline import runner
+
+        captured: dict = {}
+
+        async def fake_run_agent(**kwargs):
+            captured["tools"] = kwargs["tools"]
+            return object()
+
+        class _FakeClient:
+            async def close(self):
+                pass
+
+        monkeypatch.setattr(runner, "run_agent", fake_run_agent)
+        monkeypatch.setattr(runner, "create_llm_client", lambda **kw: _FakeClient())
+
+        await runner._run_stage_agent(
+            "plan", "p", "sp", model="m",
+            work_dir=tmp_path, api_key=None, base_url=None, provider=None,
+            budget=None, hooks=None, cancel_event=None, **extra)
+        return captured
+
+    async def test_write_anchor_threads_paper_dir(self, monkeypatch, tmp_path):
+        paper_dir = tmp_path / "writing_outputs" / "20260823_paper"
+        tools = (await self._run_stage(
+            monkeypatch, tmp_path, write_anchor=str(paper_dir)))["tools"]
+        # 相对写入归巢论文目录；exec_cwd 不动（阶段提示词全绝对路径，
+        # CWD=根 的既有语义保持）
+        assert tools.write_anchor == str(paper_dir)
+        assert tools.exec_cwd == str(tmp_path)
+
+    async def test_default_keeps_legacy_no_anchor(self, monkeypatch, tmp_path):
+        tools = (await self._run_stage(monkeypatch, tmp_path))["tools"]
+        assert tools.write_anchor is None
+
+    async def test_run_pipeline_anchors_all_stages_to_output_dir(
+            self, tmp_path, monkeypatch, gate_stub):
+        """端到端：流水线每个阶段的 write_anchor 都指向论文输出目录。"""
+        calls: list = []
+        anchors: list = []
+        inner = _make_fake_agent(calls, {})
+
+        async def spy(stage_name, prompt, system_prompt, *, write_anchor=None, **kw):
+            anchors.append(write_anchor)
+            kw.pop("write_anchor", None)
+            return await inner(stage_name, prompt, system_prompt, **kw)
+
+        monkeypatch.setattr(
+            "research_assistant.pipeline.runner._run_stage_agent", spy)
+        from research_assistant.pipeline.runner import run_pipeline
+
+        out_dir = tmp_path / "writing_outputs" / "run1"
+        await _collect(run_pipeline(
+            query="write a fem paper", model="test-model",
+            work_dir=tmp_path, output_dir=out_dir,
+        ))
+
+        assert calls  # 各阶段确实运行
+        assert set(anchors) == {str(out_dir)}

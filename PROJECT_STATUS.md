@@ -1,17 +1,17 @@
 # PROJECT_STATUS — 研究助手 (research-assistant-v3)
 
-> 交接文档 · 更新于 2026-08-23 · 已发布版本 **v3.3.3**（commit `18e7aa4`，已推送 origin/main）
-> **R11 修复已完成并通过全部测试、已提交 main，尚未打安装包发版**——建议等 v3.3.3
-> 目标机确认结果出来后再一并出 v3.3.4（避免验证时一次变两个变量）。
+> 交接文档 · 更新于 2026-08-23 · 已发布版本 **v3.4.0**（R12：执行契约 + 文件双轨制 +
+> 产出 dock + 草稿入列）。真实 UI E2E 六断言全过（§5）；安装包
+> `dist/ResearchAssistant_setup_3.4.0.exe` 静默装/卸验证通过。
+> 下一步：目标机验证 v3.4.0（无 Python 机器画图 / 产物归巢 / dock）。
 
 ---
 
 ## 1. 当前目标
 
 桌面端 AI 研究助手（PyInstaller + WebView2 单机应用，FastAPI 后端 + React 前端）。
-近期主线：**修复用户在第二台电脑上「会话永久思考中 / 无法建立与服务端的连接」的致命故障**。
-该故障已根因修复并发布 v3.3.3；待用户在目标机器上安装确认。
-R11 转入 §6 待办清单的体验治理：日期显示 / 空会话 / 等待提示。
+主线演进到 **R12/v3.4.0**：把目标机验证暴露的「打包态执行环境契约缺失」缺陷做成产品保证，
+并落地用户确认的三项产品诉求——文件双轨制、右侧产出 dock、新会话草稿入列。
 
 ## 2. 已完成内容（R6 → R10）
 
@@ -22,7 +22,8 @@ R11 转入 §6 待办清单的体验治理：日期显示 / 空会话 / 等待�
 | R8 | 3.3.1 | 全局配置迁移 `%APPDATA%/ResearchAssistant/.env`、免选夹直入、配置即生效 |
 | R9 | 3.3.2 | LLM 调用监督体系化（两阶段看门狗/墙钟/可打断）、前端失败如实上报、等待横幅、结构化会话日志 |
 | R10 | 3.3.3 | **定位并修复真正根因**：ws.ts 从未把 socket 登记进 `socks` 表；新增真实 UI 路径 E2E |
-| R11 | 待发版 | §6.3 会话列表日期显示（epoch 秒被当毫秒→「1970年1月22日」）；§6.4 空会话治理（三层：后端列表清退零轮次目录 / 前端失败补偿删除 / 工作区切换复位会话态）；§6.5 等待横幅提示 `RA_LLM_FIRST_BYTE_TIMEOUT` |
+| R11 | 3.3.x（并入 v3.3.4 未发） | §6.3 会话列表日期显示（epoch 秒被当毫秒→「1970年1月22日」）；§6.4 空会话治理（三层：后端列表清退零轮次目录 / 前端失败补偿删除 / 工作区切换复位会话态）；§6.5 等待横幅提示 `RA_LLM_FIRST_BYTE_TIMEOUT` |
+| R12 | **v3.4.0（已发）** | **P1 冻结执行契约四层防御**（A1 契约函数注入三 choke point / A2 `_FIGURE_PROMPT` 重写 / A3 frozen_exec 注入 `run_script`+`WS` / A4 bash python 拦截守卫 / A5 desktop 入口防线+`RA_ALLOW_SHELL_OPEN` / A6 run_python 工具描述）；**P2 文件双轨制**（chat 产物 `outputs/<sid>/`、write_anchor 写入归巢、任务侧仅加 anchor 不动 exec_cwd、清退/删除配对删 outputs）；**P3 右侧产出 dock**（ArtifactsPanel 树+行内预览+打开文件夹，ChatView/TasksView 接线，折叠记忆跨页共享）；**P4 新会话草稿入列** |
 
 R9 的全部后端加固经审计确认有独立价值（真实存在的挂死/不可打断缺陷），但用户侧
 主因是 R10 的前端一行缺失——R7 重写时 `wsConnect` 创建 WebSocket 后未写入 `socks`，
@@ -52,8 +53,69 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
    脚本见 §7。
 8. **`/ws/chat` 双挂载保留**（app.py：带 `/api` 前缀 + 裸路径各挂一次）：前端硬编码
    裸路径，protocol.md §10 有约定，勿在重构中删除。
+9. **执行契约四层防御**（R12/P1，详见 protocol.md §11）：提示层 addendum（冻结态禁裸
+   python、指路 run_python/run_script/WS）→ bash 拦截层（冻结态逐段检查 python/pip 调用，
+   不 spawn 直接给中文指引）→ frozen_exec 运行时（子进程注入 `run_script`/`WS`）→
+   desktop 入口防线（文件参数 exit 2 + 定向文案）。模型自创 `subprocess([sys.executable,…])`
+   这类「临场发挥」从根上封死。
+10. **write_anchor 语义 = 相对写一律归巢**（R12/P2）：anchor 设置时 write_file 相对路径
+    解析到 anchor（仍过围栏），edit_file 保持根解析——「改共享文件」响亮正确、会话永不
+    静默覆写共享文件；成功回执回显最终绝对路径闭环读写往返。会话 registry
+    `work_dir=根, write_anchor=exec_cwd=outputs/<sid>`；任务流水线只加
+    `write_anchor=<paper_dir>` 不动 exec_cwd（阶段提示词全绝对路径，CWD=根行为保持）。
+11. **connected 帧 outputs_dir 是 dock 权威源**：REST 列表的 outputs_dir 在工作区切换后
+    会错接到另一工作区同名目录（tree/file 端点跟随进程 cwd），只作恢复期兜底。
+12. **零轮次清退配对删除 outputs/<sid> 安全**：零轮次 ⇒ 从未执行工具 ⇒ 产物目录不可能
+    含用户数据；孤儿 outputs 目录惰性不清扫。
 
 ## 4. 修改过的核心文件
+
+### R12（v3.4.0）
+- `research_assistant/core.py` — **A1**：`execution_contract_addendum()` 按 `sys.frozen`
+  返回冻结契约/开发态一行；注入 `config.build_system_instructions`、pipeline
+  `_run_stage_agent`、chat `_chat_system_instructions`、旧 orchestrator 助手四处
+- `research_assistant/pipeline/orchestrator.py` — **A2**：`_FIGURE_PROMPT` 重写为
+  matplotlib-via-run_python 主路径 + generate_schematic.py 经 run_script 次路径，删 nvidia/裸 python
+- `research_assistant/tools/frozen_exec.py` — **A3**：子进程 globals += `WS` 与
+  `run_script(path, argv=None)`（swap sys.argv/__name__/__file__/sys.path[0]，finally 恢复）；
+  `_child_main` 第 4 参 workspace_root pickle 传递
+- `research_assistant/tools/exec_provider.py` / `python_exec.py` — run_python 加性 kwarg
+  `workspace_root=None` 全链转发；`tools/registry.py` — **B3**：`write_anchor`/`exec_cwd`
+  参数，bash/run_python cwd 注入 `exec_cwd or work_dir`，run_python 分支恒传
+  `workspace_root=self.work_dir`，write_file 分支注入 anchor，工具描述更新（A6）
+- `research_assistant/tools/file_ops.py` — **B2**：write_file 加 write_anchor 参
+  （相对一律 join(anchor)，回执回显最终绝对路径）；edit_file 根解析不变
+- `research_assistant/tools/bash.py` — **A4**：`_segments`/`_is_python_invocation` 纯函数 +
+  冻结态拦截返回中文指引
+- `research_assistant/desktop.py` — **A5**：`workspace_arg_error()` 分类矩阵（文件→定向文案/
+  非目录→现文案，exit 2 不变）+ `RA_ALLOW_SHELL_OPEN=1` setdefault
+- `research_assistant/session/store.py` — **B1**：SessionState += `outputs_dir: str = ""`
+- `research_assistant/web/chat.py` — **B4**：`OUTPUTS_SUBDIR`/`_outputs_root`；WS 连接即
+  mkdir outputs/<sid> 并落盘；registry 三参装配；connected 帧 += `outputs_dir`；
+  `_session_summary` += `outputs_dir|null`；清退/删除配对删 outputs；POST 不建目录；
+  会话系统提示双目录口径（`_chat_system_instructions(work_dir, outputs_dir)`）
+- `research_assistant/pipeline/runner.py` — **B5**：`_tools_for`/`_run_stage_agent` 线程化
+  write_anchor，`_stage_kwargs` 传 paper 目录
+- `research_assistant/api.py` — 单代理 ToolRegistry 加 write_anchor=paper 目录
+- `frontend/src/lib/artifacts.ts`(+test) — **C1**：normalizeArtifactPath /
+  candidatePreviewPaths（anchor 优先序+去重）/ IGNORED_TREE_PREFIXES / dock 折叠偏好 helpers
+- `frontend/src/components/chat/FilePreview.tsx` — **C2**：预览主体从 Modal 抽出（候选序回退）；
+  Modal 退化为遮罩壳
+- `frontend/src/lib/types.ts` / `protocolChat.ts`(+test) — **C3**：ChatState.outputsDir、
+  SessionSummary.outputs_dir、connected 帧归约
+- `frontend/src/components/chat/ArtifactsPanel.tsx` — **C4**：懒加载树+行内预览+刷新+
+  打开文件夹+空态（emptyRootHint 可定制）；ChatView/TasksView 接线（C5/C6：dockRoot 权威源
+  链、phase 离开 running 自增 refreshKey、折叠细条记忆跨页共享、TasksView 运行行选中高亮）
+- `frontend/src/components/chat/SessionList.tsx` / `Composer.tsx` / `views/ChatView.tsx` —
+  **P4 草稿入列**：draftActive 高亮草稿行置顶（点击 focusSignal 聚焦输入框）、✚ 按钮草稿期置灰
+- `frontend/vite.config.ts` / `src/lib/version.ts`(+test) / `App.tsx` / `tsconfig.json`
+  （resolveJsonModule）— **页脚版本同源化**：`__APP_VERSION__` 构建期注入 package.json，
+  替换 App.tsx 自 v3.3.0 漂移的硬编码「v3.3.0」（E2E 截图暴露）
+- `docs/protocol.md` — §2/§7/§8/§10.1/§10.2/§10.3/§10.4 更新 + 新 §11 执行环境契约
+- 测试：`tests/test_core.py`(TestExecutionContract)、`test_frozen_exec.py`(TestRunScriptHelper)、
+  `test_tools.py`(TestBashPythonGuard/TestWriteAnchor)、`test_desktop.py`、
+  `test_exec_provider.py`、`test_pipeline.py`(TestStageWriteAnchor)、`test_web_api.py`、
+  `test_chat_api.py`(TestChatOutputsDir ×9 / TestChatSystemInstructions)
 
 ### R11（体验治理，待发版）
 - `frontend/src/lib/format.ts` — **§6.3 核心**：`toMillis` 归一（<1e11 视为 epoch 秒 ×1000）；契约本就是秒（protocol.md:189），是前端违反了它。SessionList/TasksView 共用此口，一并修复
@@ -85,10 +147,25 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 
 ## 5. 测试与验证结果
 
-- **pytest**：586 passed / 1 skipped（R11 后；唯一 warning 是 test_utils docx 测试在
-  Windows Proactor 下的 asyncio 传输 GC 噪音，与本仓库逻辑无关、系既有）
-- **vitest**：43 passed（R11 新增 format 8 项 + chatStore 5 项）；**tsc** / **ruff** 干净
-- R11 改动均为 REST/前端展示层，未触碰 WS 帧协议与 LLM 链路；发 v3.3.4 安装包时仍须按惯例跑真实 UI E2E（§7 脚本）
+- **pytest**：644 passed / 1 skipped（R12 后；唯一 warning 是 test_utils docx 测试在
+  Windows Proactor 下的 asyncio 传输 GC 噪音，与本仓库逻辑无关、系既有）。
+  R12 新增 ~70 项：执行契约、run_script 助手、bash 守卫、write_anchor、desktop 分类、
+  provider kwarg 转发、会话 outputs_dir 全生命周期（connected 帧/run.json/清退配对删/
+  惰性建目录）、_FIGURE_PROMPT 文本审查
+- **vitest**：60 passed（R12 新增 artifacts.ts 14 项 + protocolChat outputsDir 5 项
+  + version 同源 1 项）；**tsc** / **ruff** 干净
+- 无 Python 目标机的冻结语义不可真测：mock 断言 + 提示词文本审查兜底（test_orchestrator）
+- **真实 UI 路径 E2E（v3.4.0，R12 断言清单全过 `[UI-E2E-R12] PASS`）**：
+  Edge headless + CDP 驱动安装版（全新 APPDATA + mock SSE LLM）。
+  ④ .py 文件参数启动 → 原生框自动关闭 + exit 2；① 单次点击恰 1 POST + 1 WS，
+  run_python 相对 savefig 归巢 `<工作区>/outputs/<sid>/e2e_fig.png`（真实进程内
+  matplotlib），connected 帧 outputs_dir 为 dock 免刷新渲染出该目录；③ dock 树行
+  点击行内预览；② 折叠记忆跨页面重载保持 + 草稿行「未发送」出现；⑤ bash
+  `python --version` 展开工具卡显示中文指引——cmd 报错文本与真实 Python 版本输出
+  均未出现（本机有系统 Python，此反向断言排除守卫失效假绿）；磁盘 run.json
+  outputs_dir/status 佐证。共四轮：第 1 轮 harness 失败（残留 mock 监听占 18999，
+  请求全打到旧 mock），第 2/3 轮暴露两处断言设计问题（工具卡预览默认折叠需先展开；
+  CDP 裸字符串 "1" 被二次解析成整数 1），产品代码全程零改动。
 - **安装版裸协议 E2E**（v3.3.2 时做，后端未再变）：
   mock SSE 全链路回合 PASS；死端口 45s 有界报错且带中文指引；黑洞端点（TCP 通
   不响应）约 275s 有界失败（60s 首字节窗 ×4 次尝试 + 重试间隔），期间
@@ -121,6 +198,14 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 6. **仓库卫生**：`dist/` 存有 3.3.0/3.3.1/3.3.2/3.3.3 四个安装包，发版后可清理旧版；
    `D:\vscode files\research-assistant-history-backup-20260822.bundle` 含旧历史，
    确认无需回溯后删除。
+7. **R12 已知缺口（如实记录）**：
+   - `verify_citations` 处理器以相对路径写 output_file 时不过 write_anchor（独立处理器
+     路径，未走 registry 注入）——调用方需传绝对路径；
+   - bash python 守卫只在冻结态生效（开发态有系统 Python，有意不拦）；`where python`
+     等无害读命令有意放行；
+   - 会话 dock 的 REST 列表 outputs_dir 仅恢复期兜底——工作区切换后权威源是 connected 帧；
+   - 任务页 dock 展示选中运行的 `writing_outputs/<name>`，新启动的运行要等回合结束
+     refreshRuns 后才会出现在历史列表并被选中。
 
 ## 7. 尝试过但失败 / 踩过的坑（避免重蹈）
 
@@ -141,6 +226,12 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
   `min(heartbeat_timeout, env 值)`，否则显式传小 `heartbeat_timeout` 的旧测试失效。
 - **E2E 探测脚本**：CDP `Runtime.evaluate` 的返回值可能是裸字符串（"ok"），不能
   一律当 JSON 解析；轮询终态要等相位点落到 `bg-ok`/`bg-danger`，不能见首条回复就收。
+- **mock 端口残留监听**：上一轮 mock_llm 进程还活着时新 mock bind 失败（10048），
+  全部请求打到旧路由逻辑——断言静默假绿/假红且极难察觉。启动前
+  `netstat -ano -p TCP` 查端口 LISTENING pid 并 taskkill。
+- **工具卡结果预览默认折叠**：ToolCardView 点击头部才把「结果」渲染进 DOM，
+  innerText 探测前必须先展开卡片；守卫类断言还要加反向信号（cmd 报错文本、
+  真实 Python 版本输出都不得出现），否则开发机上守卫失效会假绿。
 
 **真实 UI E2E 脚本**：`C:\Users\zhangliufeng\AppData\Local\Temp\ra_ws_e2e\e2e_r10_ui.py`
 （依赖：mock OpenAI SSE 服务 `mock_llm.py` 同目录 18999 端口；已装安装版；运行方式
@@ -148,16 +239,27 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 按 §7 坑位说明重写——核心断言：单次点击 → posts=1 / sockets=1 → 回复上屏 →
 相位点 bg-ok → 服务端日志完整回合。
 
+**R12 发版断言清单**（在 v3.3.3 断言之上追加）：
+
+1. 一次真实发送 → `<工作区>/outputs/<sid>/` 落盘，右侧 dock 免手动刷新渲染出该目录；
+2. dock 折叠/展开切换后页面重载记忆保持（localStorage `ra.artifacts.dock.collapsed`）；
+3. 工具卡文件 chip 点击可在弹窗/dock 行内预览；
+4. exe 以 .py 文件路径为参数启动 → 快速 exit 2，desktop.log 尾部含定向解释
+   （读日志一律读尾不切片）；
+5. 让助手跑 `python --version` → 工具卡返回中文替代路径指引而非 cmd 报错；
+6. 回归：合法目录启动不受影响；任务仍产出 `writing_outputs/<ts>_<desc>/` 结构。
+
 ## 8. 下一步开发顺序
 
-1. **等用户确认 v3.3.3 在目标机器正常**（若仍有问题，取该机
-   `<工作区>/.ra/logs/desktop.log`，R9 的结构化日志已能区分「WS 未达」与「回合失败」）。
-2. **发 v3.3.4**：R11 修复已在 main。流程 = 版本号四处
-   （pyproject.toml / `__init__.py` / installer.iss / frontend/package.json）→
-   前端产物重建 → 安装包 → **真实 UI E2E 必跑**（§7 脚本与坑位）→ 静默装/卸验证 →
-   泄漏扫描。建议与第 1 步的确认错开，别让目标机一次验两个变量。
-3. **仓库卫生**（§6.6）：清旧安装包、删备份 bundle（密钥轮换完成后）。
-4. 功能线回到主计划：按 README/既定 roadmap 继续（R12+ 待定）。
+1. ~~**发 v3.4.0**~~ **已完成**：`python build.py` → ISCC → 真实 UI E2E
+   `[UI-E2E-R12] PASS` → 静默装/卸/重装验证 → 泄漏扫描 → 提交推送。
+2. **目标机验证 v3.4.0**：重点验 ① 无 Python 机器上让助手画图/跑脚本（应走
+   run_python，工具卡不再出现「目录不存在」；bash 裸 python 应显示中文指引）；
+   ② 会话产物落 `outputs/<sid>/` 且右侧 dock 免刷新出现；③ 任务页选中历史运行
+   可预览 `writing_outputs/` 产物；④ 侧栏页脚显示 v3.4.0。
+3. **仓库卫生**（§6.6）：清旧安装包（dist/ 现存 3.3.0~3.4.0 五个）、删备份
+   bundle（密钥轮换完成后）。
+4. 功能线回到主计划：按 README/既定 roadmap 继续。
 
 ---
 

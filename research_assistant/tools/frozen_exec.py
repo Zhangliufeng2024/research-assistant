@@ -28,7 +28,47 @@ from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
 _JOIN_GRACE_S = 10
 
 
-def _child_main(code: str, cwd: str, out_path: str) -> None:
+def _make_script_runner():
+    """构造注入给用户代码的 ``run_script(path, argv=None)`` 助手。
+
+    冻结态没有独立解释器，技能脚本（generate_schematic.py 等）不能再经
+    subprocess 跑——本助手在子进程内就地执行脚本文件：正确设置
+    ``sys.argv`` / ``__name__`` / ``__file__`` 并把脚本目录插到
+    ``sys.path[0]``（兄弟模块可导入），结束后全部恢复。脚本内 SystemExit
+    与异常按 _child_main 同样口径汇报、不炸外层代码。
+    """
+
+    def run_script(path, argv=None):  # noqa: ANN001, ANN202
+        p = Path(str(path)).expanduser()
+        if not p.is_file():
+            return (
+                f"Error: script not found: {path}\n"
+                "请用绝对路径定位脚本（工作区根见全局常量 WS；"
+                "不要用 bash/subprocess 调 python）。"
+            )
+        resolved = p.resolve()
+        source = resolved.read_text(encoding="utf-8")
+        old_argv = list(sys.argv)
+        old_path = list(sys.path)
+        try:
+            sys.argv = [str(resolved), *(str(a) for a in (argv or []))]
+            sys.path.insert(0, str(resolved.parent))
+            # 自注入：脚本内可再嵌套 run_script（与顶层代码同一能力面）
+            globs = {"__name__": "__main__", "__file__": str(resolved), "run_script": run_script}
+            try:
+                exec(compile(source, str(resolved), "exec"), globs)  # noqa: S102
+            except SystemExit as e:
+                print(f"(exit: {e.code})")
+            except BaseException:
+                traceback.print_exc(file=sys.stderr)
+        finally:
+            sys.argv = old_argv
+            sys.path[:] = old_path
+
+    return run_script
+
+
+def _child_main(code: str, cwd: str, out_path: str, workspace_root: str = "") -> None:
     """子进程入口：执行用户代码，stdout/stderr 全量写入 out_path。"""
     os.environ.setdefault("MPLBACKEND", "Agg")  # 无头：savefig 可用，show 不阻塞
     os.chdir(cwd)
@@ -40,6 +80,10 @@ def _child_main(code: str, cwd: str, out_path: str) -> None:
             globs = {
                 "__name__": "__main__",
                 "__file__": os.path.join(cwd, "_ra_exec.py"),
+                # R12 P1：打包态执行契约的运行时半边——WS=工作区根常量，
+                # run_script 就地执行 .py 脚本（替代被禁的 bash python）
+                "WS": workspace_root,
+                "run_script": _make_script_runner(),
             }
             try:
                 exec(compile(code, "_ra_exec.py", "exec"), globs)  # noqa: S102
@@ -55,8 +99,17 @@ def _child_main(code: str, cwd: str, out_path: str) -> None:
             sys.stdout, sys.stderr = old_out, old_err
 
 
-async def run_python_inprocess(code: str, timeout: int = 120, cwd: str = ".") -> str:
-    """在 spawn 子进程中执行 Python 代码，返回 stdout + stderr（超时强杀）。"""
+async def run_python_inprocess(
+    code: str,
+    timeout: int = 120,
+    cwd: str = ".",
+    workspace_root: str | None = None,
+) -> str:
+    """在 spawn 子进程中执行 Python 代码，返回 stdout + stderr（超时强杀）。
+
+    ``workspace_root``：工作区根绝对路径，作为子进程内全局常量 ``WS``
+    暴露（不能从 cwd 推导——会话模式下 cwd 是产物目录而非根）。
+    """
     work_dir = Path(cwd).resolve()
     if not work_dir.is_dir():
         return f"Error: working directory does not exist: {work_dir}"
@@ -67,7 +120,9 @@ async def run_python_inprocess(code: str, timeout: int = 120, cwd: str = ".") ->
 
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(
-        target=_child_main, args=(code, str(work_dir), out_path), daemon=True)
+        target=_child_main,
+        args=(code, str(work_dir), out_path, workspace_root or ""),
+        daemon=True)
     proc.start()
 
     # join 阻塞放进工作线程，避免卡住事件循环；join 自身限时返回

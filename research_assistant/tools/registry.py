@@ -85,7 +85,15 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
     },
     {
         "name": "run_python",
-        "description": "Execute Python code and return stdout + stderr. The code is written to a temp file and run with the current Python interpreter. Useful for data analysis, figure generation, document creation, and computation.",
+        "description": (
+            "Execute Python code in-process and return stdout + stderr. This is the ONLY "
+            "way to run Python: never invoke python/pip via bash or subprocess (in packaged "
+            "builds there is no system Python — sys.executable is the app itself). numpy, "
+            "pandas and matplotlib are available; to run a .py script file use the injected "
+            "helper run_script(path, argv=None) inside run_python (frozen builds also expose "
+            "the workspace root as the global WS). Useful for data analysis, figure "
+            "generation, document creation, and computation."
+        ),
         "parameters": {
             "type": "object",
             "properties": {
@@ -140,10 +148,26 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
 
 
 class ToolRegistry:
-    """Manages tool definitions and dispatches tool calls."""
+    """Manages tool definitions and dispatches tool calls.
 
-    def __init__(self, work_dir: str = ".", exec_provider: ExecProvider | None = None):
+    R12 P2 双轨制注入点：
+    - ``write_anchor``：write_file 相对路径的确定性落点（会话=outputs/<sid>，
+      任务=论文目录）；不设则维持旧行为（相对路径落工作区根）。
+    - ``exec_cwd``：bash/run_python 的默认 CWD（会话=产物目录，savefig 相对
+      保存自动归家）；不设则与 work_dir 相同（任务模式语义不变）。
+    sandbox 恒为 work_dir——读写围栏不随归巢改变。
+    """
+
+    def __init__(
+        self,
+        work_dir: str = ".",
+        exec_provider: ExecProvider | None = None,
+        write_anchor: str | None = None,
+        exec_cwd: str | None = None,
+    ):
         self.work_dir = work_dir
+        self.write_anchor = write_anchor
+        self.exec_cwd = exec_cwd or work_dir
         self._handlers = dict(_TOOL_HANDLERS)
         # Execution-world seam: defaults to the local provider. Swapping in a
         # container/remote provider moves bash/run_python wholesale.
@@ -162,25 +186,28 @@ class ToolRegistry:
         # before the seam was introduced (no duplication, no loss).
         if name == "bash":
             if "path" not in arguments or not arguments.get("path"):
-                arguments["path"] = self.work_dir
-            arguments["cwd"] = arguments.pop("path", self.work_dir)
+                arguments["path"] = self.exec_cwd
+            arguments["cwd"] = arguments.pop("path", self.exec_cwd)
             try:
                 return await self.exec_provider.run_bash(
                     command=arguments.get("command", ""),
                     timeout=int(arguments.get("timeout", 120)),
-                    cwd=arguments.get("cwd", self.work_dir),
+                    cwd=arguments.get("cwd", self.exec_cwd),
                 )
             except Exception as e:
                 return f"Error executing {name}: {e}"
 
         if name == "run_python":
             if "cwd" not in arguments:
-                arguments["cwd"] = self.work_dir
+                arguments["cwd"] = self.exec_cwd
             try:
+                # workspace_root 恒取 work_dir（工作区根），与 cwd 解耦：
+                # 会话模式下 cwd 可能是产物目录，而 WS 必须指向根
                 return await self.exec_provider.run_python(
                     code=arguments.get("code", ""),
                     timeout=int(arguments.get("timeout", 120)),
-                    cwd=arguments.get("cwd", self.work_dir),
+                    cwd=arguments.get("cwd", self.exec_cwd),
+                    workspace_root=self.work_dir,
                 )
             except Exception as e:
                 return f"Error executing {name}: {e}"
@@ -195,6 +222,8 @@ class ToolRegistry:
         if name in ("read_file", "write_file", "edit_file", "verify_citations"):
             if "sandbox" not in arguments:
                 arguments["sandbox"] = self.work_dir
+        if name == "write_file" and self.write_anchor is not None:
+            arguments.setdefault("write_anchor", self.write_anchor)
 
         if name in ("glob_files", "grep_search"):
             if "path" not in arguments or not arguments.get("path"):

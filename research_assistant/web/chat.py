@@ -45,7 +45,7 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from ..agent import RunConfig, run_agent
 from ..api import usage_ticks
 from ..config import build_llm_client, resolve_model
-from ..core import load_system_instructions, safe_resolve
+from ..core import execution_contract_addendum, load_system_instructions, safe_resolve
 from ..kernel.approval import QueueApprover, ToolApprovalRequest
 from ..kernel.budget import BudgetGuard
 from ..llm.base import LLMClient, LLMResponse, OnChunkCallback
@@ -60,6 +60,10 @@ LOG = logging.getLogger("ra.web.chat")
 
 #: 会话根目录（相对工作区根）。
 SESSIONS_SUBDIR = Path(".ra") / "sessions"
+#: R12 P2 双轨制：会话模式产物的家（相对工作区根）。任务模式仍写
+#: writing_outputs/<ts>_<desc>/，会话产物一律落 outputs/<sid>/——sid 本身
+#: 即 YYYYMMDD_HHMMSS_<标题slug>，与零轮次清退可 1:1 配对删除。
+OUTPUTS_SUBDIR = Path("outputs")
 HISTORY_FILE = "history.json"
 
 MAX_USER_LENGTH = 8_000  # 单条用户消息上限（与前端 slice(0, 8000) 对齐）
@@ -125,6 +129,11 @@ def _write_history(run_dir: Path, messages: list[dict]) -> None:
 
 def _sessions_root(cwd: Path) -> Path:
     return Path(cwd) / SESSIONS_SUBDIR
+
+
+def _outputs_root(cwd: Path) -> Path:
+    """会话产物根（双轨制）：``<工作区>/outputs``。"""
+    return Path(cwd) / OUTPUTS_SUBDIR
 
 
 def _slugify(title: str) -> str:
@@ -197,6 +206,8 @@ def _session_summary(run_dir: Path) -> dict:
         "turns": sum(1 for m in messages if m["role"] == "user"),
         "created_at": state.get("created_at") or stat.st_ctime,
         "updated_at": state.get("updated_at") or stat.st_mtime,
+        # 恢复期兜底（权威源是 connected 帧）：B4 之前的旧会话为 None
+        "outputs_dir": state.get("outputs_dir") or None,
     }
 
 
@@ -234,16 +245,21 @@ async def create_session(request: Request):
     return {"id": run_dir.name, "created_at": store.state.created_at}
 
 
-def _sweep_zero_turn_sessions(root: Path) -> None:
+def _sweep_zero_turn_sessions(root: Path, outputs_root: Path | None = None) -> None:
     """列表前清退零轮次且过期的会话目录（§6.4 空会话治理）。
 
     安全性：用户消息在回合开始前先落盘（_run_turn），因此「history.json
     无用户消息」严格等价于「从未收到任何用户帧」——只可能是 POST 建目录后
     连接失败 / 应用被杀的残骸，整目录删除不丢对话内容。TTL 保护刚建目录、
     尚在连 WS 的 in-flight 会话。清退失败静默跳过（下次列表再试）。
+    R12 P2 双轨制：产物目录与会话 1:1（outputs/<sid>），清退时配对删除；
+    零轮次 ⇒ 从未运行过工具 ⇒ 产物目录内不可能有用户数据。孤立的
+    outputs 目录（会话目录已不在）不主动追删——惰性无害，避免误删。
     """
     if not root.is_dir():
         return
+    if outputs_root is None:
+        outputs_root = root.parent.parent / OUTPUTS_SUBDIR
     now = time.time()
     for child in root.iterdir():
         try:
@@ -258,6 +274,7 @@ def _sweep_zero_turn_sessions(root: Path) -> None:
             if any(m["role"] == "user" for m in _read_history(child)):
                 continue
             shutil.rmtree(child, ignore_errors=True)
+            shutil.rmtree(outputs_root / child.name, ignore_errors=True)
         except OSError:
             continue
 
@@ -269,7 +286,7 @@ async def list_sessions(request: Request):
     零轮次且超过 ZERO_TURN_TTL_S 的残骸目录先被清退（§6.4）。
     """
     root = _sessions_root(_cwd_of(request))
-    _sweep_zero_turn_sessions(root)
+    _sweep_zero_turn_sessions(root, _outputs_root(_cwd_of(request)))
     items: list[dict] = []
     if root.is_dir():
         for child in sorted(root.iterdir()):
@@ -307,6 +324,8 @@ async def delete_session(session_id: str, request: Request):
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
     shutil.rmtree(run_dir, ignore_errors=True)
+    # R12 P2 双轨制：产物目录 1:1 归会话所有，显式删除时一并清掉
+    shutil.rmtree(_outputs_root(_cwd_of(request)) / session_id, ignore_errors=True)
     return {"ok": True}
 
 
@@ -415,13 +434,18 @@ def extract_artifact_paths(
     return out
 
 
-def _chat_system_instructions(work_dir: Path) -> str:
+def _chat_system_instructions(work_dir: Path, outputs_dir: Path | None = None) -> str:
     """WRITER.md 基座 + 会话模式附录（R8 反馈 #4：cowork 化）。
 
-    不复用 config.build_system_instructions——那会把输出钉死到某个
-    writing_outputs/<ts> 论文目录，与会话「工作区即画布」的模式冲突。
+    R12 P2 双轨制口径：*work_dir* 是工作区共享根（读共享数据），*outputs_dir*
+    是本会话产物目录（写产物 + 执行默认 CWD）——两个绝对路径都明示给模型，
+    相对路径写入会被自动归巢到产物目录。结尾追加执行契约附录
+    （execution_contract_addendum）：打包版在此声明「没有独立 Python，
+    一切经 run_python / run_script」。
     """
     base = load_system_instructions(work_dir)
+    if outputs_dir is None:
+        outputs_dir = work_dir
     return (
         base
         + f"""
@@ -431,15 +455,17 @@ def _chat_system_instructions(work_dir: Path) -> str:
 你是与用户并肩工作的 agent：能动手就直接动手，交付看得见的产物，而不是只给建议。
 
 **执行原则**
-- 工作目录是 {work_dir}；所有文件读写以它为根。写出的文件会自动以卡片展示、可预览——优先把工作成果落成文件。
+- 本工作区的根目录是 {work_dir}；本会话的专属产物目录是 {outputs_dir}。
+- 读写分工：产出文件（图表、文档、脚本、数据结果）一律放进产物目录——相对路径写入会自动落到那里，bash/run_python 的默认工作目录也是它；读取工作区里的既有共享数据（data/、sources/ 等）时用**绝对路径**（可拼接全局常量 WS，它就是 {work_dir}）。
+- 写出的文件会自动以卡片展示、可预览——优先把工作成果落成文件。
 - 能用工具完成的事不要停留在口头描述：读数据、跑分析、画图、写文档，直接做，完成后简要汇报结果与产物路径。
 - 用户每发一条消息，回复一轮即停下等下一条；除非用户明确要求连续产出长文档，不要自行连写。
 - 遇到需要多步的请求（如"帮我整理这批数据并出报告"），先给一句两三步的计划，然后在本轮内直接执行到底。
 
 **产物规范（重要）**
-- 正式文档写入 writing_outputs/ 下的子目录（如 writing_outputs/20260822_主题/）；草稿、图表、脚本等中间产物放同处即可。
-- 用 run_python 生成 matplotlib 图表时保存为 PNG 到同一目录，并在回复中给出文件名。
-- 回合结束时若本轮产出了文件，在回复末尾附「交付物」清单：每行一个相对路径加一句说明。
+- 所有产物写入上面的专属产物目录；不要写进 writing_outputs/（那是任务模式的领地），也不要散落在工作区根。
+- 用 run_python 生成 matplotlib 图表时保存为 PNG 到产物目录，并在回复中给出文件名。
+- 回合结束时若本轮产出了文件，在回复末尾附「交付物」清单：每行一个相对产物目录的路径加一句说明。
 
 **引用纪律**
 - 引用文献时只使用真实可查证的论文，禁止编造 DOI 或参考文献；不确定就说明不确定。
@@ -447,6 +473,7 @@ def _chat_system_instructions(work_dir: Path) -> str:
 **语言与风格**
 - 用用户的语言回复；正文简洁，可用 Markdown。
 """
+        + execution_contract_addendum()
     )
 
 
@@ -554,6 +581,22 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         store.save()
         store.log_event("session_open", {"via": "ws"})
 
+        # ---- R12 P2 双轨制：连接即建本会话产物目录 -------------------------
+        # 不能推迟到首回合：frozen_exec 对不存在的 CWD 硬失败。旧会话重连
+        # （run.json 缺 outputs_dir 的 legacy 目录）在此惰性补建并回填落盘。
+        outputs_abs = _outputs_root(cwd) / sid
+        try:
+            outputs_abs.mkdir(parents=True, exist_ok=True)
+        except OSError as exc:
+            LOG.warning("产物目录创建失败 sid=%s：%s", sid, exc)
+            await _send({"type": "error",
+                         "message": f"无法创建产物目录 {outputs_abs}：{exc}"})
+            await websocket.close()
+            return
+        if store.state.outputs_dir != f"outputs/{sid}":
+            store.state.outputs_dir = f"outputs/{sid}"  # 相对 POSIX，权威在帧
+            store.save()
+
         # ---- 并发连接：踢掉同会话旧 socket --------------------------------
         previous = _LIVE.get(sid)
         if previous is not None and previous is not websocket:
@@ -572,8 +615,14 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         # 也不能只在连接时构建一次——那样设置页保存的新 Key/模型对已打开
         # 的会话永远不生效（R7 反馈 #3 主因 + 残留路径一并修掉）。
         budget = BudgetGuard(model=resolve_model(None))  # limits 自 RA_MAX_* 继承
-        tools = ToolRegistry(work_dir=str(cwd))
-        system_instructions = _chat_system_instructions(cwd)
+        # 双轨制注入：sandbox 围栏恒为工作区根；相对写入与执行默认 CWD 归巢
+        # 产物目录（savefig 相对保存自动落家）；读共享数据靠契约里的绝对路径口径。
+        tools = ToolRegistry(
+            work_dir=str(cwd),
+            write_anchor=str(outputs_abs),
+            exec_cwd=str(outputs_abs),
+        )
+        system_instructions = _chat_system_instructions(cwd, outputs_abs)
 
         ask_state = {"current": ""}  # 当前待应答的审批请求 ID（防迟到回执污染）
 
@@ -775,8 +824,14 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 cancel_event.set()
                 approvals.put_nowait(None)
 
-        LOG.info("会话连接建立 sid=%s", sid)
-        await _send({"type": "connected", "session_id": sid})
+        LOG.info("会话连接建立 sid=%s outputs=%s", sid, store.state.outputs_dir)
+        # connected 帧是前端 dock 的权威源：REST 列表在工作区切换后会把
+        # dock 错接到另一工作区的同名目录，这里以本连接的 cwd 为准。
+        await _send({
+            "type": "connected",
+            "session_id": sid,
+            "outputs_dir": store.state.outputs_dir,
+        })
 
         # ---- 主循环：空闲期直接接收，user 动作触发一轮 ---------------------
         while True:

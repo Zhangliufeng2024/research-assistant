@@ -213,6 +213,36 @@ def ensure_output_folder(cwd: Path, custom_dir: str | None = None) -> Path:
     return output_folder
 
 
+_FROZEN_CONTRACT = """
+
+IMPORTANT - EXECUTION ENVIRONMENT (PACKAGED BUILD):
+- 这台机器没有独立的 Python 解释器。禁止用 bash 或 subprocess 调用任何
+  python/pip/python3/py 命令——`sys.executable` 是本应用自身，把它当解释器
+  启动会重启整个桌面应用（弹「目录不存在」对话框）。
+- 一切 Python 代码都通过 run_python 工具执行（进程内沙箱，已内置
+  numpy/pandas/matplotlib 等）。
+- 需要运行 .py 脚本文件时，使用 run_python 里可直接调用的助手：
+  `run_script(路径, argv=None)`——它会正确设置 sys.argv/__name__/__file__。
+- 全局常量 `WS` 是工作区根目录的绝对路径，可用于拼接共享数据路径。
+- 产物一律写入系统提示中给出的产物目录；跨目录读写用绝对路径。
+"""
+
+_DEV_CONTRACT = "\n\n[开发态：系统 Python 可用；打包版会替换为冻结执行契约。]"
+
+
+def execution_contract_addendum() -> str:
+    """Return the execution-environment contract appended to every system prompt.
+
+    冻结（打包）版没有独立 Python：bash/subprocess 调 python 会把应用 exe
+    再启动一遍。契约向模型讲清替代路径（run_python / run_script / WS），
+    开发版只留一行占位。注入点：build_system_instructions、pipeline 各阶段、
+    chat 会话指令——三处共用同一份文本。
+    """
+    if getattr(sys, "frozen", False):
+        return _FROZEN_CONTRACT
+    return _DEV_CONTRACT
+
+
 def get_image_extensions() -> frozenset[str]:
     """Return a set of common image file extensions."""
     return IMAGE_EXTENSIONS

@@ -70,7 +70,7 @@ class TestFrozenDispatch:
 
         called = {}
 
-        async def fake_inprocess(code, timeout=120, cwd="."):
+        async def fake_inprocess(code, timeout=120, cwd=".", workspace_root=None):
             called["code"] = code
             return "in-process!"
 
@@ -78,3 +78,98 @@ class TestFrozenDispatch:
         got = asyncio.run(python_exec.run_python("print('x')", cwd=str(tmp_path)))
         assert got == "in-process!"
         assert called["code"] == "print('x')"
+
+
+# ---------------------------------------------------------------------------
+# R12 P1/A3：子进程内注入 run_script 助手与 WS 工作区根常量
+# ---------------------------------------------------------------------------
+
+class TestRunScriptHelper:
+    async def test_ws_global_is_workspace_root(self, tmp_path):
+        ws = tmp_path / "wsroot"
+        ws.mkdir()
+        result = await run_python_inprocess("print(WS)", cwd=str(tmp_path), workspace_root=str(ws))
+        assert str(ws) in result
+
+    async def test_ws_default_empty_when_not_passed(self, tmp_path):
+        result = await run_python_inprocess("print(repr(WS))", cwd=str(tmp_path))
+        assert "''" in result
+
+    async def test_run_script_argv_and_main_guard(self, tmp_path):
+        script = tmp_path / "tool.py"
+        script.write_text(
+            "import sys\n"
+            "print(sys.argv[1:])\n"
+            "print('main' if __name__ == '__main__' else 'imported')\n",
+            encoding="utf-8",
+        )
+        result = await run_python_inprocess(
+            f"run_script(r'{script}', ['a', 'b'])", cwd=str(tmp_path))
+        assert "['a', 'b']" in result
+        assert "main" in result
+
+    async def test_run_script_file_dunder(self, tmp_path):
+        script = tmp_path / "me.py"
+        script.write_text("print(__file__)\n", encoding="utf-8")
+        result = await run_python_inprocess(f"run_script(r'{script}')", cwd=str(tmp_path))
+        assert str(script) in result
+
+    async def test_sibling_module_import(self, tmp_path):
+        (tmp_path / "helper_mod.py").write_text("VALUE = 41\n", encoding="utf-8")
+        main = tmp_path / "use_helper.py"
+        main.write_text(
+            "from helper_mod import VALUE\nprint(VALUE + 1)\n", encoding="utf-8")
+        result = await run_python_inprocess(f"run_script(r'{main}')", cwd=str(tmp_path))
+        assert "42" in result
+
+    async def test_missing_script_gives_guidance(self, tmp_path):
+        result = await run_python_inprocess(
+            "print(run_script('no_such_script.py'))", cwd=str(tmp_path))
+        assert "Error" in result
+        assert "no_such_script.py" in result
+
+    async def test_run_script_restores_argv(self, tmp_path):
+        inner = tmp_path / "inner.py"
+        inner.write_text("pass\n", encoding="utf-8")
+        outer = tmp_path / "outer.py"
+        outer.write_text(
+            "import sys\n"
+            "before = list(sys.argv)\n"
+            "run_script(r'" + str(inner).replace("\\", "\\\\") + "', ['x'])\n"
+            "print('restored' if sys.argv == before else 'LEAKED')\n",
+            encoding="utf-8",
+        )
+        # 外层经 run_python 的代码本身带 argv 注入路径，验证脚本内部嵌套调用后恢复
+        result = await run_python_inprocess(
+            f"run_script(r'{outer}', ['keep', 'me'])", cwd=str(tmp_path))
+        assert "restored" in result
+
+    async def test_systemexit_inside_script_reported_not_fatal(self, tmp_path):
+        script = tmp_path / "quitter.py"
+        script.write_text(
+            "import sys\nraise SystemExit(3)\n", encoding="utf-8")
+        result = await run_python_inprocess(
+            f"run_script(r'{script}')\nprint('after')", cwd=str(tmp_path))
+        assert "(exit: 3)" in result
+        assert "after" in result
+
+
+class TestPythonExecForwardsWorkspaceRoot:
+    def test_frozen_dispatch_forwards_workspace_root(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        import research_assistant.tools.frozen_exec as fe
+        from research_assistant.tools import python_exec
+
+        captured: dict = {}
+
+        async def fake_inprocess(code, timeout=120, cwd=".", workspace_root=None):
+            captured["workspace_root"] = workspace_root
+            return "in-process!"
+
+        monkeypatch.setattr(fe, "run_python_inprocess", fake_inprocess)
+        import asyncio
+
+        got = asyncio.run(python_exec.run_python(
+            "print('x')", cwd=str(tmp_path), workspace_root="/ws"))
+        assert got == "in-process!"
+        assert captured["workspace_root"] == "/ws"

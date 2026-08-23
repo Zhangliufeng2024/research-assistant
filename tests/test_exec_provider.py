@@ -69,8 +69,14 @@ class FakeExecProvider:
         self.calls.append(("bash", {"command": command, "timeout": timeout, "cwd": cwd}))
         return "SENTINEL_BASH"
 
-    async def run_python(self, code: str, timeout: int, cwd: str) -> str:
-        self.calls.append(("python", {"code": code, "timeout": timeout, "cwd": cwd}))
+    async def run_python(
+        self, code: str, timeout: int, cwd: str,
+        workspace_root: str | None = None,
+    ) -> str:
+        self.calls.append(("python", {
+            "code": code, "timeout": timeout, "cwd": cwd,
+            "workspace_root": workspace_root,
+        }))
         return "SENTINEL_PYTHON"
 
 
@@ -89,8 +95,12 @@ class TestRegistryRoutesThroughProvider:
         registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=fake)
         result = await registry.execute("run_python", {"code": "print(1)", "timeout": 7})
         assert result == "SENTINEL_PYTHON"
+        # R12 P1：registry 把工作区根作为 workspace_root 传给 provider
         assert fake.calls == [
-            ("python", {"code": "print(1)", "timeout": 7, "cwd": str(tmp_path)})
+            ("python", {
+                "code": "print(1)", "timeout": 7, "cwd": str(tmp_path),
+                "workspace_root": str(tmp_path),
+            })
         ]
 
     @pytest.mark.asyncio
@@ -108,6 +118,7 @@ class TestRegistryRoutesThroughProvider:
         await registry.execute("run_python", {"code": "x = 1"})
         assert fake.calls[0][1]["timeout"] == 120
         assert fake.calls[0][1]["cwd"] == str(tmp_path)
+        assert fake.calls[0][1]["workspace_root"] == str(tmp_path)
 
     @pytest.mark.asyncio
     async def test_bash_explicit_path_maps_to_cwd(self, tmp_path):
@@ -134,7 +145,10 @@ class TestRegistryRoutesThroughProvider:
             async def run_bash(self, command: str, timeout: int, cwd: str) -> str:
                 raise RuntimeError("world unavailable")
 
-            async def run_python(self, code: str, timeout: int, cwd: str) -> str:
+            async def run_python(
+                self, code: str, timeout: int, cwd: str,
+                workspace_root: str | None = None,
+            ) -> str:
                 raise RuntimeError("world unavailable")
 
         registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=ExplodingProvider())
@@ -176,3 +190,35 @@ class TestRegistryRegression:
         registry = ToolRegistry()
         result = await registry.execute("nonexistent_tool", {})
         assert "Unknown tool" in result
+
+
+# ---------------------------------------------------------------------------
+# R12 P1/A3：workspace_root 沿 registry → provider → frozen 执行器贯通
+# ---------------------------------------------------------------------------
+
+class TestWorkspaceRootForwarding:
+    @pytest.mark.asyncio
+    async def test_registry_passes_workspace_root_to_provider(self, tmp_path):
+        class RootRecorder(FakeExecProvider):
+            async def run_python(
+                self, code: str, timeout: int, cwd: str,
+                workspace_root: str | None = None,
+            ) -> str:
+                self.seen_root = workspace_root
+                return "OK"
+
+        rec = RootRecorder()
+        registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=rec)
+        await registry.execute("run_python", {"code": "x = 1"})
+        assert rec.seen_root == str(tmp_path)
+
+    def test_local_provider_satisfies_protocol_with_new_kwarg(self):
+        # 协议加性扩展后，LocalExecProvider 仍满足 ExecProvider
+        assert isinstance(LocalExecProvider(), ExecProvider)
+
+    def test_run_python_protocol_signature_has_workspace_root(self):
+        import inspect
+
+        sig = inspect.signature(ExecProvider.run_python)
+        assert "workspace_root" in sig.parameters
+        assert sig.parameters["workspace_root"].default is None

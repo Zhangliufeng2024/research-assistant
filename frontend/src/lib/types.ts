@@ -42,6 +42,9 @@ export type BudgetSnapshot = Record<string, any>;
 
 export interface ChatState {
   sessionId: string | null;
+  /** 本会话产物目录（相对工作区根的 POSIX 路径）；权威源是 connected 帧
+   * （R12 B4），REST 列表仅作恢复期兜底，旧会话为 null。 */
+  outputsDir: string | null;
   /** 有序聊天流：用户气泡 / 助手文本气泡 / 工具卡占位（卡片实体在 cards） */
   items: ChatItem[];
   cards: Record<string, ToolCard>;
@@ -67,6 +70,8 @@ export interface SessionSummary {
   turns: number;
   created_at: number | string;
   updated_at: number | string;
+  /** 会话产物目录（相对 POSIX 路径）；B4 之前的旧会话为 null。 */
+  outputs_dir?: string | null;
 }
 
 /* ---------- 任务（generate 流水线）状态 ---------- */

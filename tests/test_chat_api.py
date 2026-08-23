@@ -12,6 +12,7 @@ AgentResult，从而驱动服务端产出 text / tool_card / usage / result 帧�
 
 import asyncio
 import json
+import sys
 import time
 from pathlib import Path
 
@@ -26,6 +27,7 @@ import research_assistant.web.chat as chat_mod  # noqa: E402
 from research_assistant.agent import AgentResult  # noqa: E402
 from research_assistant.kernel.approval import ToolApprovalRequest  # noqa: E402
 from research_assistant.llm.base import LLMResponse  # noqa: E402
+from research_assistant.tools.registry import ToolRegistry  # noqa: E402
 from research_assistant.web.chat import (  # noqa: E402
     extract_artifact_paths,
     router,
@@ -270,7 +272,8 @@ class TestWsChatTurn:
         with TestClient(app) as client:
             with client.websocket_connect("/ws/chat") as ws:
                 hello = ws.receive_json()
-                assert hello == {"type": "connected", "session_id": hello["session_id"]}
+                assert hello["type"] == "connected"
+                assert set(hello) == {"type", "session_id", "outputs_dir"}
 
                 ws.send_json({"action": "user", "text": "画个图"})
                 frames = _collect_until(ws, ("result",))
@@ -378,7 +381,8 @@ class TestWsChatTurn:
         with TestClient(app) as client:
             with client.websocket_connect("/ws/chat?session=ghost") as ws:
                 assert ws.receive_json() == {"type": "connected",
-                                             "session_id": "ghost"}
+                                             "session_id": "ghost",
+                                             "outputs_dir": "outputs/ghost"}
         assert (tmp_path / ".ra" / "sessions" / "ghost" / "run.json").is_file()
 
     def test_illegal_session_id_rejected(self, tmp_path, monkeypatch):
@@ -659,3 +663,162 @@ class TestExtractArtifactPaths:
 
     def test_non_dict_arguments_tolerated(self):
         assert extract_artifact_paths("write_file", None, "ok") == []
+
+
+# ---------------------------------------------------------------------------
+# R12 P2/B4: 会话产物目录接线（双轨制的会话侧）
+# ---------------------------------------------------------------------------
+
+
+class TestChatOutputsDir:
+    """连接即建 ``<工作区>/outputs/<sid>/`` 并全链路接线。
+
+    - 连接时建目录：frozen_exec 对不存在的 CWD 硬失败，不能推迟到首回合；
+    - run.json 落盘 outputs_dir（相对 POSIX 路径）；connected 帧为前端权威源
+      （REST 列表在工作区切换后会错接另一工作区的同名目录）；
+    - ToolRegistry(work_dir=根, write_anchor=产物目录, exec_cwd=产物目录)：
+      相对写入与 bash/run_python 默认 CWD 都归巢产物目录；
+    - POST 建会话**不**建产物目录（防零轮次孤儿）；旧会话重连惰性补建；
+    - 清退 / 删除会话时配对删除 outputs/<sid>。
+    """
+
+    @staticmethod
+    def _outputs(tmp_path: Path, sid: str) -> Path:
+        return tmp_path / "outputs" / sid
+
+    def test_connected_frame_creates_and_reports_outputs_dir(
+            self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _happy_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                hello = ws.receive_json()
+        sid = hello["session_id"]
+        assert hello["outputs_dir"] == f"outputs/{sid}"
+        assert self._outputs(tmp_path, sid).is_dir()
+
+    def test_run_json_persists_outputs_dir(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _happy_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                sid = ws.receive_json()["session_id"]
+        state = json.loads(
+            (tmp_path / ".ra" / "sessions" / sid / "run.json")
+            .read_text(encoding="utf-8"))
+        assert state["outputs_dir"] == f"outputs/{sid}"
+
+    def test_registry_anchored_and_cwd_homed(self, tmp_path, monkeypatch):
+        """ToolRegistry 三参口径：sandbox=根不变，anchor/exec_cwd=产物目录。"""
+        app = _make_app(tmp_path)
+        captured = _install_fakes(monkeypatch, _happy_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                sid = ws.receive_json()["session_id"]
+                ws.send_json({"action": "user", "text": "干活"})
+                _collect_until(ws, ("result",))
+        tools = captured["tools"]
+        assert isinstance(tools, ToolRegistry)
+        assert tools.work_dir == str(tmp_path)
+        assert tools.write_anchor == str(self._outputs(tmp_path, sid))
+        assert tools.exec_cwd == str(self._outputs(tmp_path, sid))
+
+    def test_post_does_not_create_outputs_dir(self, tmp_path):
+        """POST 只建会话目录——产物目录由 WS 连接补建，防零轮次孤儿。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        data = client.post("/api/chat/sessions").json()
+        assert not self._outputs(tmp_path, data["id"]).exists()
+
+    def test_reopen_legacy_session_lazily_creates_outputs_dir(
+            self, tmp_path, monkeypatch):
+        """B4 之前的旧会话（run.json 无 outputs_dir）重连时惰性补建。"""
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _happy_behavior)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions", json={"title": "旧"}).json()["id"]
+        # 手工抹掉 outputs_dir 字段模拟 legacy run.json（POST 本就不建目录）
+        state = json.loads(
+            (tmp_path / ".ra" / "sessions" / sid / "run.json")
+            .read_text(encoding="utf-8"))
+        state.pop("outputs_dir", None)
+        (tmp_path / ".ra" / "sessions" / sid / "run.json").write_text(
+            json.dumps(state), encoding="utf-8")
+
+        with TestClient(app) as tc:
+            with tc.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                hello = ws.receive_json()
+        assert hello["outputs_dir"] == f"outputs/{sid}"
+        assert self._outputs(tmp_path, sid).is_dir()
+
+    def test_summary_outputs_dir_null_for_legacy_session(self, tmp_path):
+        """列表摘要带 outputs_dir；legacy 会话为 null（前端空态兜底）。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        run_dir = tmp_path / ".ra" / "sessions" / "20200101_000000_legacy"
+        run_dir.mkdir(parents=True)
+        (run_dir / "run.json").write_text(json.dumps({
+            "mode": "chat", "query": "旧会话",
+            "created_at": 1.0, "updated_at": 2.0,
+        }), encoding="utf-8")
+        # 带一条用户消息：否则零轮次 + 远古时间戳会被 §6.4 清退掉
+        chat_mod._write_history(
+            run_dir, [{"role": "user", "content": "真实对话"}])
+
+        items = client.get("/api/chat/sessions").json()
+        assert items[0]["id"] == "20200101_000000_legacy"
+        assert items[0]["outputs_dir"] is None
+
+    def test_sweep_pairs_deletion_of_outputs_dir(self, tmp_path):
+        """零轮次清退时，outputs/<sid> 与会话目录 1:1 配对删除。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions", json={"title": "残骸"}).json()["id"]
+        out = self._outputs(tmp_path, sid)
+        out.mkdir(parents=True)
+        (out / "a.png").write_text("x", encoding="utf-8")
+        run_dir = tmp_path / ".ra" / "sessions" / sid
+        path = run_dir / "run.json"
+        state = json.loads(path.read_text(encoding="utf-8"))
+        state["updated_at"] = time.time() - 7200
+        path.write_text(json.dumps(state), encoding="utf-8")
+
+        items = client.get("/api/chat/sessions").json()
+        assert all(i["id"] != sid for i in items)
+        assert not run_dir.exists()
+        assert not out.exists()
+
+    def test_delete_session_pairs_deletion_of_outputs_dir(self, tmp_path):
+        """用户显式删除会话 → 其产物目录一并删除（不留孤儿）。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions").json()["id"]
+        out = self._outputs(tmp_path, sid)
+        out.mkdir(parents=True)
+
+        assert client.delete(f"/api/chat/sessions/{sid}").json() == {"ok": True}
+        assert not out.exists()
+
+
+class TestChatSystemInstructions:
+    """双绝对路径口径 + 执行契约注入（P1 的最后一个 choke point）。"""
+
+    @staticmethod
+    def _build(tmp_path: Path) -> str:
+        return chat_mod._chat_system_instructions(
+            tmp_path, tmp_path / "outputs" / "s1")
+
+    def test_contains_both_absolute_paths(self, tmp_path):
+        text = self._build(tmp_path)
+        assert str(tmp_path) in text           # 共享根：读共享数据用绝对路径
+        assert str(tmp_path / "outputs" / "s1") in text  # 产物目录
+
+    def test_dev_contract_has_no_run_script(self, tmp_path):
+        text = self._build(tmp_path)
+        assert "run_script" not in text
+
+    def test_frozen_contract_injected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        text = self._build(tmp_path)
+        assert "run_script" in text
+        assert "sys.executable" in text

@@ -3,11 +3,13 @@ import { Link } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
+import { candidatePreviewPaths, loadDockCollapsed, saveDockCollapsed } from "@/lib/artifacts";
 import { sessionTitle } from "@/lib/format";
 import { shouldShowWaitHint } from "@/lib/waitHint";
 import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
+import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
 import { Composer } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
@@ -22,7 +24,7 @@ const PHASE_DOT: Record<string, string> = {
   error: "bg-danger",
 };
 
-/** 会话页：会话列表二级栏 + 聊天流 + 审批卡 + 输入区。 */
+/** 会话页：会话列表二级栏 + 聊天流 + 审批卡 + 输入区 + 右侧产出 dock（R12 P3）。 */
 export function ChatView() {
   const {
     conn,
@@ -39,12 +41,39 @@ export function ChatView() {
   } = useChatStore();
 
   const [configured, setConfigured] = useState<boolean | null>(null);
-  const [previewPath, setPreviewPath] = useState<string | null>(null);
+  const [previewPaths, setPreviewPaths] = useState<string[] | null>(null);
   const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
   const [wsOpen, setWsOpen] = useState(false);
   const [toast, setToast] = useState("");
   const scrollRef = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
+
+  // ---- 产出 dock（C5）：折叠态记忆（与任务页共享）；xl(1280px) 以下默认收起 ----
+  const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
+  const toggleDock = useCallback(() => {
+    setDockCollapsed((prev) => {
+      const next = !prev;
+      saveDockCollapsed(next);
+      return next;
+    });
+  }, []);
+
+  // ---- 草稿入列（R12 P4）：未发送的新会话在左侧列表置顶高亮，点击聚焦输入框 --
+  const [draftFocusTick, setDraftFocusTick] = useState(0);
+
+  // dock 根目录：connected 帧权威，恢复期兜底会话摘要（旧会话两者皆空 → null）
+  const activeSummary = sessions.find((s) => s.id === chat.sessionId);
+  const dockRoot = chat.outputsDir ?? activeSummary?.outputs_dir ?? null;
+
+  // 回合结束（离开 running）→ 自增刷新信号，dock 免手动重载
+  const [dockRefreshKey, setDockRefreshKey] = useState(0);
+  const prevPhaseRef = useRef(chat.phase);
+  useEffect(() => {
+    if (prevPhaseRef.current === "running" && chat.phase !== "running") {
+      setDockRefreshKey((k) => k + 1);
+    }
+    prevPhaseRef.current = chat.phase;
+  }, [chat.phase]);
 
   // 等待看门狗（R9）：运行中若长时间没有任何可见输出（文本增量/工具卡），
   // 给出渐进提示——端点不可达时服务端要经历 超时×重试 才报错，不能让用户
@@ -98,7 +127,6 @@ export function ChatView() {
     [send, refreshSessions],
   );
 
-  const activeSummary = sessions.find((s) => s.id === chat.sessionId);
   const title = chat.sessionId
     ? sessionTitle(activeSummary?.title ?? null, activeSummary?.last_message ?? "")
     : chat.phase === "idle"
@@ -123,6 +151,8 @@ export function ChatView() {
           sessions={sessions}
           activeId={chat.sessionId}
           loading={sessionsLoading}
+          draftActive={chat.sessionId === null && chat.items.length === 0}
+          onDraftClick={() => setDraftFocusTick((t) => t + 1)}
           onNew={() => newSession()}
           onOpen={(id) => void openSession(id).then(() => refreshSessions()).catch(() => {})}
           onDelete={async (id) => {
@@ -200,7 +230,7 @@ export function ChatView() {
           chat={chat}
           scrollRef={scrollRef}
           onScroll={onScroll}
-          onOpenFile={setPreviewPath}
+          onOpenFile={(p) => setPreviewPaths(candidatePreviewPaths(p, dockRoot))}
           onPickSuggestion={(t) => void handleSend(t)}
         />
 
@@ -221,6 +251,7 @@ export function ChatView() {
         <Composer
           running={chat.phase === "running"}
           disabled={conn === "connecting"}
+          focusSignal={draftFocusTick}
           onSend={(t) => void handleSend(t)}
         />
 
@@ -240,6 +271,38 @@ export function ChatView() {
         </button>
       </div>
 
+      {/* 右侧产出 dock（R12 P3）：常驻可折叠；折叠为细条，展开为文件树+预览 */}
+      <div className="hidden shrink-0 border-l border-edge bg-canvas md:block">
+        {dockCollapsed ? (
+          <button
+            type="button"
+            onClick={toggleDock}
+            title="展开产出文件"
+            aria-label="展开产出文件面板"
+            className="flex h-full w-8 flex-col items-center gap-2 pt-3 text-ink-3 transition-colors hover:text-accent"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+              strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
+              <path d="m9 18 6-6-6-6" />
+            </svg>
+            <span
+              className="text-[11px] font-medium"
+              style={{ writingMode: "vertical-rl" }}
+            >
+              产出文件
+            </span>
+          </button>
+        ) : (
+          <div className="flex h-full w-72 flex-col">
+            <ArtifactsPanel
+              rootRelPath={dockRoot}
+              refreshKey={dockRefreshKey}
+              onCollapse={toggleDock}
+            />
+          </div>
+        )}
+      </div>
+
       {wsOpen && wsInfo && (
         <WorkspaceModal
           info={wsInfo}
@@ -257,8 +320,8 @@ export function ChatView() {
         />
       )}
 
-      {previewPath && (
-        <FilePreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+      {previewPaths && previewPaths.length > 0 && (
+        <FilePreviewModal paths={previewPaths} onClose={() => setPreviewPaths(null)} />
       )}
 
       {/* 轻提示 */}

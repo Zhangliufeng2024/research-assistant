@@ -13,6 +13,7 @@ async def run_python(
     code: str,
     timeout: int = 120,
     cwd: str = ".",
+    workspace_root: str | None = None,
 ) -> str:
     """Execute Python code and return stdout + stderr.
 
@@ -27,11 +28,15 @@ async def run_python(
         code: Python source code to execute.
         timeout: Timeout in seconds.
         cwd: Working directory for execution.
+        workspace_root: 工作区根绝对路径（冻结分支注入 WS 常量用；
+            开发态忽略）。
     """
     if getattr(sys, "frozen", False):
         from .frozen_exec import run_python_inprocess
 
-        return await run_python_inprocess(code, timeout=timeout, cwd=cwd)
+        return await run_python_inprocess(
+            code, timeout=timeout, cwd=cwd, workspace_root=workspace_root,
+        )
 
     temp_name = f"_ra_exec_{uuid.uuid4().hex[:8]}.py"
     temp_path = Path(cwd) / temp_name

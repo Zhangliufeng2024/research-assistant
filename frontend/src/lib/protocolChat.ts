@@ -21,6 +21,7 @@ export const APPROVAL_TIMEOUT_S = 120;
 export function emptyChat(): ChatState {
   return {
     sessionId: null,
+    outputsDir: null,
     items: [],
     cards: {},
     approval: null,
@@ -111,9 +112,21 @@ function mergeFiles(oldFiles: FileRef[], incoming: unknown): FileRef[] {
 export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
   switch (msg.type) {
     case "connected": {
-      if (!msg.session_id || msg.session_id === prev.sessionId) return prev;
+      // R12 B4：outputs_dir 是 dock 的权威源（REST 列表在工作区切换后会把
+      // dock 错接到另一工作区的同名目录）。旧服务端/空串归 null。
+      const dir =
+        typeof msg.outputs_dir === "string" && msg.outputs_dir
+          ? msg.outputs_dir
+          : null;
+      if (
+        !msg.session_id ||
+        (msg.session_id === prev.sessionId && dir === prev.outputsDir)
+      ) {
+        return prev;
+      }
       const c = clone(prev);
       c.sessionId = msg.session_id;
+      c.outputsDir = dir;
       return c;
     }
 

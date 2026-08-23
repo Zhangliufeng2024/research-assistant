@@ -20,6 +20,7 @@ from typing import Any
 
 from .agent import run_agent
 from .constants import OUTPUT_SUBDIRS
+from .core import execution_contract_addendum
 from .llm.factory import create_llm_client
 from .models import ProgressUpdate, TextUpdate, TokenUsage
 from .tools.registry import ToolRegistry
@@ -98,7 +99,8 @@ async def _run_sub_agent(  # noqa: PLR0913
     try:
         result = await run_agent(
             prompt=prompt,
-            system_prompt=system_prompt,
+            # R12 P1：legacy（RA_PIPELINE=false）路径同样注入执行契约
+            system_prompt=system_prompt + execution_contract_addendum(),
             llm_client=llm_client,
             tools=tool_registry,
             auto_continue=auto_continue,
@@ -237,12 +239,34 @@ _FIGURE_PROMPT = """Create a scientific figure.
 Paper: {paper_title}
 Figure: {figure_name} - {figure_description}
 Type: {figure_type}
-Output: {output_file}
+Output (absolute path): {output_file}
 
-Use:
-- Schematics: python {cwd}/.claude/skills/scientific-schematics/scripts/generate_schematic.py "{description}" -o {output_file}
-- Images: python {cwd}/.claude/skills/generate-image/scripts/nvidia_image_gen.py "{description}" -o {output_file}
-- Data plots: matplotlib via bash"""
+Primary path — data plots with matplotlib via the run_python tool:
+
+```python
+import matplotlib
+matplotlib.use("Agg")
+import matplotlib.pyplot as plt
+
+fig, ax = plt.subplots(figsize=(7, 4))
+# ... plot from real data here ...
+fig.savefig(r"{output_file}", dpi=200, bbox_inches="tight")
+print("saved", r"{output_file}")
+```
+
+Secondary path (best effort) — concept schematics via run_script inside run_python:
+
+```python
+run_script(
+    WS + r"/.claude/skills/scientific-schematics/scripts/generate_schematic.py",
+    [r"{description}", "-o", r"{output_file}"],
+)
+```
+
+Rules:
+- NEVER invoke python/pip via bash or subprocess (packaged builds have no system Python).
+- The output file MUST be exactly {output_file}; verify it exists after saving.
+- If the schematic script fails, fall back to a clean matplotlib diagram."""
 
 _ASSEMBLY_PROMPT = """Write the complete paper using python-docx via the run_python tool.
 

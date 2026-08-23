@@ -1,11 +1,15 @@
 import { sessionTitle, formatRelative } from "@/lib/format";
 import type { SessionSummary } from "@/lib/types";
 
-/** 会话列表（二级栏）：新建 + 按最近活跃排序的历史会话。 */
+/** 会话列表（二级栏）：新建 + 草稿行 + 按最近活跃排序的历史会话。
+ * draftActive 时置顶渲染高亮草稿行（点击聚焦输入框），✚ 按钮同时置灰——
+ * 「新会话」此刻就是草稿本身，避免重复入口（R12 P4）。 */
 export function SessionList({
   sessions,
   activeId,
   loading,
+  draftActive = false,
+  onDraftClick,
   onNew,
   onOpen,
   onDelete,
@@ -13,6 +17,10 @@ export function SessionList({
   sessions: SessionSummary[];
   activeId: string | null;
   loading: boolean;
+  /** 当前处于未发送的新会话状态。 */
+  draftActive?: boolean;
+  /** 点击草稿行：宿主聚焦输入框。 */
+  onDraftClick?: () => void;
   onNew: () => void;
   onOpen: (id: string) => void;
   onDelete: (id: string) => void;
@@ -23,7 +31,9 @@ export function SessionList({
         <button
           type="button"
           onClick={onNew}
-          className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-edge bg-surface px-3 py-2 text-[13px] font-medium shadow-sm transition-colors hover:border-accent/40 hover:text-accent-hover dark:hover:text-accent"
+          disabled={draftActive}
+          title={draftActive ? "新会话草稿已在列表中" : undefined}
+          className="flex w-full items-center justify-center gap-1.5 rounded-xl border border-edge bg-surface px-3 py-2 text-[13px] font-medium shadow-sm transition-colors enabled:hover:border-accent/40 enabled:hover:text-accent-hover dark:enabled:hover:text-accent disabled:cursor-not-allowed disabled:opacity-45"
         >
           <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
             strokeLinecap="round" className="h-4 w-4" aria-hidden>
@@ -34,8 +44,29 @@ export function SessionList({
       </div>
 
       <div className="min-h-0 flex-1 overflow-y-auto px-2 py-2">
-        {loading && sessions.length === 0 && (
+        {draftActive && (
+          <button
+            type="button"
+            onClick={onDraftClick}
+            className="mb-1 block w-full rounded-xl bg-accent-tint px-3 py-2.5 text-left ring-1 ring-accent/30 transition-colors hover:bg-accent-tint/80"
+            aria-label="回到未发送的新会话草稿"
+          >
+            <div className="truncate text-[13px] font-medium text-accent-hover dark:text-accent">
+              新会话
+              <span className="ml-1.5 rounded-md bg-surface px-1 py-px align-middle text-[10px] font-normal text-warn">
+                未发送
+              </span>
+            </div>
+            <div className="mt-0.5 text-[11px] text-ink-3">点击输入第一条消息</div>
+          </button>
+        )}
+        {loading && !draftActive && sessions.length === 0 && (
           <div className="px-3 py-6 text-center text-[12px] text-ink-3">加载中…</div>
+        )}
+        {!loading && !draftActive && sessions.length === 0 && (
+          <div className="px-3 py-6 text-center text-[12px] text-ink-3">
+            还没有历史会话
+          </div>
         )}
         {!loading && sessions.length === 0 && (
           <div className="px-3 py-6 text-center text-[12px] text-ink-3">

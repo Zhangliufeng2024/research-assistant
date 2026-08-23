@@ -1,5 +1,6 @@
 """Tests for research_assistant.core."""
 
+import sys
 import zipfile
 from pathlib import Path
 
@@ -8,6 +9,7 @@ import pytest
 from research_assistant.core import (
     create_data_context_message,
     ensure_output_folder,
+    execution_contract_addendum,
     extract_images_from_docx,
     get_api_key,
     get_data_extensions,
@@ -240,3 +242,45 @@ class TestSafeResolve:
         dotdot = sub / ".." / "b"
         result = safe_resolve(dotdot, tmp_path)
         assert str(result).startswith(str(tmp_path.resolve()))
+
+
+# ---------------------------------------------------------------------------
+# execution_contract_addendum（R12 P1：打包态执行环境契约）
+# ---------------------------------------------------------------------------
+
+class TestExecutionContract:
+    def test_frozen_text_covers_full_contract(self, monkeypatch):
+        """冻结态必须讲清四件事：禁 bash python、走 run_python、run_script
+        跑脚本、sys.executable 是应用本身（目标机事故的直接成因）。"""
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        text = execution_contract_addendum()
+        assert "run_python" in text
+        assert "run_script" in text
+        assert "禁止" in text
+        assert "sys.executable" in text
+        assert "WS" in text
+
+    def test_frozen_mentions_restart_consequence(self, monkeypatch):
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        text = execution_contract_addendum()
+        assert "重启" in text or "重新启动" in text
+
+    def test_dev_text_is_short_and_no_run_script(self, monkeypatch):
+        """开发态有真 Python，契约退化为短说明——不得出现 run_script
+        （该助手只在冻结子进程内注入，dev 提到只会误导模型）。"""
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        text = execution_contract_addendum()
+        assert "run_script" not in text
+        assert len(text) < len(execution_contract_addendum.__doc__ or "") + 200
+        frozen_len = self._frozen_len()
+        assert len(text) < frozen_len / 2
+
+    def _frozen_len(self) -> int:
+        import sys as _sys
+
+        orig = getattr(_sys, "frozen", False)
+        try:
+            _sys.frozen = True
+            return len(execution_contract_addendum())
+        finally:
+            _sys.frozen = orig

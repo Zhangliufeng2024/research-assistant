@@ -16,7 +16,13 @@ from typing import Protocol, runtime_checkable
 class ExecProvider(Protocol):
     async def run_bash(self, command: str, timeout: int, cwd: str) -> str: ...
 
-    async def run_python(self, code: str, timeout: int, cwd: str) -> str: ...
+    # workspace_root 为加性扩展（R12 P1）：冻结执行器需要工作区根来注入
+    # WS 常量；不能从 cwd 推导（会话模式下 cwd 是产物目录）。默认 None，
+    # 旧实现可忽略。
+    async def run_python(
+        self, code: str, timeout: int, cwd: str,
+        workspace_root: str | None = None,
+    ) -> str: ...
 
 
 class LocalExecProvider:
@@ -27,7 +33,13 @@ class LocalExecProvider:
 
         return await run_bash(command=command, timeout=timeout, cwd=cwd)
 
-    async def run_python(self, code: str, timeout: int, cwd: str) -> str:
+    async def run_python(
+        self, code: str, timeout: int, cwd: str,
+        workspace_root: str | None = None,
+    ) -> str:
         from .python_exec import run_python
 
-        return await run_python(code=code, timeout=timeout, cwd=cwd)
+        return await run_python(
+            code=code, timeout=timeout, cwd=cwd,
+            workspace_root=workspace_root,
+        )

@@ -232,7 +232,7 @@ export function PapersView() {
       {tab === "papers" ? <PapersTab /> : <FilesTab onOpenFile={setPreviewPath} />}
 
       {previewPath && (
-        <FilePreviewModal path={previewPath} onClose={() => setPreviewPath(null)} />
+        <FilePreviewModal paths={[previewPath]} onClose={() => setPreviewPath(null)} />
       )}
     </div>
   );

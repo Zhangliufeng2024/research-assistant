@@ -8,7 +8,7 @@
 ; 不写入 {app}；卸载只移除程序文件，不触碰任何用户数据。
 
 #define MyAppName "Research Assistant"
-#define MyAppVersion "3.3.3"
+#define MyAppVersion "3.4.0"
 #define MyAppPublisher "Zhangliufeng2024"
 #define MyAppExeName "ResearchAssistant.exe"
 

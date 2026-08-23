@@ -210,7 +210,9 @@ async def generate_paper(
     llm_client = build_llm_client(
         model=model, api_key=api_key, base_url=base_url, provider=provider,
     )
-    tool_registry = ToolRegistry(work_dir=str(work_dir))
+    # R12 P2/B5：单代理同样写入归巢论文目录（sandbox 围栏仍是工作区根）
+    tool_registry = ToolRegistry(
+        work_dir=str(work_dir), write_anchor=str(paper_output_dir))
 
     from .session.store import SessionStore
     single_session = SessionStore.create(

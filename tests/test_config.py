@@ -47,3 +47,29 @@ class TestBuildLlmClient:
         monkeypatch.delenv("LLM_API_KEY", raising=False)
         with pytest.raises(ValueError, match="No LLM API key"):
             build_llm_client()
+
+
+# ---------------------------------------------------------------------------
+# R12 P1：任务模式系统提示注入执行契约
+# ---------------------------------------------------------------------------
+
+class TestBuildSystemInstructionsContract:
+    def test_frozen_addendum_appended(self, tmp_path, monkeypatch):
+        import sys
+
+        from research_assistant.config import build_system_instructions
+
+        monkeypatch.setattr(sys, "frozen", True, raising=False)
+        text = build_system_instructions(tmp_path, "20260823_demo")
+        assert "WORKING DIRECTORY" in text
+        assert "run_script" in text
+        assert "sys.executable" in text
+
+    def test_dev_addendum_is_placeholder(self, tmp_path, monkeypatch):
+        import sys
+
+        from research_assistant.config import build_system_instructions
+
+        monkeypatch.setattr(sys, "frozen", False, raising=False)
+        text = build_system_instructions(tmp_path, "20260823_demo")
+        assert "run_script" not in text

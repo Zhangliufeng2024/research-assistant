@@ -604,3 +604,36 @@ class TestSteerPlumbing:
         assert usage, "pipeline 模式应推送至少一帧 usage"
         assert all(isinstance(u.get("budget"), dict) for u in usage)
         assert any(u.get("type") == "result" for u in updates)
+
+
+class TestSingleAgentWriteAnchor:
+    """R12 P2/B5：单代理模式的写入归巢——write_anchor=paper 输出目录。"""
+
+    async def test_single_mode_threads_paper_dir_as_anchor(
+            self, tmp_path, monkeypatch):
+        import research_assistant.api as api_mod
+
+        captured: dict = {}
+
+        class FakeAgent:
+            def __call__(self, *args, **kwargs):
+                captured.update(kwargs)
+                return self._run()
+
+            async def _run(self):
+                return AgentResult(text_output="done")
+
+        monkeypatch.setattr(api_mod, "setup_claude_skills", lambda *a, **k: None)
+        monkeypatch.setattr(api_mod, "run_agent", FakeAgent())
+        out_dir = tmp_path / "writing_outputs" / "paper"
+        out_dir.mkdir(parents=True)
+
+        updates = [u async for u in api_mod.generate_paper(
+            query="q", cwd=str(tmp_path), api_key="k",
+            output_dir=str(out_dir),
+        )]
+
+        assert updates[-1].get("type") == "result"
+        tools = captured["tools"]
+        assert tools.write_anchor == str(out_dir)
+        assert tools.work_dir == str(tmp_path)  # sandbox 围栏仍是工作区根

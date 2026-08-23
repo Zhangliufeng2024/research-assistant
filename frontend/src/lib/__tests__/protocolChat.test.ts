@@ -10,12 +10,44 @@ import {
 } from "../protocolChat";
 
 describe("reduceChat", () => {
+  it("emptyChat 初始 outputsDir 为 null（R12 C3）", () => {
+    expect(emptyChat().outputsDir).toBeNull();
+  });
+
   it("connected 设置 sessionId；同 id 幂等返回原引用", () => {
     const s0 = emptyChat();
     const s1 = reduceChat(s0, { type: "connected", session_id: "s1" });
     expect(s1.sessionId).toBe("s1");
     expect(reduceChat(s1, { type: "connected", session_id: "s1" })).toBe(s1);
     expect(reduceChat(s1, { type: "connected" })).toBe(s1);
+  });
+
+  it("connected 带 outputs_dir 写入 state；缺省/空串归 null（R12 B4 帧）", () => {
+    let s = emptyChat();
+    s = reduceChat(s, {
+      type: "connected", session_id: "s1",
+      outputs_dir: "outputs/s1",
+    });
+    expect(s.outputsDir).toBe("outputs/s1");
+
+    // 同 id 同目录：幂等
+    expect(
+      reduceChat(s, { type: "connected", session_id: "s1", outputs_dir: "outputs/s1" }),
+    ).toBe(s);
+
+    // 换会话：新目录覆盖
+    const s2 = reduceChat(s, {
+      type: "connected", session_id: "s2", outputs_dir: "outputs/s2",
+    });
+    expect(s2.outputsDir).toBe("outputs/s2");
+
+    // 旧服务端帧无该字段 / 空串 → null，不残留上一会话的值
+    const s3 = reduceChat(emptyChat(), { type: "connected", session_id: "s3" });
+    expect(s3.outputsDir).toBeNull();
+    const s4 = reduceChat(emptyChat(), {
+      type: "connected", session_id: "s4", outputs_dir: "",
+    });
+    expect(s4.outputsDir).toBeNull();
   });
 
   it("text 增量接续最后一个 text 气泡；空 delta 不产生变化", () => {
