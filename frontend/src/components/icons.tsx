@@ -99,3 +99,34 @@ export function IconMoon(props: IconProps) {
     </svg>
   );
 }
+
+/** 总览：项目主页（R15 导航收敛新增，lucide home 同风格）。 */
+export function IconHome(props: IconProps) {
+  return (
+    <svg {...strokeDefaults} {...props}>
+      <path d="m3 9 9-7 9 7v11a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2z" />
+      <path d="M9 22V12h6v10" />
+    </svg>
+  );
+}
+
+/** 研究工作台：锥形瓶（R15 导航收敛新增，lucide flask-conical 同风格）。 */
+export function IconFlask(props: IconProps) {
+  return (
+    <svg {...strokeDefaults} {...props}>
+      <path d="M10 2v7.5a2 2 0 0 1-.2.9L4.7 20.5a1 1 0 0 0 .9 1.5h12.8a1 1 0 0 0 .9-1.5L14.2 10.4a2 2 0 0 1-.2-.9V2" />
+      <path d="M8.5 2h7" />
+      <path d="M7 16h10" />
+    </svg>
+  );
+}
+
+/** 通知入口：铃铛（R15 侧栏撤出通知中心后的顶栏入口）。 */
+export function IconBell(props: IconProps) {
+  return (
+    <svg {...strokeDefaults} {...props}>
+      <path d="M6 8a6 6 0 0 1 12 0c0 7 3 9 3 9H3s3-2 3-9" />
+      <path d="M10.3 21a1.94 1.94 0 0 0 3.4 0" />
+    </svg>
+  );
+}

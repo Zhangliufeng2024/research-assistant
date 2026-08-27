@@ -17,6 +17,7 @@ zero with a warning so cost tracking degrades gracefully instead of lying.
 from __future__ import annotations
 
 import os
+import threading
 import time
 from dataclasses import dataclass, field
 
@@ -121,6 +122,17 @@ class BudgetVerdict:
         return not self.exceeded_reasons
 
 
+@dataclass
+class BudgetReservation:
+    """Capacity reserved atomically for one in-flight LLM request."""
+
+    max_output_tokens: int
+    reserved_tokens: int = 0
+    reserved_cost_usd: float = 0.0
+    warnings: list[str] = field(default_factory=list)
+    active: bool = True
+
+
 class BudgetGuard:
     """Accumulates usage and enforces :class:`BudgetLimits`."""
 
@@ -149,10 +161,26 @@ class BudgetGuard:
             not self.limits.max_cost_usd or price_known
         )
         self._warned: set[str] = set()
+        self._lock = threading.Lock()
+        self._reserved_turns = 0
+        self._reserved_tokens = 0
+        self._reserved_cost_usd = 0.0
+
+    def set_model(self, model: str) -> None:
+        """Update model metadata and pricing for subsequent reservations."""
+        with self._lock:
+            self.model = model
+            self.prices = price_for(model)
+            price_known = bool(
+                self.prices.get("input") or self.prices.get("output")
+            )
+            self.cost_cap_enforceable = (
+                not self.limits.max_cost_usd or price_known
+            )
 
     # -- accumulation -------------------------------------------------------
 
-    def record(self, response: LLMResponse) -> None:
+    def _record_unlocked(self, response: LLMResponse) -> None:
         u = response.usage
         s = self.state
         s.input_tokens += u.input_tokens
@@ -168,10 +196,125 @@ class BudgetGuard:
             + u.cache_read_input_tokens * p["cache_read"]
         ) / 1_000_000.0
 
+    def record(self, response: LLMResponse) -> None:
+        """Record a completed unreserved call (legacy/direct API)."""
+        with self._lock:
+            self._record_unlocked(response)
+
+    def reserve(
+        self,
+        *,
+        max_output_tokens: int,
+        estimated_input_tokens: int = 0,
+    ) -> BudgetReservation:
+        """Atomically reserve capacity for an in-flight request.
+
+        The returned output cap may be lower than requested when a token or
+        enforceable cost limit is close.  Concurrent callers therefore cannot
+        all pass the same pre-call check and oversubscribe the shared budget.
+        """
+        requested = max(1, int(max_output_tokens))
+        estimated_input = max(0, int(estimated_input_tokens))
+        with self._lock:
+            elapsed = time.monotonic() - self.started_at
+            lim = self.limits
+            s = self.state
+            reasons: list[str] = []
+
+            if lim.max_turns and s.turns + self._reserved_turns >= lim.max_turns:
+                reasons.append(
+                    f"turn limit reached ({s.turns + self._reserved_turns}/{lim.max_turns})"
+                )
+            if lim.max_wall_seconds and elapsed >= lim.max_wall_seconds:
+                reasons.append(
+                    f"wall-clock limit reached ({elapsed:.0f}s/{lim.max_wall_seconds:.0f}s)"
+                )
+            if reasons:
+                raise BudgetExceededError("; ".join(reasons))
+
+            allowed_output = requested
+            if lim.max_total_tokens:
+                remaining = (
+                    lim.max_total_tokens - s.total_tokens - self._reserved_tokens
+                    - estimated_input
+                )
+                if remaining <= 0:
+                    raise BudgetExceededError(
+                        "token limit reached "
+                        f"({s.total_tokens + self._reserved_tokens}/"
+                        f"{lim.max_total_tokens})"
+                    )
+                allowed_output = min(allowed_output, remaining)
+
+            input_unit_price = max(
+                self.prices["input"],
+                self.prices["cache_write"],
+                self.prices["cache_read"],
+            )
+            input_cost = estimated_input * input_unit_price / 1_000_000.0
+            if lim.max_cost_usd and self.cost_cap_enforceable:
+                remaining_cost = (
+                    lim.max_cost_usd - s.cost_usd - self._reserved_cost_usd
+                    - input_cost
+                )
+                if remaining_cost <= 0:
+                    raise BudgetExceededError(
+                        f"cost limit reached (${s.cost_usd + self._reserved_cost_usd:.2f}/"
+                        f"${lim.max_cost_usd:.2f})"
+                    )
+                output_price = self.prices["output"]
+                if output_price > 0:
+                    affordable = int(remaining_cost * 1_000_000.0 / output_price)
+                    if affordable <= 0:
+                        raise BudgetExceededError(
+                            f"cost limit reached (${s.cost_usd + self._reserved_cost_usd:.2f}/"
+                            f"${lim.max_cost_usd:.2f})"
+                        )
+                    allowed_output = min(allowed_output, affordable)
+
+            reserved_tokens = estimated_input + allowed_output
+            reserved_cost = input_cost + (
+                allowed_output * self.prices["output"] / 1_000_000.0
+            )
+            self._reserved_turns += 1
+            self._reserved_tokens += reserved_tokens
+            self._reserved_cost_usd += reserved_cost
+            return BudgetReservation(
+                max_output_tokens=allowed_output,
+                reserved_tokens=reserved_tokens,
+                reserved_cost_usd=reserved_cost,
+                warnings=self._warnings(elapsed),
+            )
+
+    def release(self, reservation: BudgetReservation) -> None:
+        """Release an unfinished request reservation."""
+        with self._lock:
+            if not reservation.active:
+                return
+            self._reserved_turns -= 1
+            self._reserved_tokens -= reservation.reserved_tokens
+            self._reserved_cost_usd -= reservation.reserved_cost_usd
+            reservation.active = False
+
+    def commit(self, reservation: BudgetReservation, response: LLMResponse) -> None:
+        """Replace a reservation with the completed request's actual usage."""
+        with self._lock:
+            if not reservation.active:
+                raise RuntimeError("budget reservation is no longer active")
+            self._reserved_turns -= 1
+            self._reserved_tokens -= reservation.reserved_tokens
+            self._reserved_cost_usd -= reservation.reserved_cost_usd
+            reservation.active = False
+            self._record_unlocked(response)
+
     # -- checking -----------------------------------------------------------
 
     def check(self) -> BudgetVerdict:
         """Return current verdict; raise BudgetExceededError on hard breach."""
+        with self._lock:
+            return self._check_unlocked()
+
+    def _check_unlocked(self) -> BudgetVerdict:
         s = self.state
         lim = self.limits
         verdict = BudgetVerdict()
@@ -216,24 +359,28 @@ class BudgetGuard:
     # -- reporting ----------------------------------------------------------
 
     def snapshot(self, include_elapsed: bool = True) -> dict:
-        s = self.state
-        d = {
-            "model": self.model,
-            "input_tokens": s.input_tokens,
-            "output_tokens": s.output_tokens,
-            "cache_creation_tokens": s.cache_creation_tokens,
-            "cache_read_tokens": s.cache_read_tokens,
-            "total_tokens": s.total_tokens,
-            "turns": s.turns,
-            "cost_usd": round(s.cost_usd, 4),
-            "cost_cap_enforceable": self.cost_cap_enforceable,
-            "limits": {
-                "max_cost_usd": self.limits.max_cost_usd,
-                "max_total_tokens": self.limits.max_total_tokens,
-                "max_turns": self.limits.max_turns,
-                "max_wall_seconds": self.limits.max_wall_seconds,
-            },
-        }
-        if include_elapsed:
-            d["elapsed_seconds"] = round(time.monotonic() - self.started_at, 1)
-        return d
+        with self._lock:
+            s = self.state
+            d = {
+                "model": self.model,
+                "input_tokens": s.input_tokens,
+                "output_tokens": s.output_tokens,
+                "cache_creation_tokens": s.cache_creation_tokens,
+                "cache_read_tokens": s.cache_read_tokens,
+                "total_tokens": s.total_tokens,
+                "turns": s.turns,
+                "cost_usd": round(s.cost_usd, 4),
+                "cost_cap_enforceable": self.cost_cap_enforceable,
+                "in_flight": self._reserved_turns,
+                "reserved_tokens": self._reserved_tokens,
+                "reserved_cost_usd": round(self._reserved_cost_usd, 4),
+                "limits": {
+                    "max_cost_usd": self.limits.max_cost_usd,
+                    "max_total_tokens": self.limits.max_total_tokens,
+                    "max_turns": self.limits.max_turns,
+                    "max_wall_seconds": self.limits.max_wall_seconds,
+                },
+            }
+            if include_elapsed:
+                d["elapsed_seconds"] = round(time.monotonic() - self.started_at, 1)
+            return d

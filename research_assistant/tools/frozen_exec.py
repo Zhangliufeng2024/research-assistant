@@ -15,6 +15,7 @@
 """
 
 import asyncio
+import logging
 import multiprocessing
 import os
 import sys
@@ -26,6 +27,8 @@ from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
 
 #: 子进程 join 的额外宽限（秒）：join 自带超时，这里只是防御性余量。
 _JOIN_GRACE_S = 10
+
+logger = logging.getLogger(__name__)
 
 
 def _make_script_runner():
@@ -118,6 +121,15 @@ async def run_python_inprocess(
         prefix="_ra_exec_out_", suffix=".txt", dir=str(work_dir))
     os.close(fd)
 
+    # 窗口闪烁结论（Bug B 排查证据）：CPython 的 spawn 启动器
+    # （multiprocessing/popen_spawn_win32.Popen._launch，3.13 实读确认）调用
+    # ``_winapi.CreateProcess`` 时 creationflags=0（仅 STARTF_FORCEOFFFEEDBACK），
+    # 且 multiprocessing.Process 不向用户暴露 creationflags 参数——此处无法
+    # 传 CREATE_NO_WINDOW。不会闪窗的依据：发布构建为 --noconsole（GUI 子
+    # 系统，见 build.py R7），GUI 子系统进程经 CreateProcess 派生时**不自动
+    # 分配控制台**——子进程（同一 exe）继承父进程的无窗状态；--debug-console
+    # 构建与开发态下子进程直接继承父控制台，同样无新窗。注意若未来改回
+    # console 子系统构建，flags=0 的 spawn 子进程会闪独立控制台窗，需重评。
     ctx = multiprocessing.get_context("spawn")
     proc = ctx.Process(
         target=_child_main,
@@ -140,13 +152,20 @@ async def run_python_inprocess(
         try:
             os.unlink(out_path)
         except OSError:
-            pass
+            # 修复 E：清理失败不再静默 pass——留 WARNING 供诊断（文件被占用等）
+            logger.warning(
+                "清理子进程输出临时文件失败: %s", out_path, exc_info=True)
 
     if timed_out:
         result = (
             f"{result}\n\nError: Python code timed out after {timeout} "
             "seconds (process terminated)"
         ).strip()
+    elif proc.exitcode not in (0, None):
+        # 修复 E：_child_main 捕获了脚本异常，正常路径 exitcode 恒为 0；
+        # 非 0 只可能是子进程级故障（os._exit / native 崩溃 / 内存耗尽），
+        # 此时输出可能为空或不完整，必须显式回报而不是静默成功。
+        result = f"{result}\n\n[执行器] 子进程异常退出，exitcode={proc.exitcode}".strip()
     if len(result) > OUTPUT_TRUNCATION_LIMIT:
         result = (
             result[:OUTPUT_TRUNCATION_HALF]

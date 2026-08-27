@@ -50,3 +50,26 @@ export function sessionTitle(title: string | null, lastMessage: string): string 
   const l = (lastMessage || "").trim();
   return l ? l.slice(0, 30) : "未命名会话";
 }
+
+/* ---------- 审批倒计时（R13-C，纯函数供 vitest 覆盖） ---------- */
+
+/** 剩余秒数（向上取整）；已过期为 0，负值截到 0。 */
+export function remainingSeconds(deadlineMs: number, nowMs: number): number {
+  return Math.max(0, Math.ceil((deadlineMs - nowMs) / 1000));
+}
+
+/** 进度条比例：剩余 / 总时长，夹在 [0,1]。 */
+export function remainingRatio(
+  deadlineMs: number,
+  nowMs: number,
+  timeoutS: number,
+): number {
+  const total = timeoutS * 1000;
+  if (total <= 0) return 0;
+  return Math.min(1, Math.max(0, (deadlineMs - nowMs) / total));
+}
+
+/** 是否已过截止：后端超时自动 deny 且不发清除帧，前端据此本地置灰。 */
+export function approvalExpired(deadlineMs: number, nowMs: number): boolean {
+  return deadlineMs - nowMs <= 0;
+}

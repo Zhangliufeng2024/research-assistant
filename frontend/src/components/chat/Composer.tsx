@@ -1,20 +1,44 @@
 import { useEffect, useRef, useState } from "react";
+import type { AttachmentRef } from "@/lib/types";
+
+/** 发送结果串（与 chatStore.send 对齐）；undefined 视同成功。 */
+type SendResult = "ok" | "empty" | "offline" | void;
+
+/** 附加结果串（与 chatStore.attachFiles 对齐）。 */
+type AttachResult = "ok" | "empty" | "offline" | "limit" | void;
 
 /** 输入区：Enter 发送 / Shift+Enter 换行；运行中占位符切换为引导语义。
- * focusSignal 自增时把焦点拉回输入框（草稿入列点击聚焦，R12 P4）。 */
+ * focusSignal 自增时把焦点拉回输入框（草稿入列点击聚焦，R12 P4）。
+ * R13-B：onSend 返回非 ok 状态串时恢复草稿——发送失败还清空输入框，
+ * 用户只能眼睁睁看着写好的话消失。
+ * R16 附件：📎 选择 / 拖拽文件到输入区 / 粘贴截图均可加入待发附件，
+ * 上传即时走 REST（chips 展示），随下一条消息一并发送。 */
 export function Composer({
   running,
   disabled,
   focusSignal = 0,
+  pendingAttachments,
+  attaching,
   onSend,
+  onAttach,
+  onRemoveAttachment,
 }: {
   running: boolean;
   disabled?: boolean;
   focusSignal?: number;
-  onSend: (text: string) => void;
+  pendingAttachments: AttachmentRef[];
+  /** 附件上传进行中：发送钮一并禁用（避免消息先于附件引用发出） */
+  attaching: boolean;
+  onSend: (text: string) => SendResult | Promise<SendResult>;
+  onAttach: (files: File[]) => AttachResult | Promise<AttachResult>;
+  onRemoveAttachment: (path: string) => void;
 }) {
   const [value, setValue] = useState("");
+  const [dragOver, setDragOver] = useState(false);
   const ref = useRef<HTMLTextAreaElement>(null);
+  const fileRef = useRef<HTMLInputElement>(null);
+  // 拖拽计数：子元素 dragenter/dragleave 成对触发，用计数抵消抖动
+  const dragDepth = useRef(0);
 
   useEffect(() => {
     if (focusSignal > 0) ref.current?.focus();
@@ -22,8 +46,12 @@ export function Composer({
 
   function submit() {
     const v = value.trim();
-    if (!v || disabled) return;
-    onSend(v);
+    if (!v || disabled || attaching) return;
+    // 先乐观清空（打字流畅度优先），失败再原样恢复草稿
+    // （光标位置不强求——失败是异常路径，话还在比什么都重要）
+    Promise.resolve(onSend(v)).then((r) => {
+      if (r !== undefined && r !== "ok") setValue(v);
+    });
     setValue("");
     // 清空后恢复高度
     requestAnimationFrame(() => {
@@ -31,10 +59,93 @@ export function Composer({
     });
   }
 
+  function addFiles(list: FileList | File[] | null) {
+    if (!list) return;
+    const files = Array.from(list);
+    if (files.length === 0) return;
+    void Promise.resolve(onAttach(files));
+  }
+
   return (
     <div className="px-4 pb-4">
       <div className="mx-auto max-w-3xl">
-        <div className="flex items-end gap-2 rounded-2xl border border-edge bg-surface p-2 shadow-card transition-colors focus-within:border-accent/50">
+        <div
+          className={`flex items-end gap-2 rounded-2xl border bg-surface p-2 shadow-card transition-colors focus-within:border-accent/50 ${
+            dragOver ? "border-accent bg-accent-tint" : "border-edge"
+          }`}
+          onDragEnter={(e) => {
+            e.preventDefault();
+            dragDepth.current += 1;
+            setDragOver(true);
+          }}
+          onDragOver={(e) => e.preventDefault()}
+          onDragLeave={(e) => {
+            e.preventDefault();
+            dragDepth.current -= 1;
+            if (dragDepth.current <= 0) {
+              dragDepth.current = 0;
+              setDragOver(false);
+            }
+          }}
+          onDrop={(e) => {
+            e.preventDefault();
+            dragDepth.current = 0;
+            setDragOver(false);
+            addFiles(e.dataTransfer?.files ?? null);
+          }}
+        >
+          {/* 待发附件 chips：上传完成即显示，✕ 移除 */}
+          {(pendingAttachments.length > 0 || attaching) && (
+            <div className="flex w-full flex-wrap gap-1.5 px-1 pb-1.5">
+              {attaching && (
+                <span className="flex items-center gap-1 rounded-lg border border-edge bg-surface-2 px-2 py-0.5 text-[11px] text-ink-3">
+                  <span className="h-3 w-3 animate-spin rounded-full border-2 border-ink-3 border-t-transparent" />
+                  上传中…
+                </span>
+              )}
+              {pendingAttachments.map((a) => (
+                <span
+                  key={a.path}
+                  className="flex items-center gap-1 rounded-lg border border-edge bg-surface-2 px-2 py-0.5 text-[11px] text-ink-2"
+                >
+                  <span aria-hidden>📎</span>
+                  <span className="max-w-[10rem] truncate">{a.name}</span>
+                  <button
+                    type="button"
+                    aria-label={`移除附件 ${a.name}`}
+                    onClick={() => onRemoveAttachment(a.path)}
+                    className="text-ink-3 transition-colors hover:text-danger"
+                  >
+                    ✕
+                  </button>
+                </span>
+              ))}
+            </div>
+          )}
+          <input
+            ref={fileRef}
+            type="file"
+            multiple
+            className="hidden"
+            tabIndex={-1}
+            onChange={(e) => {
+              addFiles(e.target.files);
+              e.target.value = ""; // 允许重复选择同一文件
+            }}
+          />
+          <button
+            type="button"
+            onClick={() => fileRef.current?.click()}
+            disabled={disabled || attaching}
+            aria-label="添加附件"
+            title="添加附件（也可拖拽或粘贴）"
+            className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-surface-2 text-ink-3 transition-all hover:text-accent disabled:opacity-40"
+          >
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+              strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
+              <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l8.57-8.57A4 4 0 1 1 18 8.84l-8.59 8.57a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </button>
           <textarea
             ref={ref}
             value={value}
@@ -54,14 +165,22 @@ export function Composer({
                 submit();
               }
             }}
+            onPaste={(e) => {
+              // 剪贴板带文件（如截图）→ 转附件；纯文本走默认粘贴
+              const files = Array.from(e.clipboardData?.files ?? []);
+              if (files.length > 0) {
+                e.preventDefault();
+                addFiles(files);
+              }
+            }}
           />
           <button
             type="button"
             onClick={submit}
-            disabled={!value.trim() || disabled}
+            disabled={!value.trim() || disabled || attaching}
             aria-label={running ? "发送引导指令" : "发送消息"}
             className={`flex h-9 w-9 shrink-0 items-center justify-center rounded-xl transition-all ${
-              value.trim() && !disabled
+              value.trim() && !disabled && !attaching
                 ? "bg-accent text-white hover:bg-accent-hover"
                 : "bg-surface-2 text-ink-3"
             }`}
@@ -74,7 +193,7 @@ export function Composer({
           </button>
         </div>
         <div className="mt-1.5 text-center text-[11px] text-ink-3">
-          Enter 发送 · Shift+Enter 换行{running ? " · 运行中的消息将作为引导注入下一步" : ""}
+          Enter 发送 · Shift+Enter 换行{running ? " · 运行中的消息将作为引导注入下一步" : " · 可拖拽/粘贴附件"}
         </div>
       </div>
     </div>

@@ -1,7 +1,8 @@
 /* WebSocket 客户端（命名通道：task = /ws/generate，chat = /ws/chat）。
  *
- * 双通道并存是有意的：从运行中的任务切到会话页不应断开生成连接
- * （服务端在连接断开时会置位 cancel_event 终止生成，docs/protocol.md §5.2）。
+ * 双通道并存是有意的：从运行中的任务切到会话页不应断开生成连接。
+ * 生成任务在服务端后台执行，断开只是停止观察；重连用 observe 协议回放
+ * 错过的事件（docs/protocol.md §5.3）。
  * 有意不做自动重连——静默重连只会造成「看起来还在跑」的假象；
  * 断开由 UI 层给出明确横幅，pipeline 任务可从运行历史一键续跑。
  * （移植自旧前端 ws.js；socket 登记表为模块级，路由切换不断连。）
@@ -79,12 +80,17 @@ export function wsConnect({
     onMessage?.(msg);
   };
   sock.onerror = () => {
+    // R13-G：身份守卫同样覆盖状态上报——旧 socket 的迟到 onerror/onclose
+    // 属于已被接任的连接，状态归新连接管，不得用旧回调污染
+    // （典型症状：新会话刚 open，横幅却被旧连的 closed/error 打成断连）。
+    if (socks.get(channel) !== sock) return;
     onStatus?.("error");
   };
   sock.onclose = () => {
+    if (socks.get(channel) !== sock) return;
     // 身份守卫：仅当表里仍是本 socket 才清除——重连竞态下旧 socket 的
     // onclose 迟到触发时，不能误删已接任的新连接。
-    if (socks.get(channel) === sock) socks.delete(channel);
+    socks.delete(channel);
     onStatus?.(opened ? "closed" : "error");
   };
   return sock;

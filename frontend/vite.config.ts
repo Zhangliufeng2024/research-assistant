@@ -21,6 +21,26 @@ export default defineConfig({
     outDir: "../research_assistant/web/static",
     emptyOutDir: true,
     chunkSizeWarningLimit: 1500,
+    // R15 路由代码分割配套：重依赖拆 vendor chunk。react-vendor 是壳层
+    // 必需；motion 被 Toaster/向导静态引用仍属首屏；markdown/katex 只被
+    // lazy 视图引用，首屏不再加载（配合 React.lazy 的路由 chunk）。
+    rollupOptions: {
+      output: {
+        manualChunks: {
+          "react-vendor": ["react", "react-dom", "react-router-dom", "zustand"],
+          motion: ["framer-motion"],
+          markdown: [
+            "react-markdown",
+            "remark-gfm",
+            "remark-math",
+            "rehype-highlight",
+            "rehype-katex",
+            "highlight.js",
+          ],
+          katex: ["katex"],
+        },
+      },
+    },
   },
   server: {
     port: 5173,

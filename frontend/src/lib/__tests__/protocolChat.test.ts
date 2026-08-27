@@ -120,17 +120,31 @@ describe("reduceChat", () => {
     expect(s.approval).toBeNull();
   });
 
-  it("error 置错误态并清审批；done 在运行中收尾、空闲则原样返回", () => {
+  it("error 是伴随通知不翻相位；result(stop_reason=error) 才是出错终态", () => {
+    // 后端口径：失败回合先发 error 再发 result——error 只记录消息，
+    // 相位由唯一收尾帧 result 决定（否则绿点「已完成」与红横幅并存）。
     let s = reduceChat(emptyChat(), { type: "error", message: "boom" });
-    expect(s.phase).toBe("error");
+    expect(s.phase).toBe("idle"); // 请求级拒绝：无收尾帧，相位不动
     expect(s.error).toBe("boom");
 
+    let run = applyUserMessage(emptyChat(), "hi");
+    run = reduceChat(run, { type: "error", message: "模型调用失败" });
+    expect(run.phase).toBe("running");
+    run = reduceChat(run, { type: "result", stop_reason: "error" });
+    expect(run.phase).toBe("error");
+    expect(run.stopReason).toBe("error");
+
+    // 正常完成不受影响
+    let ok = applyUserMessage(emptyChat(), "hi");
+    ok = reduceChat(ok, { type: "result", stop_reason: "completed" });
+    expect(ok.phase).toBe("done");
+  });
+
+  it("chat 通道没有 done 帧：未知帧型一律原样返回（§9 容忍）", () => {
     const idle = emptyChat();
     expect(reduceChat(idle, { type: "done" })).toBe(idle);
-
-    let run = applyUserMessage(emptyChat(), "hi"); // 本地置 running
-    run = reduceChat(run, { type: "done" });
-    expect(run.phase).toBe("done");
+    const run = applyUserMessage(emptyChat(), "hi");
+    expect(reduceChat(run, { type: "done" })).toBe(run);
   });
 
   it("未知帧型原样返回", () => {

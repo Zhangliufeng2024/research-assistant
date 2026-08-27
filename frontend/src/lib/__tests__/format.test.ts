@@ -6,7 +6,12 @@
  * 这里把秒/毫秒两种输入的期望输出全部锁死。
  */
 import { describe, expect, it } from "vitest";
-import { formatRelative } from "@/lib/format";
+import {
+  approvalExpired,
+  formatRelative,
+  remainingRatio,
+  remainingSeconds,
+} from "@/lib/format";
 
 const NOW_S = Math.floor(Date.now() / 1000); // 从真实时钟派生，断言只依赖相对差
 
@@ -51,5 +56,31 @@ describe("formatRelative：其他合法输入", () => {
     expect(formatRelative("not-a-date")).toBe("");
     expect(formatRelative(null)).toBe("");
     expect(formatRelative(undefined)).toBe("");
+  });
+});
+
+/* ---------- 审批倒计时（R13-C） ---------- */
+
+describe("审批倒计时纯函数（R13-C）", () => {
+  const deadline = 1_000_000; // ms
+
+  it("remainingSeconds：向上取整、过期截 0", () => {
+    expect(remainingSeconds(deadline, deadline - 90_000)).toBe(90);
+    expect(remainingSeconds(deadline, deadline - 500)).toBe(1); // 0.5s → 向上取整
+    expect(remainingSeconds(deadline, deadline)).toBe(0);
+    expect(remainingSeconds(deadline, deadline + 60_000)).toBe(0); // 负值截 0
+  });
+
+  it("remainingRatio：夹在 [0,1]，总时长非法时为 0", () => {
+    expect(remainingRatio(deadline, deadline - 60_000, 120)).toBeCloseTo(0.5);
+    expect(remainingRatio(deadline, deadline - 999_999, 120)).toBe(1); // 上限夹取
+    expect(remainingRatio(deadline, deadline + 5_000, 120)).toBe(0);
+    expect(remainingRatio(deadline, 0, 0)).toBe(0);
+  });
+
+  it("approvalExpired：deadline 精确判定（后端超时自动 deny 的本地镜像）", () => {
+    expect(approvalExpired(deadline, deadline - 1)).toBe(false);
+    expect(approvalExpired(deadline, deadline)).toBe(true);
+    expect(approvalExpired(deadline, deadline + 1)).toBe(true);
   });
 });

@@ -1,12 +1,13 @@
 """Python code execution tool."""
 
 import asyncio
+import os
 import sys
 import uuid
 from pathlib import Path
 
 from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
-from .bash import _kill_process
+from .bash import _run_process, decode_process_output
 
 
 async def run_python(
@@ -46,24 +47,20 @@ async def run_python(
     except Exception as e:
         return f"Error writing temp file: {e}"
 
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            sys.executable, str(temp_path),
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
+        # Bug A 源头治理：给 python 子进程注入 PYTHONUTF8=1（完整环境副本），
+        # 让子进程的 print/文件读写默认 utf-8，减少乱码产生面；输出侧仍有
+        # decode_process_output 兜底链双保险。
+        child_env = {**os.environ, "PYTHONUTF8": "1"}
+        returncode, stdout, stderr = await _run_process(
+            [sys.executable, str(temp_path)], cwd=cwd, timeout=timeout,
+            env=child_env,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        if proc is not None:
-            await _kill_process(proc)
         return f"Error: Python code timed out after {timeout} seconds"
     except FileNotFoundError:
         return f"Error: Python interpreter not found: {sys.executable}"
     except Exception as e:
-        if proc is not None:
-            await _kill_process(proc)
         return f"Error executing Python code: {e}"
     finally:
         try:
@@ -73,14 +70,15 @@ async def run_python(
 
     output_parts = []
     if stdout:
-        output_parts.append(stdout.decode("utf-8", errors="replace"))
+        # Bug A：与 bash 同一解码兜底链（utf-8 strict → 本地编码 replace）
+        output_parts.append(decode_process_output(stdout))
     if stderr:
-        output_parts.append(stderr.decode("utf-8", errors="replace"))
+        output_parts.append(decode_process_output(stderr))
 
     result = "\n".join(output_parts).strip()
 
-    if proc.returncode != 0:
-        result = f"Exit code: {proc.returncode}\n{result}"
+    if returncode != 0:
+        result = f"Exit code: {returncode}\n{result}"
 
     if len(result) > OUTPUT_TRUNCATION_LIMIT:
         result = (

@@ -23,6 +23,10 @@ class ToolApprovalRequest:
     arguments: dict[str, Any] = field(default_factory=dict)
     turn: int = 0
     reason: str = ""                      # why the hook escalated to ask
+    agent_id: str = ""
+    agent_role: str = ""
+    request_id: str = ""
+    metadata: dict[str, Any] = field(default_factory=dict)
 
     def summary(self, max_args_chars: int = 300) -> str:
         try:

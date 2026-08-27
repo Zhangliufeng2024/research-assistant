@@ -35,5 +35,21 @@ export const api = {
       headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
       body: body !== undefined ? JSON.stringify(body) : undefined,
     }),
+  put: <T>(url: string, body?: unknown) =>
+    request<T>(url, {
+      method: "PUT",
+      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }),
+  patch: <T>(url: string, body?: unknown) =>
+    request<T>(url, {
+      method: "PATCH",
+      headers: body !== undefined ? { "Content-Type": "application/json" } : undefined,
+      body: body !== undefined ? JSON.stringify(body) : undefined,
+    }),
   del: <T>(url: string) => request<T>(url, { method: "DELETE" }),
+  /** multipart 上传（R16 附件）：不可手设 Content-Type——边界由浏览器生成。
+   * 超时放宽：附件可能远大于 JSON 负载。 */
+  upload: <T>(url: string, form: FormData, timeoutMs = 120_000) =>
+    request<T>(url, { method: "POST", body: form }, timeoutMs),
 };

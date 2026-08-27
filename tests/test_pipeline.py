@@ -60,6 +60,27 @@ class TestArtifactStore:
         b.write_text("changed")
         assert not store.all_valid("a", "b")
 
+    def test_manifest_replace_failure_preserves_previous_json(
+            self, tmp_path, monkeypatch):
+        first = tmp_path / "first.txt"
+        first.write_text("one")
+        store = ArtifactStore(tmp_path)
+        store.register("first", first, stage="s")
+        manifest = tmp_path / ".ra" / "artifacts" / "manifest.json"
+        previous = manifest.read_text(encoding="utf-8")
+
+        second = tmp_path / "second.txt"
+        second.write_text("two")
+        monkeypatch.setattr(
+            "research_assistant.core.os.replace",
+            lambda *args: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+        with pytest.raises(OSError, match="replace failed"):
+            store.register("second", second, stage="s")
+
+        assert manifest.read_text(encoding="utf-8") == previous
+        assert not list(manifest.parent.glob(".manifest.json.*.tmp"))
+
 
 # ---------------------------------------------------------------------------
 # SessionStore
@@ -103,6 +124,22 @@ class TestSessionStore:
         (tmp_path / "run.json").write_text("{not json", encoding="utf-8")
         store = SessionStore(tmp_path)
         assert store.state.status == "running"  # fresh state, no crash
+
+    def test_save_replace_failure_preserves_previous_json(
+            self, tmp_path, monkeypatch):
+        store = SessionStore.create(tmp_path, query="original", model="m")
+        run_file = tmp_path / "run.json"
+        previous = run_file.read_text(encoding="utf-8")
+        store.state.query = "changed"
+        monkeypatch.setattr(
+            "research_assistant.core.os.replace",
+            lambda *args: (_ for _ in ()).throw(OSError("replace failed")),
+        )
+        with pytest.raises(OSError, match="replace failed"):
+            store.save()
+
+        assert run_file.read_text(encoding="utf-8") == previous
+        assert not list(tmp_path.glob(".run.json.*.tmp"))
 
 
 # ---------------------------------------------------------------------------
@@ -250,6 +287,59 @@ async def test_full_pipeline_happy_path(tmp_path, monkeypatch, gate_stub):
 
 
 @pytest.mark.asyncio
+async def test_blocking_gate_failure_does_not_publish_final(
+        tmp_path, monkeypatch, gate_stub):
+    """Exhausted blocking gates must leave only drafts, never a final file."""
+    import research_assistant.gates as gates_pkg
+    from research_assistant.agent import AgentResult
+    from research_assistant.gates import GateResult
+
+    calls: list = []
+    base_agent = _make_fake_agent(calls, {})
+
+    async def fake_agent(stage_name, prompt, system_prompt, **kwargs):
+        if stage_name.startswith("revision_"):
+            calls.append(stage_name)
+            return AgentResult(stop_reason="completed")
+        return await base_agent(stage_name, prompt, system_prompt, **kwargs)
+
+    class FailingDocGate(gates_pkg.DocGate):
+        async def run(self, context):
+            return GateResult(
+                name="document", passed=False,
+                failures=["document remains incomplete"],
+            )
+
+    monkeypatch.setattr(
+        "research_assistant.pipeline.runner._run_stage_agent", fake_agent,
+    )
+    monkeypatch.setattr(gates_pkg, "DocGate", FailingDocGate)
+
+    from research_assistant.pipeline.runner import run_pipeline
+
+    out_dir = tmp_path / "run"
+    stale_final = out_dir / "final" / "manuscript.docx"
+    stale_final.parent.mkdir(parents=True)
+    stale_final.write_bytes(b"stale")
+
+    updates = await _collect(run_pipeline(
+        "q", "m", tmp_path, out_dir, max_revision_rounds=1,
+    ))
+
+    result = next(u for u in updates if u.get("type") == "result")
+    assert result["status"] == "failed"
+    assert result["compilation_success"] is False
+    assert "[document] document remains incomplete" in result["errors"]
+    assert not stale_final.exists()
+    assert (out_dir / "drafts" / "v1_draft.docx").exists()
+    assert "review" not in calls
+
+    session = SessionStore(out_dir)
+    assert session.state.status == "failed"
+    assert session.stage_status("gates") == "failed"
+
+
+@pytest.mark.asyncio
 async def test_pipeline_resume_skips_completed_stages(tmp_path, monkeypatch, gate_stub):
     calls: list = []
     monkeypatch.setattr(
@@ -312,11 +402,11 @@ async def test_pipeline_records_budget_snapshot(tmp_path, monkeypatch, gate_stub
 
     out_dir = tmp_path / "run"
     await _collect(run_pipeline(
-        "q", "claude-sonnet-4-6", tmp_path, out_dir,
+        "q", "claude-sonnet-5", tmp_path, out_dir,
         budget_limits=BudgetLimits(max_turns=100),
     ))
     state = SessionStore(out_dir).state
-    assert state.budget["model"] == "claude-sonnet-4-6"
+    assert state.budget["model"] == "claude-sonnet-5"
     assert state.budget["limits"]["max_turns"] == 100
 
 

@@ -1,33 +1,14 @@
-"""Restricted launcher — expires after 3 months (2026-09-15)."""
+"""Restricted launcher — thin delegate kept as a legacy packaging entry.
 
-import sys
-from datetime import date
+历史版本曾内置三个月试用到期门禁（到期即弹窗并退出进程、未到期则打印剩余
+天数），已于 2026-08 彻底移除。build.py --restricted 仍以本文件作为打包
+entry（产出 ResearchAssistant_Trial.exe），故保留此薄委托壳：本模块不再做
+任何门禁检查，仅在作为脚本执行时转发到 research_assistant.launcher.main()。
 
-EXPIRE_DATE = date(2026, 9, 15)
-
-
-def check_expiry():
-    today = date.today()
-    if today > EXPIRE_DATE:
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            root = tk.Tk()
-            root.withdraw()
-            messagebox.showerror(
-                "已过期",
-                f"此版本已于 {EXPIRE_DATE.isoformat()} 过期，请联系作者获取新版本。"
-            )
-            root.destroy()
-        except Exception:
-            print(f"此版本已于 {EXPIRE_DATE.isoformat()} 过期，请联系作者获取新版本。")
-        sys.exit(1)
-
-    remaining = (EXPIRE_DATE - today).days
-    print(f"授权有效期至 {EXPIRE_DATE.isoformat()}（剩余 {remaining} 天）")
-
+防回归锁见 tests/test_launcher_restricted.py。
+"""
 
 if __name__ == "__main__":
-    check_expiry()
     from research_assistant.launcher import main
+
     main()

@@ -1,8 +1,7 @@
 import { Fragment, type RefObject } from "react";
-import { motion } from "framer-motion";
 import { LogoMark } from "@/components/icons";
-import { Markdown } from "@/components/Markdown";
-import { ToolCardView } from "@/components/chat/ToolCardView";
+import { AssistantBubble, ToolCardRow, UserBubble } from "@/components/chat/MessageBubbles";
+import type { MessageOpResult } from "@/lib/messageOps";
 import type { ChatState } from "@/lib/types";
 
 const SUGGESTIONS = [
@@ -35,24 +34,38 @@ function EmptyHero({ onPick }: { onPick: (text: string) => void }) {
   );
 }
 
-/** 聊天流：用户气泡 / 助手文本 / 工具卡，按 items 顺序渲染。 */
+/** 聊天流：用户气泡 / 助手文本 / 工具卡，按 items 顺序渲染。
+ *
+ * R14-N：滚动容器 ref 由 usePinnedScroll 提供（贴底跟随 + 回底 pill），
+ * 本组件只负责把 ref 挂到真实 overflow 元素上。
+ * R14-R：每类气泡是 React.memo 组件（memo 边界见 MessageBubbles.tsx 头注），
+ * map 回调里禁止给它们传内联闭包——回调一律来自 ChatView 的 useCallback。
+ */
 export function MessageList({
   chat,
-  scrollRef,
-  onScroll,
+  containerRef,
+  opsEnabled,
   onOpenFile,
   onPickSuggestion,
+  onCopyMessage,
+  onRegenerate,
+  onEditSubmit,
 }: {
   chat: ChatState;
-  scrollRef: RefObject<HTMLDivElement>;
-  onScroll?: () => void;
+  containerRef: RefObject<HTMLDivElement>;
+  /** false=流式进行中，隐藏消息操作钮（regenerate/edit 此刻会被 busy 拒绝）。 */
+  opsEnabled: boolean;
   onOpenFile: (path: string) => void;
   onPickSuggestion: (text: string) => void;
+  onCopyMessage: (text: string) => void;
+  onRegenerate: (idx: number) => void;
+  onEditSubmit: (idx: number, newText: string) => Promise<MessageOpResult>;
 }) {
   const streaming = chat.phase === "running" && !chat.approval;
+  const lastIdx = chat.items.length - 1;
 
   return (
-    <div ref={scrollRef} onScroll={onScroll} className="min-h-0 flex-1 overflow-y-auto">
+    <div ref={containerRef} className="h-full overflow-y-auto">
       {chat.items.length === 0 ? (
         <EmptyHero onPick={onPickSuggestion} />
       ) : (
@@ -60,59 +73,41 @@ export function MessageList({
           {chat.items.map((item, i) => {
             if (item.kind === "user") {
               return (
-                <motion.div
+                <UserBubble
                   key={`${item.t}-${i}`}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.18 }}
-                  className="flex justify-end"
-                >
-                  <div className="relative max-w-[85%] rounded-2xl rounded-br-md bg-accent-tint px-4 py-2.5">
-                    <div className="whitespace-pre-wrap break-words text-[14.5px] leading-6">
-                      {item.text}
-                    </div>
-                    {item.steer && (
-                      <div className="mt-1 text-right text-[10.5px] text-accent-hover dark:text-accent">
-                        已作为引导注入
-                      </div>
-                    )}
-                  </div>
-                </motion.div>
+                  text={item.text}
+                  steer={item.steer}
+                  attachments={item.attachments}
+                  idx={i}
+                  opsEnabled={opsEnabled}
+                  onCopyMessage={onCopyMessage}
+                  onOpenFile={onOpenFile}
+                  onEditSubmit={onEditSubmit}
+                />
               );
             }
             if (item.kind === "tool") {
               const card = chat.cards[item.ref];
               if (!card) return null;
               return (
-                <motion.div
+                <ToolCardRow
                   key={`${item.t}-${i}`}
-                  initial={{ opacity: 0, y: 8 }}
-                  animate={{ opacity: 1, y: 0 }}
-                  transition={{ duration: 0.18 }}
-                  className="flex gap-3"
-                >
-                  <div className="min-w-0 flex-1">
-                    <ToolCardView card={card} onOpenFile={onOpenFile} />
-                  </div>
-                </motion.div>
+                  card={card}
+                  onOpenFile={onOpenFile}
+                />
               );
             }
             return (
-              <motion.div
+              <AssistantBubble
                 key={`${item.t}-${i}`}
-                initial={{ opacity: 0, y: 8 }}
-                animate={{ opacity: 1, y: 0 }}
-                transition={{ duration: 0.18 }}
-                className="flex gap-3"
-              >
-                <LogoMark className="mt-0.5 h-7 w-7 shrink-0 rounded-lg shadow-sm" />
-                <div className="min-w-0 flex-1">
-                  <Markdown>{item.text}</Markdown>
-                  {streaming && i === chat.items.length - 1 && (
-                    <span className="ml-0.5 inline-block h-4 w-[3px] translate-y-0.5 animate-pulse rounded-full bg-accent" />
-                  )}
-                </div>
-              </motion.div>
+                text={item.text}
+                showCursor={streaming && i === lastIdx}
+                partial={item.partial}
+                idx={i}
+                opsEnabled={opsEnabled}
+                onCopyMessage={onCopyMessage}
+                onRegenerate={onRegenerate}
+              />
             );
           })}
 

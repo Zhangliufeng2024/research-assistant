@@ -16,11 +16,26 @@ from ..constants import (
 )
 from ..models import TokenUsage
 from .base import LLMClient, LLMResponse, OnChunkCallback, ToolCall
-from .errors import classify_response
+from .errors import (
+    BadRequestError,
+    OverloadedError,
+    RateLimitError,
+    ServerError,
+    classify_response,
+)
 
 ANTHROPIC_DEFAULT_BASE_URL = "https://api.anthropic.com"
 
 _CACHE_CONTROL = {"type": "ephemeral"}
+
+# 流内 error 事件（HTTP 200 也可能出现，如中途 overloaded）→ 类型化异常映射。
+# retryable 的判定口径：与 classify_response 对同类错误的分类保持一致。
+_STREAM_ERROR_TYPES: dict[str, type] = {
+    "overloaded_error": OverloadedError,
+    "rate_limit_error": RateLimitError,
+    "timeout_error": ServerError,
+    "api_error": ServerError,
+}
 
 
 def _apply_cache_control(body: dict[str, Any]) -> None:
@@ -232,6 +247,27 @@ class AnthropicClient(LLMClient):
                 if etype == "message_start":
                     msg_usage = event.get("message", {}).get("usage", {})
                     usage.input_tokens = msg_usage.get("input_tokens", 0)
+                    # 缓存计量（缺陷 E）：与非流式 _parse_response 的字段对齐，
+                    # 否则流式调用在预算/成本口径里丢掉 cache 读写字量。
+                    usage.cache_creation_input_tokens = msg_usage.get(
+                        "cache_creation_input_tokens", 0)
+                    usage.cache_read_input_tokens = msg_usage.get(
+                        "cache_read_input_tokens", 0)
+
+                elif etype == "error":
+                    # 缺陷 C：HTTP 200 流内也可能收到 error 事件（最典型是
+                    # 中途 overloaded_error）——旧实现落入 continue，半截文
+                    # 被当成完整成功。这里显式抛类型化 LLMError，让上层重试
+                    # 链接管（已发布的半截文由 agent 的重试语义标注处理）。
+                    payload = event.get("error", {}) or {}
+                    error_type = str(payload.get("type", ""))
+                    message = str(payload.get("message", "")) or json.dumps(
+                        event, ensure_ascii=False)
+                    exc_cls = _STREAM_ERROR_TYPES.get(error_type, BadRequestError)
+                    raise exc_cls(
+                        f"Anthropic stream error ({error_type}): {message[:300]}",
+                        provider_type=error_type,
+                    )
 
                 elif etype == "content_block_start":
                     block = event.get("content_block", {})

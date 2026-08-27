@@ -20,9 +20,12 @@ Status labels
 from __future__ import annotations
 
 import asyncio
+import json
 import os
 import re
-from dataclasses import dataclass, field
+import time
+import weakref
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
 import httpx
@@ -39,6 +42,37 @@ _UNCERTAIN_THRESHOLD: float = 0.55
 _MAX_CONCURRENT: int = 4
 _REQUEST_DELAY: float = 0.35   # polite inter-request gap (seconds per slot)
 _HTTP_TIMEOUT: float = 12.0
+_CACHE_TTL_SECONDS: float = 30 * 24 * 60 * 60
+
+# Keep one connection pool per running event loop.  A module-global client
+# cannot safely be shared across ``asyncio.run`` loops (as used by the desktop
+# host and tests), while creating a client for every BibTeX batch defeats HTTP
+# keep-alive.  Weak keys let closed loops release their pool automatically;
+# the web lifespan calls ``close_shared_clients`` for an explicit shutdown.
+_SHARED_CLIENTS: weakref.WeakKeyDictionary[asyncio.AbstractEventLoop, httpx.AsyncClient] = (
+    weakref.WeakKeyDictionary()
+)
+
+
+def _shared_client() -> httpx.AsyncClient:
+    loop = asyncio.get_running_loop()
+    client = _SHARED_CLIENTS.get(loop)
+    if client is None or client.is_closed:
+        client = httpx.AsyncClient(
+            headers={"User-Agent": "ResearchAssistant/3.0 (citation-verifier)"},
+            limits=httpx.Limits(max_connections=8, max_keepalive_connections=4),
+        )
+        _SHARED_CLIENTS[loop] = client
+    return client
+
+
+async def close_shared_clients() -> None:
+    """Close citation HTTP pools owned by the current process."""
+    clients = list(_SHARED_CLIENTS.values())
+    _SHARED_CLIENTS.clear()
+    for client in clients:
+        if not client.is_closed:
+            await client.aclose()
 
 
 # ---------------------------------------------------------------------------
@@ -337,14 +371,18 @@ async def _verify_batch(
 
     async def _limited(ref, idx: int) -> CitationResult:
         async with semaphore:
-            await asyncio.sleep(idx * _REQUEST_DELAY)
+            # The old idx*delay slept for progressively longer while holding a
+            # semaphore slot (citation 30 waited >10s).  A fixed polite gap
+            # bounds load without turning the batch into a staircase.
+            if idx:
+                await asyncio.sleep(_REQUEST_DELAY)
             return await _verify_one(ref, client, ss_api_key, openalex_email)
 
-    async with httpx.AsyncClient(
-        headers={"User-Agent": "ResearchAssistant/3.0 (citation-verifier)"}
-    ) as client:
-        tasks = [_limited(ref, i) for i, ref in enumerate(refs)]
-        raw = await asyncio.gather(*tasks, return_exceptions=True)
+    # Reuse the per-event-loop pool so a multi-agent paper run does not create
+    # a fresh TCP/TLS connection for every citation batch.
+    client = _shared_client()
+    tasks = [_limited(ref, i) for i, ref in enumerate(refs)]
+    raw = await asyncio.gather(*tasks, return_exceptions=True)
 
     results: list = []
     for ref, outcome in zip(refs, raw, strict=False):
@@ -443,7 +481,35 @@ def _format_report(report: VerificationReport) -> str:
 # Public tool function
 # ---------------------------------------------------------------------------
 
-async def verify_bibtex_file(bib_file) -> VerificationReport:
+def _cache_key(ref) -> str:
+    doi = (getattr(ref, "doi", "") or "").strip().lower()
+    title = _normalize(ref.title or "")
+    return f"doi:{doi}" if doi else f"title:{title}"
+
+
+def _default_cache_path(bib_path: Path) -> Path:
+    # Standard pipeline layout is <run>/references/references.bib.
+    run_root = bib_path.parent.parent if bib_path.parent.name == "references" else bib_path.parent
+    return run_root / ".ra" / "citation_cache.json"
+
+
+def _load_cache(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        return data if isinstance(data, dict) else {}
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_cache(path: Path, cache: dict) -> None:
+    from ..core import atomic_write_text
+    path.parent.mkdir(parents=True, exist_ok=True)
+    atomic_write_text(path, json.dumps(cache, ensure_ascii=False, indent=2))
+
+
+async def verify_bibtex_file(
+    bib_file, *, cache_path: str | Path | None = None,
+) -> VerificationReport:
     """Programmatic citation verification for one .bib file.
 
     Parses *bib_file*, checks every entry against Crossref / Semantic
@@ -470,7 +536,38 @@ async def verify_bibtex_file(bib_file) -> VerificationReport:
 
     ss_api_key = os.getenv("SEMANTIC_SCHOLAR_API_KEY", "")
     openalex_email = os.getenv("OPENALEX_EMAIL", "")
-    results = await _verify_batch(refs, ss_api_key, openalex_email)
+    resolved_cache_path = Path(cache_path) if cache_path else _default_cache_path(bib_path)
+    cache = _load_cache(resolved_cache_path)
+    now = time.time()
+    results_by_key: dict[str, CitationResult] = {}
+    missing = []
+    for ref in refs:
+        key = _cache_key(ref)
+        cached = cache.get(key)
+        if isinstance(cached, dict) and now - float(cached.get("cached_at", 0)) <= _CACHE_TTL_SECONDS:
+            try:
+                result_data = dict(cached.get("result") or {})
+                result_data.update({
+                    "key": ref.key, "title": ref.title or "",
+                    "doi": getattr(ref, "doi", "") or "",
+                    "year": ref.year or 0, "authors": ref.authors or "",
+                })
+                results_by_key[ref.key] = CitationResult(**result_data)
+                continue
+            except (TypeError, ValueError):
+                pass
+        missing.append(ref)
+
+    fresh = await _verify_batch(missing, ss_api_key, openalex_email) if missing else []
+    for ref, result in zip(missing, fresh, strict=False):
+        results_by_key[ref.key] = result
+        cache[_cache_key(ref)] = {"cached_at": now, "result": asdict(result)}
+    if fresh:
+        try:
+            _save_cache(resolved_cache_path, cache)
+        except OSError:
+            pass
+    results = [results_by_key[ref.key] for ref in refs]
 
     report = VerificationReport(bib_path=str(bib_path), total=len(refs))
     for r in results:
@@ -501,11 +598,24 @@ async def verify_citations(
         when *output_file* is not specified.
     """
     bib_path = Path(bib_file)
+    out_path = Path(output_file) if output_file else None
     if sandbox:
+        sandbox_path = Path(sandbox)
         try:
-            bib_path = safe_resolve(bib_path, Path(sandbox))
+            bib_path = safe_resolve(
+                bib_path if bib_path.is_absolute() else sandbox_path / bib_path,
+                sandbox_path,
+            )
         except ValueError as e:
             return f"Error: {e}"
+        if out_path is not None:
+            try:
+                out_path = safe_resolve(
+                    out_path if out_path.is_absolute() else sandbox_path / out_path,
+                    sandbox_path,
+                )
+            except ValueError as e:
+                return f"Error: output_file path escapes sandbox: {e}"
 
     try:
         report = await verify_bibtex_file(bib_path)
@@ -517,14 +627,7 @@ async def verify_citations(
     report_md = _format_report(report)
 
     saved_to = ""
-    if output_file:
-        out_path = Path(output_file)
-        if sandbox:
-            try:
-                check_dir = out_path.parent if out_path.parent.exists() else out_path.parent.parent
-                safe_resolve(check_dir, Path(sandbox))
-            except ValueError as e:
-                return f"Error: output_file path escapes sandbox: {e}"
+    if out_path is not None:
         out_path.parent.mkdir(parents=True, exist_ok=True)
         out_path.write_text(report_md, encoding="utf-8")
         saved_to = str(out_path)

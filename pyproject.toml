@@ -9,7 +9,9 @@ dependencies = [
     "httpx>=0.27.0",
     "python-dotenv>=1.0.0",
     "requests>=2.31.0",
-    "pymupdf>=1.24.0",
+    "pypdf>=4.0",
+    "openpyxl>=3.1",
+    "pandas>=2.0",
     "python-docx>=1.1.0",
     "pyyaml>=6.0",
 ]
@@ -17,6 +19,8 @@ dependencies = [
 [project.optional-dependencies]
 web = ["fastapi>=0.115.0", "uvicorn[standard]>=0.30.0"]
 desktop = ["pywebview>=5.0"]
+# PDF→图片转换（.claude/skills/scientific-slides/scripts/pdf_to_images.py）专用
+pdf-images = ["pymupdf>=1.24.0"]
 
 # System Dependencies (must be installed separately):
 #
@@ -25,7 +29,10 @@ desktop = ["pywebview>=5.0"]
 #   - Linux: sudo apt-get install libreoffice
 #   - Windows: https://www.libreoffice.org/download/
 #
-# PDF to Image Conversion: PyMuPDF is included — no external software needed.
+# PDF handling: core PDF text extraction uses pypdf (a declared dependency).
+# PDF-to-image conversion needs the optional pymupdf extra:
+#   pip install "research-assistant[pdf-images]"
+# Packaged desktop builds do NOT bundle pymupdf by default.
 
 [project.scripts]
 research-assistant = "research_assistant.cli:cli_main"
@@ -44,6 +51,7 @@ testpaths = ["tests"]
 asyncio_mode = "auto"
 
 [tool.uv]
+# TODO: 待生成 uv.lock 锁定依赖（需联网执行 uv lock，本次离线不做）。
 dev-dependencies = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",

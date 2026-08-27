@@ -10,7 +10,7 @@ import httpx
 from ..constants import DEFAULT_OPENAI_MODEL, HTTP_CONNECT_TIMEOUT_SECONDS, HTTP_TIMEOUT_SECONDS
 from ..models import TokenUsage
 from .base import LLMClient, LLMResponse, OnChunkCallback, ToolCall
-from .errors import classify_response
+from .errors import LLMError, classify_response
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
@@ -133,6 +133,9 @@ class OpenAICompatClient(LLMClient):
 
         if on_chunk is not None:
             body["stream"] = True
+            # 缺陷 D：流式默认拿不到 usage——显式要求端点回传计量 chunk
+            #（OpenAI 规范字段；不认识的兼容端点由降级逻辑兜底，见下）。
+            body["stream_options"] = {"include_usage": True}
             return await self._chat_streaming(url, headers, body, on_chunk, on_activity)
 
         resp = await self._client.post(url, headers=headers, json=body)
@@ -151,7 +154,40 @@ class OpenAICompatClient(LLMClient):
         on_chunk: OnChunkCallback,
         on_activity: Any | None = None,
     ) -> LLMResponse:
-        """Stream the OpenAI-compatible response via SSE, calling on_chunk for text deltas."""
+        """Stream the OpenAI-compatible response via SSE, calling on_chunk for text deltas.
+
+        缺陷 D 兜底：个别兼容端点不认识 ``stream_options``（HTTP 400 且报文
+        含该字样）——自动去掉该字段重发**一次**，只降一级，防死循环。
+        """
+        current_body = body
+        for _ in range(2):  # 首发最多 + 一次去 stream_options 的降级重发
+            try:
+                return await self._chat_stream_once(
+                    url, headers, current_body, on_chunk, on_activity,
+                )
+            except LLMError as exc:
+                already_degraded = current_body is not body
+                if (
+                    not already_degraded
+                    and getattr(exc, "status_code", None) == 400
+                    and "stream_options" in str(exc).lower()
+                ):
+                    current_body = {
+                        k: v for k, v in body.items() if k != "stream_options"
+                    }
+                    continue
+                raise
+        raise LLMError("unreachable: streaming retry loop exited")
+
+    async def _chat_stream_once(
+        self,
+        url: str,
+        headers: dict,
+        body: dict,
+        on_chunk: OnChunkCallback,
+        on_activity: Any | None = None,
+    ) -> LLMResponse:
+        """Issue one streaming request and consume its SSE frames."""
         content_text = ""
         tool_calls_by_index: dict[int, dict] = {}
         stop_reason = "end_turn"

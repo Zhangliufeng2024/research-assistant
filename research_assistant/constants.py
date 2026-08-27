@@ -12,7 +12,9 @@ HTTP_TIMEOUT_SECONDS: float = 300.0
 # 干等两分多钟才见到错误帧——表现为永久「思考中」）。
 HTTP_CONNECT_TIMEOUT_SECONDS: float = 15.0
 DEFAULT_LLM_REQUEST_INTERVAL: float = 2.0
-DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-4-6"
+# Claude 5 代系的有效别名（claude-sonnet-4-6 并非有效模型 ID，新装用户
+# 只填 key 不填模型名会首报错）。
+DEFAULT_ANTHROPIC_MODEL: str = "claude-sonnet-5"
 DEFAULT_OPENAI_MODEL: str = "gpt-4o"
 ANTHROPIC_API_VERSION: str = "2023-06-01"
 

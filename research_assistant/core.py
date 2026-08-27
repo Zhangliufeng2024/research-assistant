@@ -3,6 +3,7 @@
 import os
 import shutil
 import sys
+import uuid
 import zipfile
 from collections import defaultdict
 from pathlib import Path
@@ -27,6 +28,33 @@ def safe_resolve(path: Path, sandbox: Path) -> Path:
             f"Path escapes sandbox: {resolved} is not inside {sandbox_resolved}"
         )
     return resolved
+
+
+def atomic_write_text(
+    path: str | Path,
+    content: str,
+    *,
+    encoding: str = "utf-8",
+) -> None:
+    """Durably replace a text file without exposing a partial JSON/file.
+
+    The temporary file is created beside the destination so ``os.replace``
+    remains atomic on the same filesystem, including on Windows.
+    """
+    target = Path(path)
+    target.parent.mkdir(parents=True, exist_ok=True)
+    temporary = target.with_name(f".{target.name}.{uuid.uuid4().hex}.tmp")
+    try:
+        with open(temporary, "w", encoding=encoding) as handle:
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, target)
+    finally:
+        try:
+            temporary.unlink()
+        except FileNotFoundError:
+            pass
 
 
 def ensure_dotenv_loaded() -> None:
@@ -540,4 +568,3 @@ def create_data_context_message(processed_info: dict[str, Any] | None) -> str:
     context_parts.append("[END DATA FILES]\n")
 
     return "\n".join(context_parts)
-

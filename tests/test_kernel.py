@@ -94,12 +94,12 @@ def _resp(inp=0, out=0, cw=0, cr=0):
 
 class TestBudget:
     def test_price_prefix_match(self):
-        assert price_for("claude-sonnet-4-6")["input"] == 3.0
+        assert price_for("claude-sonnet-5")["input"] == 3.0
         assert price_for("gpt-4o-mini-2024")["output"] == 0.60
         assert price_for("totally-unknown-model")["input"] == 0.0
 
     def test_cost_accumulation_uses_cache_prices(self):
-        guard = BudgetGuard(BudgetLimits(), model="claude-sonnet-4-6")
+        guard = BudgetGuard(BudgetLimits(), model="claude-sonnet-5")
         guard.record(_resp(inp=1_000_000, out=100_000, cw=500_000, cr=250_000))
         expected = (1_000_000 * 3.0 + 100_000 * 15.0 + 500_000 * 3.75 + 250_000 * 0.30) / 1e6
         assert abs(guard.state.cost_usd - expected) < 1e-9
@@ -125,7 +125,7 @@ class TestBudget:
             guard.check()
 
     def test_cost_limit_raises(self):
-        guard = BudgetGuard(BudgetLimits(max_cost_usd=0.001), model="claude-sonnet-4-6")
+        guard = BudgetGuard(BudgetLimits(max_cost_usd=0.001), model="claude-sonnet-5")
         guard.record(_resp(inp=10_000_000))
         with pytest.raises(BudgetExceededError, match="cost limit"):
             guard.check()
@@ -157,7 +157,7 @@ class TestBudget:
 
     def test_cost_cap_enforceable_flag(self):
         # 已知价格 + 设了成本上限 → 可执行
-        g1 = BudgetGuard(BudgetLimits(max_cost_usd=5), model="claude-sonnet-4-6")
+        g1 = BudgetGuard(BudgetLimits(max_cost_usd=5), model="claude-sonnet-5")
         assert g1.snapshot()["cost_cap_enforceable"] is True
         # 未知价格 + 设了成本上限 → 如实上报不可执行（token 等其它上限不受影响）
         g2 = BudgetGuard(BudgetLimits(max_cost_usd=5), model="agnes-2.0-flash")
@@ -165,6 +165,33 @@ class TestBudget:
         # 未设成本上限 → 无所谓可不可执行，恒为 True
         g3 = BudgetGuard(model="agnes-2.0-flash")
         assert g3.snapshot()["cost_cap_enforceable"] is True
+
+    def test_reservations_make_turn_limit_atomic(self):
+        guard = BudgetGuard(BudgetLimits(max_turns=1), model="m")
+        reservation = guard.reserve(max_output_tokens=10)
+        with pytest.raises(BudgetExceededError, match="turn limit"):
+            guard.reserve(max_output_tokens=10)
+        guard.release(reservation)
+        assert guard.snapshot()["in_flight"] == 0
+
+    def test_reservations_share_remaining_token_capacity(self):
+        guard = BudgetGuard(BudgetLimits(max_total_tokens=100), model="m")
+        first = guard.reserve(max_output_tokens=70, estimated_input_tokens=10)
+        second = guard.reserve(max_output_tokens=70, estimated_input_tokens=10)
+        assert first.max_output_tokens == 70
+        assert second.max_output_tokens == 10
+        assert guard.snapshot()["reserved_tokens"] == 100
+        with pytest.raises(BudgetExceededError, match="token limit"):
+            guard.reserve(max_output_tokens=1)
+        guard.release(first)
+        guard.release(second)
+
+    def test_set_model_refreshes_pricing(self):
+        guard = BudgetGuard(BudgetLimits(max_cost_usd=5), model="unknown")
+        assert guard.cost_cap_enforceable is False
+        guard.set_model("claude-sonnet-5")
+        assert guard.prices["output"] == 15.0
+        assert guard.cost_cap_enforceable is True
 
 
 # ---------------------------------------------------------------------------
@@ -254,7 +281,7 @@ class TestMaybeCompact:
         client = _SummarizerClient()
         msgs = _long_history(5)
         out, compacted, _info = await maybe_compact(
-            msgs, llm_client=client, model="claude-sonnet-4-6",
+            msgs, llm_client=client, model="claude-sonnet-5",
         )
         assert not compacted
         assert out is msgs
@@ -267,7 +294,7 @@ class TestMaybeCompact:
         original_first = dict(msgs[0])
         # Force trigger via measured tokens.
         out, compacted, _info = await maybe_compact(
-            msgs, llm_client=client, model="claude-sonnet-4-6",
+            msgs, llm_client=client, model="claude-sonnet-5",
             last_input_tokens=190_000,
         )
         assert compacted
@@ -302,9 +329,56 @@ class TestMaybeCompact:
         assert sum("[CONTEXT SUMMARY" in str(m.get("content", "")) for m in msgs) == 1
 
 
+class _RecordingBudget:
+    """计量桩：record() 收到的响应用量记下来。"""
+
+    def __init__(self):
+        self.recorded: list[LLMResponse] = []
+
+    def record(self, response):
+        self.recorded.append(response)
+
+
+class TestCompactionMetering:
+    """缺陷 I：压缩用的 summarize_span 调用本身也要计入预算计量。"""
+
+    @pytest.mark.asyncio
+    async def test_summarize_span_records_into_budget(self):
+        from research_assistant.kernel.context import summarize_span
+
+        client = _SummarizerClient()
+        budget = _RecordingBudget()
+
+        await summarize_span(client, "span text", budget=budget)
+
+        assert len(budget.recorded) == 1
+        assert client.prompts == ["span text"]
+
+    @pytest.mark.asyncio
+    async def test_summarize_span_without_budget_still_works(self):
+        from research_assistant.kernel.context import summarize_span
+
+        client = _SummarizerClient()
+        summary = await summarize_span(client, "span text")
+        assert "## Goal" in summary
+
+    @pytest.mark.asyncio
+    async def test_maybe_compact_passes_budget_through(self):
+        client = _SummarizerClient()
+        budget = _RecordingBudget()
+        msgs = _long_history(40)
+
+        await maybe_compact(
+            msgs, llm_client=client, model="claude-sonnet-5",
+            last_input_tokens=190_000, budget=budget,
+        )
+
+        assert len(budget.recorded) == 1
+
+
 class TestWindowFor:
     def test_known_models(self):
-        assert window_for("claude-sonnet-4-6") == 200_000
+        assert window_for("claude-sonnet-5") == 200_000
         assert window_for("gpt-4o") == 128_000
         assert window_for("deepseek-chat") == 128_000
 

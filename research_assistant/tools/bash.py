@@ -1,8 +1,10 @@
 """Bash command execution tool."""
 
 import asyncio
+import locale
 import os
 import re
+import subprocess
 import sys
 
 from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
@@ -19,29 +21,122 @@ _FROZEN_PY_GUARD_MSG = (
 )
 
 _ENV_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SEG_SPLIT_RE = re.compile(r"&&|\|\||[|&;]")
+# \r\n 也算段分隔符：cmd.exe 会把裸 LF 当命令分隔符，不切行就会漏检
+# 「dir\npython x.py」这类换行藏毒的复合命令（冻结态拦截加固 ①）。
+_SEG_SPLIT_RE = re.compile(r"&&|\|\||[|&;\r\n]")
+
+# call/start/cmd 前缀：其后可能跟着 / 开关与带引号窗口标题，需跳过后再判
+# 命令本体，否则「call python -V」「start "" python x.py」直接放行（加固 ③）。
+_CMD_PREFIX_TOKENS = frozenset({"call", "start", "cmd", "cmd.exe"})
+_PREFIX_MAX_DEPTH = 4  # call cmd /c python … 的前缀链防御性深度上限
+
+_QUOTE_CHARS = "\"'"
+
+# Windows 下抑制子进程控制台窗（Bug B）：getattr 兼容非 Windows 平台导入。
+_CREATE_NO_WINDOW = getattr(subprocess, "CREATE_NO_WINDOW", 0)
 
 
 def _segments(command: str) -> list[str]:
-    """按 shell 操作符切分命令（&& || | & ;），供逐段检查。"""
+    """按 shell 操作符切分命令（&& || | & ; 与裸换行），供逐段检查。"""
     return [seg.strip() for seg in _SEG_SPLIT_RE.split(command) if seg.strip()]
 
 
+def _tokens(segment: str) -> list[str]:
+    """按空白切分但尊重双引号——引号内空格不分段（带空格路径是一个 token）。"""
+    out: list[str] = []
+    buf: list[str] = []
+    in_quote = False
+    for ch in segment:
+        if ch == '"':
+            in_quote = not in_quote
+            buf.append(ch)
+        elif ch in " \t" and not in_quote:
+            if buf:
+                out.append("".join(buf))
+                buf = []
+        else:
+            buf.append(ch)
+    if buf:
+        out.append("".join(buf))
+    return out
+
+
+def _strip_quotes(token: str) -> str:
+    return token.strip(_QUOTE_CHARS)
+
+
+def _exe_basename(token: str) -> str:
+    """取 token 的可执行名：先剥包裹引号再取 basename、小写、去 .exe。"""
+    exe = os.path.basename(_strip_quotes(token)).lower()
+    if exe.endswith(".exe"):
+        exe = exe[:-4]
+    return exe
+
+
 def _is_python_invocation(segment: str) -> bool:
-    """判断一个命令段是否在调用 python/pip（跳过前导 KEY=VALUE 赋值）。"""
-    tokens = segment.split()
+    """判断一个命令段是否在调用 python/pip。
+
+    覆盖三类绕过形态：
+    - 引号包裹的可执行路径（含带空格路径）：token 先剥引号再做 basename
+      匹配（加固 ②）；
+    - ``call python …`` / ``start "" python …`` / ``cmd /c python …``：
+      首个 token 属于 {call, start, cmd, cmd.exe} 时跳过其后以 ``/`` 开头
+      的开关参数与一个可能的带引号标题后再检查（加固 ③）；
+    - 前导 KEY=VALUE 环境变量赋值照旧跳过。
+
+    边界声明：%VAR% 间接引用（如 ``%PY% x.py``）**不做**静态展开识别——
+    需要运行时环境变量才能解析，属于已知盲区，明确不在本函数处理范围。
+    """
+    tokens = _tokens(segment)
     i = 0
     while i < len(tokens) and _ENV_ASSIGN_RE.match(tokens[i]):
         i += 1
-    if i >= len(tokens):
-        return False
-    exe = os.path.basename(tokens[i]).lower()
-    if exe.endswith(".exe"):
-        exe = exe[:-4]
-    if exe in _PY_INVOKABLE:
-        return True
-    # 覆盖 python3.12 之类带版本号的写法（但不误伤 ipython 等）
-    return exe.startswith("python")
+    depth = 0
+    while i < len(tokens):
+        exe = _exe_basename(tokens[i])
+        if exe in _PY_INVOKABLE:
+            return True
+        # 覆盖 python3.12/pythonw 之类写法（但不误伤 ipython 等）
+        if exe.startswith("python"):
+            return True
+        if exe not in _CMD_PREFIX_TOKENS or depth >= _PREFIX_MAX_DEPTH:
+            return False
+        j = i + 1
+        # 跳过以 / 开头的开关参数（cmd /c /d …）
+        while j < len(tokens) and tokens[j].startswith("/"):
+            j += 1
+        if j >= len(tokens):
+            return False  # 前缀后没有命令本体（如孤立的 `call`）
+        # start "" python：紧跟 start 的带引号参数是窗口标题而非命令。
+        # 但 `call "python.exe" -V` 这种引号包住命令本身的形态不能误跳——
+        # 标题后的 token 若本身是 python 调用则保留到下一轮循环命中。
+        if tokens[j].startswith('"') and j + 1 < len(tokens):
+            nxt = _exe_basename(tokens[j])
+            if not (nxt in _PY_INVOKABLE or nxt.startswith("python")):
+                j += 1
+        i = j
+        depth += 1
+    return False
+
+
+def decode_process_output(data: bytes) -> str:
+    """子进程字节流解码：utf-8 strict 失败回退本地首选编码（Bug A）。
+
+    中文 Windows 上 cmd.exe 内建命令（dir/echo 等）经管道输出的是
+    GBK(cp936) 字节而非 UTF-8——一律按 utf-8+replace 解会得到乱码
+    （用户实测「中文路径无法识别」的根因）。先试 utf-8 strict（python
+    子进程输出、PYTHONUTF8=1 场景原样保留），UnicodeDecodeError 再按
+    locale.getpreferredencoding(False) 兜底；errors="replace" 保证对任何
+    杂凑字节都不抛异常。
+    """
+    try:
+        return data.decode("utf-8")
+    except UnicodeDecodeError:
+        fallback = locale.getpreferredencoding(False) or "utf-8"
+        try:
+            return data.decode(fallback, errors="replace")
+        except LookupError:
+            return data.decode("utf-8", errors="replace")
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -57,6 +152,62 @@ async def _kill_process(proc: asyncio.subprocess.Process) -> None:
             await proc.wait()
     except ProcessLookupError:
         pass
+
+
+async def _run_process(
+    args: list[str],
+    *,
+    cwd: str,
+    timeout: int,
+    env: dict[str, str] | None = None,
+) -> tuple[int, bytes, bytes]:
+    """Run a child process with fully awaited pipe cleanup.
+
+    Windows' Proactor subprocess transports can outlive short pytest/app event
+    loops even after ``communicate``.  A managed ``Popen`` in a worker thread
+    avoids those transports while retaining cancellation/timeout cleanup.
+
+    ``env``：None 表示继承父进程环境；传入完整副本可注入 PYTHONUTF8 等。
+    """
+    if sys.platform == "win32":
+        # Bug B：桌面应用（无控制台窗体）里 spawn cmd.exe 不能闪终端黑框，
+        # win32 分支统一加 CREATE_NO_WINDOW（asyncio 分支仅 POSIX 走到）。
+        popen_kwargs: dict = {
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "cwd": cwd,
+            "creationflags": _CREATE_NO_WINDOW,
+        }
+        if env is not None:
+            popen_kwargs["env"] = env
+        proc = subprocess.Popen(args, **popen_kwargs)
+        try:
+            stdout, stderr = await asyncio.to_thread(
+                proc.communicate, timeout=timeout,
+            )
+        except subprocess.TimeoutExpired as exc:
+            proc.kill()
+            await asyncio.to_thread(proc.communicate)
+            raise asyncio.TimeoutError from exc
+        except asyncio.CancelledError:
+            proc.kill()
+            await asyncio.to_thread(proc.communicate)
+            raise
+        return proc.returncode, stdout, stderr
+
+    proc = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+        cwd=cwd,
+        env=env,
+    )
+    try:
+        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+    except (asyncio.CancelledError, asyncio.TimeoutError):
+        await _kill_process(proc)
+        raise
+    return proc.returncode, stdout, stderr
 
 
 async def run_bash(
@@ -88,36 +239,29 @@ async def run_bash(
             shell = "/bin/sh"
         args = [shell, "-c", command]
 
-    proc = None
     try:
-        proc = await asyncio.create_subprocess_exec(
-            *args,
-            stdout=asyncio.subprocess.PIPE,
-            stderr=asyncio.subprocess.PIPE,
-            cwd=cwd,
+        returncode, stdout, stderr = await _run_process(
+            args, cwd=cwd, timeout=timeout,
         )
-        stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
     except asyncio.TimeoutError:
-        if proc is not None:
-            await _kill_process(proc)
         return f"Error: Command timed out after {timeout} seconds"
     except FileNotFoundError:
         return f"Error: Shell not found: {shell}"
     except Exception as e:
-        if proc is not None:
-            await _kill_process(proc)
         return f"Error executing command: {e}"
 
     output_parts = []
     if stdout:
-        output_parts.append(stdout.decode("utf-8", errors="replace"))
+        # Bug A：cmd.exe 内建命令在中文 Windows 输出 GBK——utf-8 strict
+        # 失败时回退本地编码，不再一律 replace 成乱码。
+        output_parts.append(decode_process_output(stdout))
     if stderr:
-        output_parts.append(stderr.decode("utf-8", errors="replace"))
+        output_parts.append(decode_process_output(stderr))
 
     result = "\n".join(output_parts).strip()
 
-    if proc.returncode != 0:
-        result = f"Exit code: {proc.returncode}\n{result}"
+    if returncode != 0:
+        result = f"Exit code: {returncode}\n{result}"
 
     if len(result) > OUTPUT_TRUNCATION_LIMIT:
         result = (

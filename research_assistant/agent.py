@@ -14,8 +14,10 @@ Kernel features (all optional, wired via :class:`RunConfig`):
 import asyncio
 import inspect
 import json
+import logging
 import random
 import time
+import uuid
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,6 +46,8 @@ from .retry import (
 )
 from .tools.registry import ToolRegistry
 
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class AgentResult:
@@ -57,6 +61,7 @@ class AgentResult:
     turns: int = 0
     #: "completed" | "cancelled" | "budget_exceeded" | "max_turns" | "max_continuations"
     stop_reason: str = "completed"
+    budget_snapshot: dict[str, Any] = field(default_factory=dict)
 
 
 OnTextCallback = Callable[[str], Awaitable[None] | None]
@@ -64,6 +69,22 @@ OnToolCallback = Callable[[str, dict[str, Any], str], Awaitable[None] | None]
 OnToolStartCallback = Callable[[str, dict[str, Any]], Awaitable[None] | None]
 OnTurnStartCallback = Callable[[int, float, "TokenUsage"], Awaitable[None] | None]
 OnSteerCallback = Callable[[str], Awaitable[None] | None]
+
+
+def _conservative_request_token_estimate(
+    messages: list[dict], system: str, tools: list[dict] | None,
+) -> int:
+    """Upper-bound ordinary UTF-8 tokenizer usage for budget reservation.
+
+    Tokenizers may merge bytes but do not normally create more tokens than
+    the UTF-8 payload has bytes.  Reserving the serialized byte count keeps a
+    shared hard cap safe without coupling the kernel to one provider tokenizer.
+    """
+    payload = json.dumps(
+        {"system": system, "messages": messages, "tools": tools or []},
+        ensure_ascii=False, default=str,
+    )
+    return max(1, len(payload.encode("utf-8")))
 
 
 @dataclass
@@ -100,6 +121,11 @@ class RunConfig:
     #: Summarize old history when nearing the model's context window.
     compaction: bool = True
     heartbeat_timeout: float | None = None
+    #: Model-visible conversation prefix restored by the kernel before the
+    #: current user prompt.  These messages are included in the audit ledger.
+    initial_messages: list[dict] = field(default_factory=list)
+    agent_id: str = ""
+    agent_role: str = ""
 
 
 def _is_completion_loop(recent_texts: list[str]) -> bool:
@@ -176,6 +202,10 @@ class _ActivityWatchdog:
             pass
 
     async def call(self, coro_factory: Callable[[], Any]) -> LLMResponse:
+        # 每次尝试独立计量：同一重试循环里上一尝试残留的心跳标记不得为
+        # 本次首字节窗「续命」（否则流式中断后的重试首字节窗 60s 退化为
+        # 静默大窗 300s，快失败语义失效）。
+        self._activity.clear()
         task = asyncio.create_task(coro_factory())
         started = time.time()
         ever_beaten = False
@@ -298,7 +328,10 @@ async def run_agent(
             max_tokens=max_tokens,
         )
 
-    hooks = cfg.hooks if cfg.hooks is not None else HookBus()
+    # A supplied bus contains host observers.  Fork it before mounting
+    # per-run permission and repeat-call guards so parallel agents do not
+    # mutate one another's handler lists or share guard state.
+    hooks = cfg.hooks.fork() if cfg.hooks is not None else HookBus()
 
     # Mount the permission policy (default from env) unless explicitly off.
     if cfg.permission_policy is not None:
@@ -321,7 +354,8 @@ async def run_agent(
     )
 
     start_time = time.time()
-    messages: list[dict] = [{"role": "user", "content": prompt}]
+    messages: list[dict] = [dict(message) for message in cfg.initial_messages]
+    messages.append({"role": "user", "content": prompt})
     tool_schemas = tools.get_schemas()
 
     collected_text = ""
@@ -355,7 +389,7 @@ async def run_agent(
         except Exception:
             pass  # telemetry must never break the run
 
-    def _log_append(msg: dict) -> None:
+    def _log_append(msg: dict, *, origin: str = "current") -> None:
         ledger["appended"] += 1
         seq = ledger["appended"] - ledger["deleted"] - 1
         content = msg.get("content", "")
@@ -363,7 +397,7 @@ async def run_agent(
             content = json.dumps(content, ensure_ascii=False, default=str)
         _slog("msg_add", seq=seq, role=msg.get("role", "?"),
               content=str(content)[:20_000],
-              tool_calls=bool(msg.get("tool_calls")))
+              tool_calls=bool(msg.get("tool_calls")), origin=origin)
 
     def _log_delete(n: int) -> None:
         ledger["deleted"] += n
@@ -376,7 +410,9 @@ async def run_agent(
             hooks.on(EventKind.PRE_TOOL_USE, guard)
 
     await _emit(EventKind.RUN_START, payload={"prompt_chars": len(prompt)})
-    _log_append({"role": "user", "content": prompt})
+    for restored in messages[:-1]:
+        _log_append(restored, origin="history")
+    _log_append(messages[-1], origin="current")
 
     # Per-run scratch space for externalized tool outputs.
     artifacts_dir: Path | None = None
@@ -386,6 +422,39 @@ async def run_agent(
             artifacts_dir = Path(work_dir) / ".ra" / "tool_outputs"
 
     use_activity = _supports_on_activity(llm_client)
+
+    async def _supervised_chat(
+        *,
+        messages: list[dict],
+        system: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> LLMResponse:
+        """带完整监督的单次 chat 调用，注入给压缩摘要（kernel/context）。
+
+        复用主链路同一套设施——_ActivityWatchdog 两阶段看门狗（活动标记在
+        每尝试入口自清）、_llm_call_with_retry 指数退避重试、_cancelable 停止
+        打断（_TurnCancelled 语义与主链路一致）——不自建第二套监督。
+        """
+        watchdog = _ActivityWatchdog(
+            heartbeat_timeout,
+            # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
+            first_byte_timeout=min(heartbeat_timeout, get_first_byte_timeout()),
+            wall_timeout=get_attempt_wall_timeout(),
+        )
+        kwargs: dict[str, Any] = (
+            {"on_activity": watchdog.beat} if use_activity else {}
+        )
+        return await _cancelable(
+            _llm_call_with_retry(
+                llm_client, messages, system, None,
+                temperature, max_tokens, heartbeat_timeout,
+                max_retries, base_delay,
+                extra_kwargs=kwargs,
+                watchdog=watchdog,
+            ),
+            cfg.cancel_event,
+        )
 
     turn = -1
     for turn in range(cfg.max_turns):
@@ -408,10 +477,18 @@ async def run_agent(
         await _emit(EventKind.TURN_START, turn=turn + 1)
 
         # --- budget gate ---------------------------------------------------
+        reservation = None
+        request_max_tokens = cfg.max_tokens
         if budget is not None:
             try:
-                verdict = budget.check()
-                for w in verdict.warnings:
+                reservation = budget.reserve(
+                    max_output_tokens=cfg.max_tokens,
+                    estimated_input_tokens=_conservative_request_token_estimate(
+                        messages, system_prompt, tool_schemas,
+                    ),
+                )
+                request_max_tokens = reservation.max_output_tokens
+                for w in reservation.warnings:
                     await _emit(EventKind.BUDGET_WARNING, payload={"message": w})
             except BudgetExceededError as exc:
                 await _emit(EventKind.BUDGET_EXCEEDED, payload={"report": exc.report})
@@ -434,16 +511,29 @@ async def run_agent(
             wall_timeout=get_attempt_wall_timeout(),
         )
 
-        async def _do_call(watchdog=watchdog, messages=messages) -> LLMResponse:
+        llm_started = time.monotonic()
+        call_first_chunk_at: float | None = None
+
+        async def _stream_chunk(chunk: str) -> None:
+            nonlocal call_first_chunk_at
+            if call_first_chunk_at is None:
+                call_first_chunk_at = time.monotonic()
+            await _maybe_await(on_text, chunk)
+
+        async def _do_call(
+            watchdog=watchdog,
+            messages=messages,
+            request_max_tokens=request_max_tokens,
+        ) -> LLMResponse:
             kwargs: dict[str, Any] = {}
             if use_activity:
                 kwargs["on_activity"] = watchdog.beat
             # watchdog 传入重试循环内部：监督每次尝试（R9，见函数 docstring）
             return await _llm_call_with_retry(
                 llm_client, messages, system_prompt, tool_schemas,
-                cfg.temperature, cfg.max_tokens, heartbeat_timeout,
+                cfg.temperature, request_max_tokens, heartbeat_timeout,
                 max_retries, base_delay,
-                on_chunk=on_text if streaming else None,
+                on_chunk=_stream_chunk if streaming else None,
                 extra_kwargs=kwargs,
                 watchdog=watchdog,
             )
@@ -454,27 +544,68 @@ async def run_agent(
             # _cancelable：停止/断连可立即打断在途调用（含尝试间退避期）
             response = await _cancelable(_do_call(), cfg.cancel_event)
         except _TurnCancelled:
+            if reservation is not None:
+                budget.release(reservation)
             stop_reason = "cancelled"
             break
         except BudgetExceededError:
+            if reservation is not None:
+                budget.release(reservation)
             raise
         except Exception as exc:
+            if reservation is not None:
+                budget.release(reservation)
             await _emit(EventKind.ERROR, payload={"error": str(exc)})
             # RUN_END must fire even when the run dies mid-loop.
             await _emit(EventKind.RUN_END, payload={
                 "stop_reason": "error", "turns": n_llm_calls,
             })
             raise
+        except BaseException:
+            # 缺陷 A：asyncio.CancelledError 是 BaseException，旧实现直接穿堂——
+            # supervisor.wait_for 超时、断连兜底 task.cancel() 后预算预留永久
+            # 滞留 BudgetGuard、RUN_END 缺失。这里先归还预留（同步方法），再
+            # 尽力补发 RUN_END(cancelled) 让前端收尾，最后原样上抛取消。
+            if reservation is not None:
+                budget.release(reservation)
+            try:
+                await _emit(EventKind.RUN_END, payload={
+                    "stop_reason": "cancelled", "turns": n_llm_calls,
+                })
+            except BaseException:
+                pass  # 取消路径上的收尾尽力而为；原始异常优先上抛
+            raise
 
         _accumulate_usage(total_usage, response)
         n_llm_calls += 1
         if budget is not None:
-            budget.record(response)
+            if reservation is not None:
+                budget.commit(reservation, response)
+            else:
+                budget.record(response)
         await _emit(EventKind.LLM_RESPONSE, turn=turn + 1, payload={
             "stop_reason": response.stop_reason,
             "tool_calls": len(response.tool_calls),
             "input_tokens": response.usage.input_tokens,
+            "output_tokens": response.usage.output_tokens,
+            "elapsed_seconds": round(time.monotonic() - llm_started, 3),
+            "first_chunk_seconds": (
+                round(call_first_chunk_at - llm_started, 3)
+                if call_first_chunk_at is not None
+                else None
+            ),
         })
+        _slog(
+            "llm_timing", turn=turn + 1,
+            elapsed_seconds=round(time.monotonic() - llm_started, 3),
+            first_chunk_seconds=(
+                round(call_first_chunk_at - llm_started, 3)
+                if call_first_chunk_at is not None
+                else None
+            ),
+            input_tokens=response.usage.input_tokens,
+            output_tokens=response.usage.output_tokens,
+        )
 
         # --- context compaction (after measuring real usage) ---------------
         if cfg.compaction:
@@ -484,6 +615,11 @@ async def run_agent(
                     llm_client=llm_client,
                     model=getattr(llm_client, "model", ""),
                     last_input_tokens=response.usage.input_tokens,
+                    # 压缩用的摘要调用同样计入预算计量（缺陷 I）
+                    budget=budget,
+                    # 摘要调用复用主链路监督（看门狗/取消/重试）——否则挂死的
+                    # 摘要请求既不会被击杀也不会被「停止」打断（永久思考中）
+                    supervised_chat=_supervised_chat,
                 )
                 if compacted:
                     if compact_info:
@@ -492,8 +628,15 @@ async def run_agent(
                     await _emit(EventKind.CONTEXT_COMPACTION, turn=turn + 1,
                                 payload=compact_info or {})
                     _slog("compaction", turn=turn + 1, **(compact_info or {}))
-            except Exception:
-                pass  # compaction is best-effort; never kill a healthy run
+            except _TurnCancelled:
+                # 用户停止打断挂死中的摘要：取消不得被下面的「尽力而为」降级
+                # 吞成照常继续——普通异常才允许降级，取消语义与主链路一致。
+                stop_reason = "cancelled"
+                break
+            except Exception as exc:
+                # 压缩是尽力而为：失败不杀健康的运行，但静默吞掉会让
+                # 「上下文为何爆掉」无从排查（缺陷 I）。
+                logger.warning("上下文压缩失败: %s", exc)
 
         if response.content:
             collected_text += response.content
@@ -526,16 +669,18 @@ async def run_agent(
                     request = ToolApprovalRequest(
                         tool_name=tc.name, arguments=tc.arguments,
                         turn=turn + 1, reason=verdict.reason,
+                        agent_id=cfg.agent_id, agent_role=cfg.agent_role,
+                        request_id=uuid.uuid4().hex,
                     )
                     await _emit(EventKind.APPROVAL_REQUESTED, turn=turn + 1,
                                 tool_name=tc.name,
-                                payload={"summary": request.summary()})
+                                payload={"summary": request.summary(), "agent_id": cfg.agent_id, "role": cfg.agent_role})
                     approved, note = await resolve_approval(
                         cfg.approver, request, cfg.approval_timeout,
                     )
                     await _emit(EventKind.APPROVAL_RESOLVED, turn=turn + 1,
                                 tool_name=tc.name,
-                                payload={"approved": approved, "note": note})
+                                payload={"approved": approved, "note": note, "agent_id": cfg.agent_id, "role": cfg.agent_role})
                     _slog("approval", tool=tc.name, approved=approved, note=note)
                     if approved:
                         approved_via_ask = True
@@ -551,7 +696,9 @@ async def run_agent(
                     await _emit(EventKind.TOOL_START, turn=turn + 1,
                                 tool_name=tc.name, payload={"arguments": tc.arguments})
                     _slog("tool_call", tool=tc.name, arguments=tc.arguments)
+                    tool_started = time.monotonic()
                     result_text = await tools.execute(tc.name, tc.arguments)
+                    tool_elapsed = round(time.monotonic() - tool_started, 3)
                     raw_result_text = result_text
                     rewrite = await hooks.first_response(AgentEvent(
                         EventKind.TOOL_RESULT_REWRITE, turn=turn + 1,
@@ -569,7 +716,15 @@ async def run_agent(
                         )
                     await _emit(EventKind.TOOL_END, turn=turn + 1,
                                 tool_name=tc.name,
-                                payload={"result_chars": len(result_text)})
+                                payload={
+                                    "result_chars": len(result_text),
+                                    "elapsed_seconds": tool_elapsed,
+                                })
+                    _slog(
+                        "tool_timing", tool=tc.name, turn=turn + 1,
+                        elapsed_seconds=tool_elapsed,
+                        result_chars=len(result_text),
+                    )
                 await _maybe_await(on_tool_use, tc.name, tc.arguments, result_text)
 
                 if tc.name in ("write_file",) and (
@@ -685,26 +840,43 @@ async def _llm_call_with_retry(
     R9：*watchdog* 监督**每次尝试**（而非整个重试循环）——否则心跳超时异常
     会从循环外一击穿、绕过全部重试（retryable 形同虚设）。每次尝试都获得
     完整的首字节窗口 / 静默窗口与墙钟。
+
+    R12.x 流式直通：on_chunk 实时透传给调用方，不再缓冲到整次调用成功后
+    回放（旧行为让 UI 全程看不到正文）。若某次尝试已发布过正文后才失败，
+    下一次尝试开始前先补一条「生成中断，正在自动重试」标注——诚实告知，
+    避免两段文本无解释地拼接；首块之前的失败（连接 / 429 / 首字节超时等
+    最常见场景）依旧无痕重试。
     """
     last_exc: BaseException | None = None
     extra_kwargs = extra_kwargs or {}
 
-    def _one_attempt() -> Any:
-        return client.chat(
-            messages,
-            system=system,
-            tools=tools,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            on_chunk=on_chunk,
-            **extra_kwargs,
-        )
-
     for attempt in range(max_retries + 1):
+        # 记录本次尝试是否已经向调用方发布过流式 chunk（外部可见、不可回滚）。
+        published = [False]
+
+        def _tracked_chunk(text: str, _flag=published) -> Any:
+            _flag[0] = True
+            return on_chunk(text)
+
+        attempt_callback = _tracked_chunk if on_chunk is not None else None
+
+        def _one_attempt(attempt_callback=attempt_callback) -> Any:
+            return client.chat(
+                messages,
+                system=system,
+                tools=tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                on_chunk=attempt_callback,
+                **extra_kwargs,
+            )
+
         try:
             if watchdog is not None:
-                return await watchdog.call(_one_attempt)
-            return await _one_attempt()
+                response = await watchdog.call(_one_attempt)
+            else:
+                response = await _one_attempt()
+            return response
         except Exception as exc:
             last_exc = exc
 
@@ -721,6 +893,10 @@ async def _llm_call_with_retry(
             retryable = _is_retryable(exc) or isinstance(exc, HeartbeatTimeoutError)
             if not retryable or attempt >= max_retries:
                 raise
+
+            # 本次尝试已流出过正文才需要标注；首块之前的失败保持无痕重试。
+            if on_chunk is not None and published[0]:
+                await _maybe_await(on_chunk, "\n\n[生成中断，正在自动重试…]\n\n")
 
             delay = base_delay * (2 ** attempt)
             if getattr(exc, "retry_after", None):

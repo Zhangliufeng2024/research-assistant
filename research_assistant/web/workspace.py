@@ -1,15 +1,13 @@
 """工作区 API（R5 计划 R1：W1-W4；R8 增运行时切换 POST /workspace/root）。
 
-约定：**服务启动目录即工作区根** —— 与 ``web/app.py`` lifespan 中
-``app.state.cwd = Path.cwd()`` 的赋值一致，本模块统一以 ``Path.cwd()``
-取根。所有端点的 ``path`` 参数均相对该根解析，且必须通过
+约定：工作区根保存在 ``app.state.cwd``；未初始化 state 的轻量测试才回退
+到 ``Path.cwd()``。所有端点的 ``path`` 参数均相对该根解析，且必须通过
 :func:`research_assistant.core.safe_resolve` 围栏校验：越界一律 403、
 目标不存在 404。路由本身不带 ``/api`` 前缀，由 app.py 以
 ``prefix="/api"`` 挂载（与 web/routes.py 同一惯例）。
 
-R8 运行时切换（POST /workspace/root）通过 ``os.chdir`` 落地——本模块
-所有读取都跟随进程 CWD，天然生效；``app.state.cwd/output_folder/model``
-由切换端点同步刷新。
+R8 运行时切换（POST /workspace/root）只更新 app state，不改变进程 CWD；
+避免并发请求、后台任务和第三方库的相对路径语义被全局切换污染。
 """
 
 import mimetypes
@@ -22,6 +20,7 @@ from fastapi import APIRouter, HTTPException, Request
 from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
+from ..artifacts import ArtifactVersionStore
 from ..config import load_project_env, resolve_model
 from ..core import ensure_output_folder, safe_resolve, setup_claude_skills
 
@@ -35,6 +34,44 @@ TEXT_PREVIEW_LIMIT = 256 * 1024
 
 #: W3 docx 预览最多抽取的正文段落数（表格单元格文本另行全部拼接后再统一截断）。
 DOCX_PARAGRAPH_LIMIT = 200
+
+
+def _root_of(request: Request) -> Path:
+    """Return the request-scoped application workspace root."""
+    return Path(getattr(request.app.state, "cwd", None) or Path.cwd()).resolve()
+
+
+def _version_store(request: Request) -> ArtifactVersionStore:
+    return ArtifactVersionStore(_root_of(request))
+
+
+@router.get("/workspace/changes")
+async def list_workspace_changes(request: Request, limit: int = 200):
+    return _version_store(request).list(limit)
+
+
+@router.get("/workspace/changes/{change_id}")
+async def get_workspace_change(change_id: str, request: Request):
+    try:
+        return _version_store(request).diff(change_id)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="变更不存在") from exc
+
+
+class RestoreChangePayload(BaseModel):
+    side: str = "before"
+
+
+@router.post("/workspace/changes/{change_id}/restore")
+async def restore_workspace_change(
+    change_id: str, payload: RestoreChangePayload, request: Request,
+):
+    try:
+        return _version_store(request).restore(change_id, payload.side)
+    except KeyError as exc:
+        raise HTTPException(status_code=404, detail="变更不存在") from exc
+    except ValueError as exc:
+        raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 #: W3 视为文本读取的扩展名（小写、含点）；无扩展名的小文件同样按文本处理。
 _TEXT_EXTENSIONS = frozenset(
@@ -89,6 +126,20 @@ def _fence(path: str | None, root: Path) -> Path:
         raise HTTPException(status_code=403, detail="路径越界，拒绝访问") from exc
 
 
+#: 预览/下载端点的敏感目标前缀：环境变量文件（.env*）、内部状态库目录
+#（.ra*，含 platform/sources sqlite）与版本库目录（.git*）。
+_PROTECTED_PREFIXES = (".env", ".ra", ".git")
+
+
+def _is_protected_target(target: Path, root: Path) -> bool:
+    """相对路径任一段命中敏感前缀即拒绝（围栏保证 target 在根内）。"""
+    try:
+        rel = target.relative_to(root)
+    except ValueError:
+        return True  # 围栏外的异常情况一律视为受保护
+    return any(part.lower().startswith(_PROTECTED_PREFIXES) for part in rel.parts)
+
+
 def _rel_posix(path: Path, root: Path) -> str:
     """相对工作区根的 POSIX 风格显示路径；不在根内时回退绝对路径。
 
@@ -137,7 +188,7 @@ def _docx_preview(target: Path, size: int) -> dict:
 @router.get("/workspace")
 async def get_workspace(request: Request):
     """W1 工作区名片：根目录、名称、输出目录显示路径、是否 git 仓库。"""
-    root = Path.cwd()
+    root = _root_of(request)
     out_raw = getattr(request.app.state, "output_folder", None)
     output_folder = _rel_posix(Path(out_raw), root) if out_raw is not None else None
     return {
@@ -156,13 +207,11 @@ class SwitchRootPayload(BaseModel):
 async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
     """R8 反馈 #1：运行时切换工作区根（Claude Desktop 式界面内添加工作目录）。
 
-    落地方式是进程级 ``os.chdir``：workspace.py 全部端点读 ``Path.cwd()``
-    即刻跟随；随后重建输出目录与技能、重载配置（全局 .env + 新工作区
-    覆盖层），并刷新 ``app.state`` 的 cwd / output_folder / model。
+    切换只刷新 ``app.state`` 的 cwd / output_folder / model；随后重建输出
+    目录与技能、重载配置（全局 .env + 新工作区覆盖层）。
 
     语义边界（有意为之）：
-    - 生成任务运行中一律 409 拒绝——chdir 是进程级状态，任务中途换根会让
-      相对路径写入落进新目录，风险不可控；完成后再切。
+    - 生成任务运行中仍 409 拒绝，避免 UI 与任务所属工作区产生歧义。
     - 已打开的会话连接不受影响：其 ToolRegistry 在连接时捕获了旧工作区
       的**绝对路径**，进行中的回合继续写原目录（会话属于原工作区，语义
       正确）；新建会话/重连即用新根。
@@ -177,7 +226,7 @@ async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
     if not target.is_dir():
         raise HTTPException(status_code=404, detail=f"目录不存在：{target}")
 
-    if Path.cwd().resolve() == target:
+    if _root_of(request) == target:
         return {"ok": True, "root": str(target), "unchanged": True}
 
     tasks_reg = getattr(request.app.state, "active_tasks", None)
@@ -191,7 +240,6 @@ async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
             status_code=409, detail="有生成任务正在运行，请等待完成（或先停止）再切换工作目录"
         )
 
-    os.chdir(target)
     # 技能随新根重同步：冻结包内 .claude 在 research_assistant/ 下，
     # 开发态在仓库根——两级探测与 desktop.bundle_root 的取法互补。
     package_dir = Path(__file__).parent.parent.absolute()
@@ -203,11 +251,42 @@ async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
     request.app.state.cwd = target
     request.app.state.output_folder = output_folder
     request.app.state.model = resolve_model(None)
+    # Switch the portable project catalog together with the filesystem root.
+    # Existing background tasks keep their captured absolute paths and hub;
+    # new work is registered in the newly selected project database.
+    old_scheduler = getattr(request.app.state, "scheduler", None)
+    if old_scheduler is not None:
+        # 切换不再等待旧工作区流水线排空（stop 默认 drain=True 会 gather 全部
+        # 活跃任务，可能把本 HTTP 请求挂起数小时）。drain=False 只让轮询退出，
+        # 活跃任务持有旧 store/hub 的绝对路径引用自然跑完并照常落库。
+        await old_scheduler.stop(drain=False)
+    from ..runtime import (
+        BackgroundTaskHub,
+        DurableScheduler,
+        PlatformStore,
+        build_scheduler_dispatcher,
+    )
+    platform_store = PlatformStore(target / ".ra" / "platform.sqlite3")
+    platform_store.mark_orphaned_running_tasks()
+    request.app.state.platform_store = platform_store
+    request.app.state.project = platform_store.ensure_project(target)
+    request.app.state.task_hub = BackgroundTaskHub(platform_store)
+    from ..context import SourceStore
+    request.app.state.source_store = SourceStore(target / ".ra" / "sources.sqlite3")
+    request.app.state.scheduler = DurableScheduler(platform_store)
+    dispatchers, _dispatch = build_scheduler_dispatcher(
+        store=platform_store, hub=request.app.state.task_hub, cwd=target,
+        project=request.app.state.project, source_store=request.app.state.source_store,
+        default_model=request.app.state.model,
+    )
+    for workflow_id, dispatcher in dispatchers.items():
+        request.app.state.scheduler.register(workflow_id, dispatcher)
+    request.app.state.scheduler.start()
     return {"ok": True, "root": str(target), "output_folder": str(output_folder)}
 
 
 @router.get("/workspace/tree")
-async def get_workspace_tree(path: str = "", depth: int = 1):
+async def get_workspace_tree(request: Request, path: str = "", depth: int = 1):
     """W2 目录树单层懒加载：返回一层子项，深层由前端按需逐层展开。
 
     忽略 ``.git``/``__pycache__``/``.ra``/``node_modules`` 与一切 ``.`` 开头
@@ -215,7 +294,7 @@ async def get_workspace_tree(path: str = "", depth: int = 1):
     策略）。排序：目录在前、名称升序。``depth`` 为预留参数，当前契约是
     单层懒加载，不做递归。
     """
-    root = Path.cwd()
+    root = _root_of(request)
     target = _fence(path, root)
     if not target.is_dir():
         raise HTTPException(status_code=404, detail="目录不存在")
@@ -253,16 +332,21 @@ async def get_workspace_tree(path: str = "", depth: int = 1):
 
 
 @router.get("/workspace/file")
-async def get_workspace_file(path: str):
+async def get_workspace_file(request: Request, path: str):
     """W3 泛化文件预览：按类型分流返回。
 
+    - 敏感目标（``.env*`` / ``.ra*`` / ``.git*`` 路径段）一律 403，且先于
+      存在性判断 —— 不能借 404/200 探测密钥文件是否存在；
     - 文本类扩展名 / 无扩展名小文件 → 头部 ≤256KB UTF-8 文本 JSON；
     - ``.docx`` → python-docx 抽段落与表格文本，仍为 text kind；
-    - 图片 / PDF → FileResponse inline（浏览器内嵌预览）；
+    - 图片 / PDF → FileResponse inline（浏览器内嵌预览）；SVG 除外：
+      可携带脚本，强制 attachment 下载；
     - 其余二进制 → FileResponse attachment 下载。
     """
-    root = Path.cwd()
+    root = _root_of(request)
     target = _fence(path, root)
+    if _is_protected_target(target, root):
+        raise HTTPException(status_code=403, detail="受保护文件，不允许预览/下载")
     if not target.is_file():
         raise HTTPException(status_code=404, detail="文件不存在")
     size = target.stat().st_size
@@ -276,11 +360,11 @@ async def get_workspace_file(path: str):
         return _docx_preview(target, size)
 
     mime, _ = mimetypes.guess_type(str(target))
-    disposition = (
-        "inline"
-        if mime and (mime.startswith("image/") or mime == "application/pdf")
-        else "attachment"
-    )
+    inline_ok = bool(mime) and (mime.startswith("image/") or mime == "application/pdf")
+    if mime == "image/svg+xml":
+        # SVG 可内嵌 <script>，浏览器同源渲染有 XSS 风险：只允许附件下载。
+        inline_ok = False
+    disposition = "inline" if inline_ok else "attachment"
     return FileResponse(
         path=str(target),
         media_type=mime or "application/octet-stream",
@@ -289,7 +373,7 @@ async def get_workspace_file(path: str):
 
 
 @router.post("/workspace/open")
-async def open_in_system(path: str = ""):
+async def open_in_system(request: Request, path: str = ""):
     """W4 用系统默认程序打开文件 / 用资源管理器定位目录。
 
     默认关闭：环境变量 ``RA_ALLOW_SHELL_OPEN`` 不为 ``"1"`` 时一律 403，
@@ -298,7 +382,7 @@ async def open_in_system(path: str = ""):
     """
     if os.getenv("RA_ALLOW_SHELL_OPEN", "").strip() != "1":
         raise HTTPException(status_code=403, detail="未启用：需设置环境变量 RA_ALLOW_SHELL_OPEN=1")
-    root = Path.cwd()
+    root = _root_of(request)
     target = _fence(path, root)
     if not (target.is_file() or target.is_dir()):
         raise HTTPException(status_code=404, detail="目标不存在")

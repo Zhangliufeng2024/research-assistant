@@ -314,6 +314,176 @@ class TestParseBibtex:
         assert any("[1]" in t and "Test Author" in t for t in texts)
 
 
+class TestParseBibtexRobustness:
+    """Nested braces, escapes, multi-line values, and mildly malformed input."""
+
+    def test_nested_braces_preserved(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{smith2023,\n"
+            "  author = {Smith, John and Doe, Jane},\n"
+            "  title = {Deep {Learning} Approaches for {SiO_{2}} Coatings},\n"
+            "  journal = {Nature},\n"
+            "  year = {2023},\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        # Only the outermost delimiters are stripped; inner braces stay verbatim.
+        assert refs[0].title == (
+            "Deep {Learning} Approaches for {SiO_{2}} Coatings"
+        )
+        # Fields following the nested-brace value are still parsed.
+        assert refs[0].journal == "Nature"
+        assert refs[0].year == 2023
+        assert refs[0].authors == "Smith, John and Doe, Jane"
+
+    def test_nested_braces_across_multiple_entries(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{a2020,\n"
+            "  title = {Study of {Fe_{3}O_{4}} Nanoparticles},\n"
+            "  year = {2020},\n"
+            "}\n"
+            "\n"
+            "@inproceedings{b2021,\n"
+            "  title = {On {G}raph {N}eural {N}etworks for {SHM}},\n"
+            "  booktitle = {{Proceedings} of EWSHM},\n"
+            "  year = {2021},\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 2
+        assert refs[0].title == "Study of {Fe_{3}O_{4}} Nanoparticles"
+        assert refs[0].year == 2020
+        assert refs[1].title == "On {G}raph {N}eural {N}etworks for {SHM}"
+        assert refs[1].booktitle == "{Proceedings} of EWSHM"
+        assert refs[1].year == 2021
+
+    def test_escaped_braces_in_value(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{esc1,\n"
+            "  title = {Escaped \\{Brace\\} Title},\n"
+            "  journal = {Journal of \\{Special\\} Materials},\n"
+            "  year = {2019},\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].title == "Escaped \\{Brace\\} Title"
+        assert refs[0].journal == "Journal of \\{Special\\} Materials"
+        assert refs[0].year == 2019
+
+    def test_quoted_values_still_work(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            '@article{q1,\n'
+            '  author = "Quoted, Author",\n'
+            '  title = "A Quoted Title",\n'
+            '  year = "2018",\n'
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].title == "A Quoted Title"
+        assert refs[0].authors == "Quoted, Author"
+        assert refs[0].year == 2018
+
+    def test_quoted_value_containing_braces(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            '@article{q2,\n'
+            '  title = "The {Braced} Word",\n'
+            '  year = "2017",\n'
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].title == "The {Braced} Word"
+
+    def test_multiline_field_value(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{ml1,\n"
+            "  title = {Multi-line Test},\n"
+            "  abstract = {First line of the abstract\n"
+            "continues on the second line with a {Protected Name}\n"
+            "and ends on the third line.},\n"
+            "  year = {2024},\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].title == "Multi-line Test"
+        # The multi-line value (with its nested {Protected Name}) must be
+        # consumed in full so that later fields still parse.
+        assert refs[0].year == 2024
+
+    def test_unterminated_field_value_skipped_not_crash(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{bad1,\n"
+            "  year = {2020},\n"
+            "  title = {This value is never closed\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))  # must not raise
+        assert len(refs) == 1
+        assert refs[0].key == "bad1"
+        assert refs[0].year == 2020
+        # The unterminated field yields no title instead of a truncated one.
+        assert refs[0].title == ""
+
+    def test_missing_entry_closing_brace_skips_entry(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{good,\n"
+            "  title = {Good Title},\n"
+            "  year = {2001},\n"
+            "}\n"
+            "\n"
+            "@article{broken,\n"
+            "  title = {Broken Entry},\n"
+            "  year = {2002},\n"
+        )
+        refs = parse_bibtex(str(bib))  # must not raise
+        assert [r.key for r in refs] == ["good"]
+        assert refs[0].title == "Good Title"
+
+    def test_crlf_file_parses(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_bytes(
+            b"@article{crlf1,\r\n"
+            b"  author = {CRLF Author},\r\n"
+            b"  title = {Deep {Learning} on {SiO_{2}} Coatings},\r\n"
+            b"  journal = {Nature},\r\n"
+            b"  year = {2023},\r\n"
+            b"}\r\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].key == "crlf1"
+        assert refs[0].title == "Deep {Learning} on {SiO_{2}} Coatings"
+        assert refs[0].year == 2023
+
+    def test_bare_unquoted_values(self, tmp_path):
+        bib = tmp_path / "refs.bib"
+        bib.write_text(
+            "@article{bare1,\n"
+            "  title = {Bare Values},\n"
+            "  volume = 17,\n"
+            "  pages = 100--110,\n"
+            "  year = 2016,\n"
+            "}\n"
+        )
+        refs = parse_bibtex(str(bib))
+        assert len(refs) == 1
+        assert refs[0].volume == "17"
+        assert refs[0].pages == "100--110"
+        assert refs[0].year == 2016
+
+
 # ---------------------------------------------------------------------------
 # Template system
 # ---------------------------------------------------------------------------

@@ -10,6 +10,7 @@
  */
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import { emptyChat } from "@/lib/protocolChat";
+import type { HistoryMessage } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
 
 const h = vi.hoisted(() => ({
@@ -117,5 +118,111 @@ describe("chatStore.send 空会话治理（§6.4 回归）", () => {
     expect(r).toBe("offline");
     expect(vi.mocked(api.post)).not.toHaveBeenCalled();
     expect(vi.mocked(api.del)).not.toHaveBeenCalled();
+  });
+});
+
+/* ---------- R13-A / R13-D 回归 ---------- */
+describe("chatStore 断连复位与切换竞态（R13-A/D）", () => {
+  /** 最近一次 wsConnect 捕获的 onStatus（模拟底层 socket 事件用）。 */
+  let capturedStatus: ((st: "connecting" | "open" | "error" | "closed") => void) | null;
+
+  beforeEach(() => {
+    vi.clearAllMocks();
+    capturedStatus = null;
+    vi.mocked(api.post).mockResolvedValue({ id: "s-x" });
+    vi.mocked(api.del).mockResolvedValue({});
+    useChatStore.setState({
+      conn: "idle",
+      chat: emptyChat(),
+      sessions: [],
+      sessionsLoading: false,
+    });
+  });
+
+  it("R16：回合中途 closed → 进入自动重连，phase 保持 running（服务端继续跑）", async () => {
+    h.wsConnect.mockImplementation(
+      (opts: { onStatus?: (s: "connecting" | "open" | "error" | "closed") => void }) => {
+        capturedStatus = opts.onStatus ?? null;
+        opts.onStatus?.("open");
+      },
+    );
+    h.wsConnected.mockReturnValue(false); // 首条消息走建连
+    h.wsSend.mockReturnValue(true);
+
+    expect(await useChatStore.getState().send("开始调研")).toBe("ok");
+    expect(useChatStore.getState().chat.phase).toBe("running");
+
+    capturedStatus!("closed"); // 服务端/网络断开
+
+    // R16 耐久化：断线不再终止回合——前端转自动重连（非致命态），
+    // phase 保持 running 与服务端真实状态一致；错误横幅不出现。
+    const st = useChatStore.getState();
+    expect(st.conn).toBe("reconnecting");
+    expect(st.chat.phase).toBe("running");
+    expect(st.chat.error).toBeNull();
+    useChatStore.getState().newSession(); // 清理重连定时器，避免跨测试泄漏
+  });
+
+  it("R16：open 之后的 error 同样转入自动重连（close 未及触发的场景）", async () => {
+    h.wsConnect.mockImplementation(
+      (opts: { onStatus?: (s: "connecting" | "open" | "error" | "closed") => void }) => {
+        capturedStatus = opts.onStatus ?? null;
+        opts.onStatus?.("open");
+      },
+    );
+    // 首条消息走一次建连（捕获 onStatus），此后通道视为已连
+    h.wsConnected.mockReturnValueOnce(false).mockReturnValue(true);
+    h.wsSend.mockReturnValue(true);
+    expect(await useChatStore.getState().send("第一条")).toBe("ok");
+    expect(useChatStore.getState().chat.phase).toBe("running");
+
+    capturedStatus!("error");
+
+    expect(useChatStore.getState().conn).toBe("reconnecting");
+    expect(useChatStore.getState().chat.phase).toBe("running");
+    useChatStore.getState().newSession();
+  });
+
+  it("R16：steer 发送失败 → 保持 running（回合仍在后台跑），返回 offline", async () => {
+    useChatStore.setState({
+      chat: { ...emptyChat(), phase: "running", sessionId: "s-run" },
+      conn: "closed",
+    });
+    h.wsConnected.mockReturnValue(false); // 表里无 socket → wsSend 必败
+    h.wsSend.mockReturnValue(false);
+
+    expect(await useChatStore.getState().send("插一句话")).toBe("offline");
+    // R16 耐久化契约：断线不终止回合——phase 不得被打成 error。旧实现
+    // 的「本回合已终止」会掩盖重连横幅与手动重连入口，且随后 attach 到
+    // 仍在跑的回合时 replay_begin 又把相位翻回 running（状态跳动）。
+    expect(useChatStore.getState().chat.phase).toBe("running");
+  });
+
+  it("R13-D：快速连点两个会话——后发起的赢，先到的历史静默放弃", async () => {
+    let resolveA!: (v: { messages: HistoryMessage[] }) => void;
+    vi.mocked(api.get).mockImplementation(((url: string) => {
+      if (String(url).includes("s-a")) {
+        return new Promise<{ messages: HistoryMessage[] }>((res) => {
+          resolveA = res;
+        });
+      }
+      return Promise.resolve({
+        messages: [{ role: "assistant", content: "B 的历史" }],
+      });
+    }) as typeof api.get);
+    fakeConnect("open");
+
+    const pA = useChatStore.getState().openSession("s-a");
+    const pB = useChatStore.getState().openSession("s-b");
+    await pB; // B 的历史先返回并完成落位
+    resolveA({ messages: [] }); // A 的历史此刻才到——必须被丢弃
+    await pA;
+
+    expect(useChatStore.getState().chat.sessionId).toBe("s-b");
+    // A 全程不得触碰连接（wsClose 仅 B 落位时调用过一次）
+    expect(h.wsClose).toHaveBeenCalledTimes(1);
+    expect(h.wsConnect).toHaveBeenLastCalledWith(
+      expect.objectContaining({ query: "session=s-b" }),
+    );
   });
 });

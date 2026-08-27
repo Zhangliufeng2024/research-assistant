@@ -69,7 +69,10 @@ class PDFToImagesConverter:
         else:
             raise RuntimeError(
                 "PyMuPDF not installed. Install it with:\n"
-                "  pip install pymupdf\n\n"
+                "  pip install pymupdf\n"
+                '  (or: pip install "research-assistant[pdf-images]")\n\n'
+                "Note: the packaged desktop app does NOT bundle PyMuPDF by default -\n"
+                "install it in your development environment or add the optional extra.\n"
                 "PyMuPDF is a self-contained library - no external dependencies needed."
             )
     
@@ -170,6 +173,8 @@ Resolution:
 Requirements:
   Install PyMuPDF (no external dependencies needed):
     pip install pymupdf
+  Note: packaged desktop builds do not bundle PyMuPDF; install it in a
+  development environment or via the optional [pdf-images] extra.
         """
     )
     

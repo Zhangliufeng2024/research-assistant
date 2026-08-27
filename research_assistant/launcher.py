@@ -18,7 +18,7 @@ DEFAULTS = {
     "LLM_PROVIDER": "OpenAI",
     "IMAGE_API_KEY": "",
     "IMAGE_BASE_URL": "https://apihub.agnes-ai.com/v1",
-    "IMAGE_MODEL": "agnes-image-2.1-flash",
+    "IMAGE_MODEL": "agnes-image-2.0-flash",
     "IMAGE_REVIEW_MODEL": "agnes-2.0-flash",
     "PARALLEL_API_KEY": "",
     "SEMANTIC_SCHOLAR_API_KEY": "",

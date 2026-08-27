@@ -14,6 +14,10 @@ AI-powered research and writing assistant that combines deep research with publi
 - **Figure generation** — schematics, data plots, AI-generated images via NVIDIA NIM (free) or any OpenAI-compatible image API
 - **Document review** — reads generated .docx to verify content completeness; optional PDF conversion via LibreOffice
 - **Multi-agent mode** — resumable pipeline state machine: PLAN → RESEARCH∥ → FIGURES∥ → ASSEMBLE → GATES → REVISION → FINALIZE
+- **科研工作平台运行时** — SQLite WAL durable tasks、断线事件回放、DAG 节点指标、进程重启后的精确续跑与项目隔离
+- **通用 Agent 工作流** — `AgentRole` / `WorkflowRegistry` 支持论文流水线、研究问题冲刺和可复现数据分析，任务页可切换工作流
+- **项目资料库** — PDF/DOCX/Markdown/TXT/BibTeX 导入，keyword/semantic/hybrid 检索，页码、片段和哈希锚点可追溯
+- **产物审计与恢复** — Agent、脚本和 Python 间接写入均有版本 diff，可从变更页恢复；通用工作流节点保存检查点
 - **Web console（Claude 式现代界面，浅/深双主题）** — React 18 + TypeScript + Vite +
   Tailwind v4 构建的前端（源码 `frontend/`，产物直出 `research_assistant/web/static/`）：
   stage timeline, live activity & LLM output stream, real-time budget gauges,
@@ -48,7 +52,8 @@ Key environment variables: `RA_MAX_COST_USD`, `RA_MAX_TOKENS`, `RA_MAX_TURNS`,
 blocking), `RA_REPEAT_TOOL_LIMIT` (deny the Nth identical tool call; default 3,
 0 = off), `RA_APPROVAL_MODE` (`interactive` enables CLI y/N approval for hooks
 that escalate with ask; default off), `ANTHROPIC_PROMPT_CACHE` (`0` disables
-cache_control breakpoints), `RA_HEARTBEAT_TIMEOUT`, `RA_AUTO_CONTINUE`.
+cache_control breakpoints), `RA_HEARTBEAT_TIMEOUT`, `RA_AUTO_CONTINUE`,
+`RA_MODEL_FAST` / `RA_MODEL_STRONG` (optional role-based model routing).
 Wire protocol (run.json / events.jsonl / HookVerdict / approval flow) is
 specified in [`docs/protocol.md`](docs/protocol.md).
 
@@ -183,12 +188,50 @@ research_assistant/
 ├── cli.py               # Interactive CLI
 ├── docgen.py            # PaperBuilder (.docx generation) + BibTeX parser
 ├── orchestrator.py      # Multi-agent orchestration (4 phases)
+├── workflows/            # AgentRole、WorkflowRegistry 与通用 DAG 执行器
+├── runtime/              # SQLite WAL durable tasks、研究对象图、租约队列和任务指标
+├── context/              # 项目资料库与 hybrid retrieval
+├── artifacts/            # 产物变更版本、diff 和恢复
 ├── config.py            # Environment + model configuration
 ├── core.py              # File routing, skill setup
 ├── models.py            # Data models (PaperResult, TokenUsage, etc.)
 ├── retry.py             # Retry, heartbeat, error classification
 └── utils.py             # Paper scanning, citation counting
 ```
+
+工作区级平台状态位于 `.ra/platform.sqlite3` 和 `.ra/sources.sqlite3`；论文产物仍位于
+`writing_outputs/`，通用工作流节点检查点位于各任务目录的 `.ra/workflow/`。浏览器关闭或
+切换页面不会取消后台任务，任务页可重新观察或精确续跑。进入“研究工作台”可维护
+研究问题、假设、主张、证据、决策和 provenance；`/api/scheduler/jobs` 提供可恢复的
+后台队列，适合定时/批量实验。Web 宿主会自动执行内置和已校验的项目工作流，默认最多
+并行 2 个队列任务（可用 `RA_SCHEDULER_CONCURRENCY` 调整）；任务产物会自动进入审阅中心，
+并保留 SHA-256、版本、质量门禁和 provenance 关联。
+
+### 科研操作系统工作台
+
+项目首页现在围绕四个科研对象组织工作：Project、Agent Task、Evidence Graph 和 Artifact
+Review。任务会自动生成 Thread/Turn/Agent Item、ResearchRun 与 provenance；资料、主张、
+分析运行和论文产物可以互相追溯。`/artifacts` 提供文本/PDF/图片预览、版本 diff、门禁详情和
+“要求 Agent 修改”；`/analysis` 支持运行比较、后台复现和挂接主张；`/api/project/export`
+导出不含密钥和内部缓存的完整研究包，`/api/project/import?conflict=skip|overwrite|rename` 可安全合并回项目并返回文件冲突清单。
+项目首页提供 Ctrl/Cmd+K 全局搜索；任务详情提供 Agent 角色、状态、耗时和错误隔离面板；审批请求会进入持久化收件箱。
+来源删除会自动为关联主张写入 source_integrity 风险，Citation/Doc/复现门禁失败的产物不能被接受为 final。
+
+常用接口：
+
+- `GET /api/project/home`：项目摘要、活跃任务、风险、通知、资源消耗；
+- `GET /api/artifacts/reviews/{id}/preview|diff`：产物 Inspector；
+- `POST /api/analysis/runs/{id}/rerun`：按脚本/输入/参数创建复现运行；
+- `POST /api/tasks/{task_id}/steps/{step_id}/skip|takeover`：人工控制工作流节点。
+- `GET /api/tasks/{task_id}/agents`：任务 Agent roster、角色、状态和耗时；
+- `GET /api/approvals` / `POST /api/approvals/{id}/resolve`：持久化审批收件箱；
+- `GET /api/project/search?q=...`：跨线程、任务、资料、主张和产物搜索。
+- `GET /api/project/activity?after=...`：项目统一活动流；
+- `GET /api/agent-runs?task_id=...`：持久化 AgentRun 的角色、预算、输出和状态；
+- `GET /api/notifications`：通知中心；`python scripts/perf_research_os.py`：合成性能验收。
+
+当前科研操作系统 beta 主流程已通过真实浏览器 E2E；发布前持续验收项目包括合成性能基准、
+真实模型长任务和目标机打包运行。审批收件箱、Agent roster 和质量风险回写已纳入主流程。
 
 **No SDK dependencies.** The agentic loop is implemented directly with `httpx` HTTP calls. The `llm/` layer normalizes Anthropic and OpenAI wire protocols into a unified interface. Tools are executed locally in-process.
 

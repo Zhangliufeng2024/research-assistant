@@ -1,13 +1,17 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { Link } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
 import { candidatePreviewPaths, loadDockCollapsed, saveDockCollapsed } from "@/lib/artifacts";
+import { copyText } from "@/lib/clipboard";
 import { sessionTitle } from "@/lib/format";
+import type { MessageOpResult } from "@/lib/messageOps";
 import { shouldShowWaitHint } from "@/lib/waitHint";
 import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
+import { toast } from "@/stores/toastStore";
+import { usePinnedScroll } from "@/hooks/usePinnedScroll";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
@@ -31,22 +35,28 @@ export function ChatView() {
     chat,
     sessions,
     sessionsLoading,
+    pendingAttachments,
+    attaching,
     send,
+    attachFiles,
+    removePendingAttachment,
     respondApproval,
     stop,
     newSession,
     openSession,
     refreshSessions,
     deleteSession,
+    regenerateMessage,
+    editAndResend,
+    reconnectNow,
   } = useChatStore();
 
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [previewPaths, setPreviewPaths] = useState<string[] | null>(null);
   const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
   const [wsOpen, setWsOpen] = useState(false);
-  const [toast, setToast] = useState("");
-  const scrollRef = useRef<HTMLDivElement>(null);
-  const stickToBottom = useRef(true);
+  // 与全局 toast（stores/toastStore）并存的历史遗留轻提示：仅承载发送失败等旧文案
+  const [legacyToast, setLegacyToast] = useState("");
 
   // ---- 产出 dock（C5）：折叠态记忆（与任务页共享）；xl(1280px) 以下默认收起 ----
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
@@ -77,12 +87,13 @@ export function ChatView() {
 
   // 等待看门狗（R9）：运行中若长时间没有任何可见输出（文本增量/工具卡），
   // 给出渐进提示——端点不可达时服务端要经历 超时×重试 才报错，不能让用户
-  // 对着永久「思考中」干等。items 引用变化即视为有活动。
+  // 对着永久「思考中」干等。R13-I：长工具期没有文本增量，只有 cards/budget
+  // 在更新——引用变化同样视为活动，否则误报「已等待 n 秒未见模型输出」。
   const [nowTick, setNowTick] = useState(() => Date.now());
   const lastActivityAt = useRef(Date.now());
   useEffect(() => {
     if (chat.phase === "running") lastActivityAt.current = Date.now();
-  }, [chat.items]);
+  }, [chat.items, chat.cards, chat.budget]);
   useEffect(() => {
     if (chat.phase !== "running") return;
     const t = setInterval(() => setNowTick(Date.now()), 1000);
@@ -103,26 +114,70 @@ export function ChatView() {
       .catch(() => {});
   }, [refreshSessions]);
 
-  // 自动滚动：仅在用户本就贴近底部时跟随（避免打断回看）
-  useEffect(() => {
-    const el = scrollRef.current;
-    if (el && stickToBottom.current) {
-      el.scrollTop = el.scrollHeight;
-    }
-  }, [chat.items, chat.approval]);
+  // 智能滚动（R14-N）：贴底跟随 + 解除跟随期间的「回到底部」pill。
+  // contentToken 用 chat.items 引用（store 合帧后逐帧换新）驱动跟随/计数；
+  // 未读只数消息（user/text），工具卡不计入「N 条新消息」。
+  const messageCount = useMemo(
+    () => chat.items.reduce((n, i) => (i.kind === "tool" ? n : n + 1), 0),
+    [chat.items],
+  );
+  const { containerRef, pinned, missedCount, scrollToBottom } = usePinnedScroll({
+    contentToken: chat.items,
+    messageCount,
+    sessionKey: chat.sessionId,
+  });
+  // 流式进行中隐藏消息操作钮：regenerate/edit 此刻必被 busy 拒绝，藏起来更干净
+  const opsEnabled = chat.phase !== "running";
 
-  const onScroll = useCallback(() => {
-    const el = scrollRef.current;
-    if (!el) return;
-    stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 90;
+  /* ---- 消息操作三件套（R14-M）：结果码 → 全局 toast ---- */
+  const reportOpResult = useCallback((r: MessageOpResult) => {
+    if (r === "busy") toast.info("助手正在回复中——本回合结束后再试");
+    else if (r === "offline") toast.error("连接不可用，请稍候或新建会话");
+    else if (r === "empty") toast.info("没有找到可操作的消息");
   }, []);
 
+  const handleRegenerate = useCallback(
+    (idx: number) => {
+      void regenerateMessage(chat.sessionId, idx).then((r) => {
+        reportOpResult(r);
+        if (r === "ok") void refreshSessions();
+      });
+    },
+    [regenerateMessage, chat.sessionId, refreshSessions, reportOpResult],
+  );
+
+  const handleEditSubmit = useCallback(
+    async (idx: number, newText: string): Promise<MessageOpResult> => {
+      const r = await editAndResend(chat.sessionId, idx, newText);
+      reportOpResult(r);
+      if (r === "ok") void refreshSessions();
+      return r;
+    },
+    [editAndResend, chat.sessionId, refreshSessions, reportOpResult],
+  );
+
+  const handleCopyMessage = useCallback((text: string) => {
+    void copyText(text).then((okFlag) => {
+      if (okFlag) toast.success("已复制");
+      else toast.error("复制失败——剪贴板不可用，请手动选择文本复制");
+    });
+  }, []);
+
+  // 稳定引用是气泡 memo 边界生效的前提（R14-R）：此前内联箭头每帧换新，
+  // 会把所有工具卡行的 memo 打穿
+  const handleOpenFile = useCallback(
+    (p: string) => setPreviewPaths(candidatePreviewPaths(p, dockRoot)),
+    [dockRoot],
+  );
+
+  // R13-B：状态串必须透传给 Composer——它据此决定是否恢复草稿
   const handleSend = useCallback(
     async (text: string) => {
       const r = await send(text);
-      if (r === "offline") setToast("连接不可用，请稍候或新建会话");
-      else if (r === "empty") setToast("消息不能为空");
+      if (r === "offline") setLegacyToast("连接不可用，请稍候或新建会话");
+      else if (r === "empty") setLegacyToast("消息不能为空");
       if (r === "ok") void refreshSessions();
+      return r;
     },
     [send, refreshSessions],
   );
@@ -131,16 +186,23 @@ export function ChatView() {
     ? sessionTitle(activeSummary?.title ?? null, activeSummary?.last_message ?? "")
     : chat.phase === "idle"
       ? "新会话"
+      // R13-J：新会话兜底只用首条用户消息切片——旧的 sessions.find 兜底
+      // 会把列表里别的会话的话题借来当标题，纯属张冠李戴
       : sessionTitle(
-          sessions.find((s) => s.last_message)?.title ?? null,
+          null,
           String(chat.items.find((i) => i.kind === "user")?.text ?? ""),
         );
 
-  const connBanner =
-    conn === "error"
-      ? "无法建立与服务端的连接——请确认应用服务正在运行。"
+  // R16：reconnecting 是非致命态（服务端回合仍在跑）→ 警示横幅；自动重连
+  // 放弃后 conn==="closed" → 危险横幅 + 手动重连按钮。旧「断连即终止」文案废除。
+  const reconnectBanner =
+    conn === "reconnecting"
+      ? { tone: "warn" as const, text: "连接中断，正在自动重连……回合仍在后台运行，完成后自动保存。" }
       : conn === "closed" && chat.phase === "running"
-        ? "连接已断开，服务端已停止本次运行；重新发送可继续对话。"
+        ? {
+            tone: "danger" as const,
+            text: "连接已中断且未能自动恢复——回合仍在服务端继续并会保存到历史；重新打开本会话或点击重连查看进展。",
+          }
         : null;
 
   return (
@@ -158,9 +220,9 @@ export function ChatView() {
           onDelete={async (id) => {
             try {
               await deleteSession(id);
-              setToast("会话已删除");
+              setLegacyToast("会话已删除");
             } catch {
-              setToast("删除失败");
+              setLegacyToast("删除失败");
             }
           }}
         />
@@ -194,7 +256,7 @@ export function ChatView() {
         </div>
 
         {/* 横幅区 */}
-        {(configured === false || connBanner || chat.error || shouldShowWaitHint(chat.phase, silentSeconds)) && (
+        {(configured === false || reconnectBanner || chat.error || shouldShowWaitHint(chat.phase, silentSeconds)) && (
           <div className="shrink-0 space-y-px">
             {configured === false && (
               <Link
@@ -209,9 +271,24 @@ export function ChatView() {
                 出错：{chat.error}（重新发送即可重试）
               </div>
             )}
-            {connBanner && (
-              <div className="bg-danger/10 px-5 py-2 text-center text-[12.5px] text-danger">
-                {connBanner}
+            {reconnectBanner && (
+              <div
+                className={`flex items-center justify-center gap-3 px-5 py-2 text-center text-[12.5px] ${
+                  reconnectBanner.tone === "warn"
+                    ? "bg-warn/10 text-warn"
+                    : "bg-danger/10 text-danger"
+                }`}
+              >
+                <span>{reconnectBanner.text}</span>
+                {reconnectBanner.tone === "danger" && (
+                  <button
+                    type="button"
+                    onClick={reconnectNow}
+                    className="shrink-0 rounded-lg border border-danger/40 bg-surface px-2 py-0.5 text-[11.5px] font-medium text-danger transition-colors hover:bg-surface-2"
+                  >
+                    重连
+                  </button>
+                )}
               </div>
             )}
             {shouldShowWaitHint(chat.phase, silentSeconds) && (
@@ -226,13 +303,46 @@ export function ChatView() {
           </div>
         )}
 
-        <MessageList
-          chat={chat}
-          scrollRef={scrollRef}
-          onScroll={onScroll}
-          onOpenFile={(p) => setPreviewPaths(candidatePreviewPaths(p, dockRoot))}
-          onPickSuggestion={(t) => void handleSend(t)}
-        />
+        {/* 消息流 + 回到底部 pill（R14-N）：pill 绝对定位于消息区右下角，
+            与 Toaster 的视口右下角固定区天然错开（中间还隔着输入区） */}
+        <div className="relative min-h-0 flex-1">
+          <MessageList
+            chat={chat}
+            containerRef={containerRef}
+            opsEnabled={opsEnabled}
+            onOpenFile={handleOpenFile}
+            onPickSuggestion={(t) => void handleSend(t)}
+            onCopyMessage={handleCopyMessage}
+            onRegenerate={handleRegenerate}
+            onEditSubmit={handleEditSubmit}
+          />
+          <AnimatePresence>
+            {!pinned && (
+              <motion.button
+                key="back-to-bottom"
+                type="button"
+                onClick={scrollToBottom}
+                initial={{ opacity: 0, y: 12, scale: 0.96 }}
+                animate={{ opacity: 1, y: 0, scale: 1 }}
+                exit={{ opacity: 0, y: 8, transition: { duration: 0.15, ease: "easeIn" } }}
+                transition={{ duration: 0.18, ease: "easeOut" }}
+                className="absolute bottom-4 right-5 z-20 flex items-center gap-2 rounded-full border border-edge bg-surface py-1.5 pl-3.5 pr-2.5 text-[12.5px] font-medium shadow-card transition-colors hover:bg-surface-2"
+              >
+                回到底部
+                {missedCount > 0 && (
+                  <span className="rounded-full bg-accent-tint px-2 py-0.5 text-[11px] font-medium text-accent-hover dark:text-accent">
+                    {missedCount} 条新消息
+                  </span>
+                )}
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                  strokeLinecap="round" strokeLinejoin="round" className="h-3.5 w-3.5 text-ink-3" aria-hidden>
+                  <path d="M12 5v14" />
+                  <path d="m19 12-7 7-7-7" />
+                </svg>
+              </motion.button>
+            )}
+          </AnimatePresence>
+        </div>
 
         {/* 审批卡（悬浮于输入区上方） */}
         <AnimatePresence>
@@ -250,9 +360,19 @@ export function ChatView() {
 
         <Composer
           running={chat.phase === "running"}
-          disabled={conn === "connecting"}
+          disabled={conn === "connecting" || conn === "reconnecting"}
           focusSignal={draftFocusTick}
-          onSend={(t) => void handleSend(t)}
+          pendingAttachments={pendingAttachments}
+          attaching={attaching}
+          onSend={handleSend}
+          onAttach={(files) =>
+            attachFiles(files).then((r) => {
+              if (r === "offline") setLegacyToast("附件上传失败——请检查连接后重试");
+              else if (r === "limit") setLegacyToast("单条消息最多 8 个附件");
+              return r;
+            })
+          }
+          onRemoveAttachment={removePendingAttachment}
         />
 
         {/* 工作目录入口（R8 反馈 #1：Claude Desktop 式，对话框下方随时更换） */}
@@ -314,7 +434,7 @@ export function ChatView() {
             // 若残留，下一条消息带旧 id 连入会触发服务端「幂等重建」，在新
             // 工作区造出无标题空目录。复位为全新会话（与删除活跃会话同语义）。
             newSession();
-            setToast(`已切换到「${next.name}」`);
+            setLegacyToast(`已切换到「${next.name}」`);
             refreshSessions().catch(() => {});
           }}
         />
@@ -324,20 +444,20 @@ export function ChatView() {
         <FilePreviewModal paths={previewPaths} onClose={() => setPreviewPaths(null)} />
       )}
 
-      {/* 轻提示 */}
+      {/* 轻提示（旧式底部居中，仅承载发送失败等遗留文案，待全局化后移除） */}
       <AnimatePresence>
-        {toast && (
+        {legacyToast && (
           <motion.div
             key="toast"
             initial={{ opacity: 0, y: 10 }}
             animate={{ opacity: 1, y: 0 }}
             exit={{ opacity: 0 }}
             onAnimationComplete={() => {
-              if (toast) setTimeout(() => setToast(""), 2400);
+              if (legacyToast) setTimeout(() => setLegacyToast(""), 2400);
             }}
             className="fixed bottom-24 left-1/2 z-40 -translate-x-1/2 rounded-xl bg-ink px-4 py-2 text-[12.5px] text-canvas shadow-card dark:text-ink"
           >
-            {toast}
+            {legacyToast}
           </motion.div>
         )}
       </AnimatePresence>

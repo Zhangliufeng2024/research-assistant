@@ -13,6 +13,7 @@ async def read_file(
     offset: int = 0,
     limit: int = 2000,
     sandbox: str | None = None,
+    write_anchor: str | None = None,
 ) -> str:
     """Read a file and return its content with line numbers.
 
@@ -21,15 +22,30 @@ async def read_file(
         offset: Line number to start reading from (0-based).
         limit: Maximum number of lines to read.
         sandbox: If set, restricts access to this directory tree.
+        write_anchor: 双轨回退（修复 G）：相对路径在 sandbox 根下不存在而
+            anchor 下存在时读 anchor 副本；绝对路径行为完全不变。
     """
-    p = Path(file_path)
+    raw = Path(file_path)
+    relative = not raw.is_absolute()
+    p: Path
     if sandbox:
         try:
-            p = safe_resolve(p, Path(sandbox))
+            sandbox_path = Path(sandbox)
+            p = safe_resolve(
+                raw if not relative else sandbox_path / raw,
+                sandbox_path,
+            )
+            # 相对路径双轨回退：根下没有、anchor 下有 → 读 anchor 副本，
+            # 避免「写进 anchor、读到根」的会话内不一致。
+            if relative and write_anchor is not None and not p.exists():
+                anchor_candidate = safe_resolve(
+                    Path(write_anchor) / raw, sandbox_path)
+                if anchor_candidate.exists():
+                    p = anchor_candidate
         except ValueError as e:
             return f"Error: {e}"
     else:
-        p = p.resolve()
+        p = raw.resolve()
 
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
@@ -55,6 +71,47 @@ async def read_file(
     return result
 
 
+#: Windows 保留设备名（修复 H）：整名匹配——con.txt 拒绝、concrete.md 放行。
+_WINDOWS_RESERVED_RE = re.compile(
+    r"(aux|con|prn|nul|com[1-9]|lpt[1-9])(\..*)?$",
+    re.IGNORECASE,
+)
+
+
+def _reject_windows_hazard(file_path: str) -> str | None:
+    """Windows 特有非法写入目标校验；返回拒绝文案，合法返回 None（修复 H）。
+
+    - 保留设备名（CON/NUL/AUX/COM1-9/LPT1-9）：即便带扩展名，写入也会被
+      系统重定向到设备吞掉内容（静默数据丢失），必须拒绝；
+    - 盘符之外的冒号：NTFS 备用数据流（ADS）形态（file:stream），不属于
+      普通文件语义，拒绝以防绕过版本跟踪与审阅。
+    """
+    raw = Path(file_path)
+    name = raw.name
+    if _WINDOWS_RESERVED_RE.fullmatch(name):
+        return (
+            f"Error: '{name}' 是 Windows 保留设备名，无法作为普通文件写入"
+            "（内容会被设备吞掉导致静默丢失）。请换一个文件名。"
+        )
+    if ":" in file_path:
+        normalized = file_path.replace("\\", "/")
+        head = normalized.split("/", 1)[0]
+        # 仅允许首段出现一次盘符冒号（D:\... / D:/...）；其余位置或数量的
+        # 冒号均为 ADS 形态。
+        colon_ok = (
+            len(head) >= 2
+            and head[1] == ":"
+            and head.count(":") == 1
+            and normalized.count(":") == 1
+        )
+        if not colon_ok:
+            return (
+                "Error: 文件路径含盘符之外的冒号（疑似 NTFS 备用数据流）:"
+                f" {file_path}。请使用普通文件路径。"
+            )
+    return None
+
+
 async def write_file(
     file_path: str,
     content: str,
@@ -76,6 +133,10 @@ async def write_file(
         sandbox: If set, restricts writes to this directory tree.
         write_anchor: 归巢目录（相对路径的确定性落点），须位于 sandbox 内。
     """
+    hazard = _reject_windows_hazard(file_path)
+    if hazard is not None:
+        return hazard
+
     p = Path(file_path)
     if sandbox:
         try:
@@ -104,6 +165,7 @@ async def edit_file(
     old_string: str,
     new_string: str,
     sandbox: str | None = None,
+    write_anchor: str | None = None,
 ) -> str:
     """Replace an exact string in a file. old_string must appear exactly once.
 
@@ -112,21 +174,36 @@ async def edit_file(
         old_string: The exact text to find and replace.
         new_string: The text to replace it with.
         sandbox: If set, restricts edits to this directory tree.
+        write_anchor: anchor 优先存在性（修复 G）：相对路径在 anchor 下存在
+            时编辑 anchor 副本（与 write_file 同一落点），否则退回 sandbox 根
+            （共享文件编辑兼容）；绝对路径行为完全不变。
     """
-    p = Path(file_path)
+    raw = Path(file_path)
+    relative = not raw.is_absolute()
+    p: Path
     if sandbox:
         try:
-            p = safe_resolve(p, Path(sandbox))
+            sandbox_path = Path(sandbox)
+            if not relative:
+                p = safe_resolve(raw, sandbox_path)
+            else:
+                p = safe_resolve(sandbox_path / raw, sandbox_path)
+                if write_anchor is not None:
+                    anchor_candidate = safe_resolve(
+                        Path(write_anchor) / raw, sandbox_path)
+                    if anchor_candidate.exists():
+                        p = anchor_candidate
         except ValueError as e:
             return f"Error: {e}"
     else:
-        p = p.resolve()
+        p = raw.resolve()
 
     if not p.exists():
         return f"Error: File does not exist: {file_path}"
 
     try:
-        text = p.read_text(encoding="utf-8")
+        # errors="replace"：GBK 等存量编码文件可编不可崩（修复 G）
+        text = p.read_text(encoding="utf-8", errors="replace")
     except Exception as e:
         return f"Error reading file: {e}"
 
@@ -144,9 +221,24 @@ async def edit_file(
         return f"Error writing file: {e}"
 
 
-async def glob_files(pattern: str, path: str = ".") -> str:
-    """Find files matching a glob pattern."""
+async def glob_files(
+    pattern: str,
+    path: str = ".",
+    sandbox: str | None = None,
+) -> str:
+    """Find files matching a glob pattern, optionally inside *sandbox*."""
     base = Path(path)
+    if sandbox:
+        try:
+            sandbox_path = Path(sandbox)
+            base = safe_resolve(
+                base if base.is_absolute() else sandbox_path / base,
+                sandbox_path,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+    else:
+        base = base.resolve()
     if not base.exists():
         return f"Error: Directory does not exist: {path}"
 
@@ -154,6 +246,16 @@ async def glob_files(pattern: str, path: str = ".") -> str:
     # 避免在 async def 里同步 rglob 卡死事件循环——那会让所有 WS/REST
     # 一起失联（R9 任务页「无法建立连接」的候选共因）。
     matches = await asyncio.to_thread(lambda: sorted(base.glob(pattern)))
+    if sandbox:
+        safe_matches: list[Path] = []
+        for match in matches:
+            try:
+                safe_matches.append(safe_resolve(match, Path(sandbox)))
+            except ValueError:
+                # Do not expose paths outside the configured workspace. A
+                # pattern may contain ``..`` or traverse an external symlink.
+                continue
+        matches = safe_matches
     if not matches:
         return f"No files matching '{pattern}' in {path}"
 
@@ -186,9 +288,25 @@ def _grep_scan(
             return
 
 
-async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
-    """Search for a regex pattern in files."""
+async def grep_search(
+    pattern: str,
+    path: str = ".",
+    glob: str = "",
+    sandbox: str | None = None,
+) -> str:
+    """Search for a regex pattern in files, optionally inside *sandbox*."""
     base = Path(path)
+    if sandbox:
+        try:
+            sandbox_path = Path(sandbox)
+            base = safe_resolve(
+                base if base.is_absolute() else sandbox_path / base,
+                sandbox_path,
+            )
+        except ValueError as e:
+            return f"Error: {e}"
+    else:
+        base = base.resolve()
     if not base.exists():
         return f"Error: Path does not exist: {path}"
 
@@ -204,6 +322,15 @@ async def grep_search(pattern: str, path: str = ".", glob: str = "") -> str:
             files = await asyncio.to_thread(lambda: sorted(base.rglob(glob)))
         else:
             files = await asyncio.to_thread(lambda: sorted(base.rglob("*")))
+
+    if sandbox:
+        safe_files: list[Path] = []
+        for match in files:
+            try:
+                safe_files.append(safe_resolve(match, Path(sandbox)))
+            except ValueError:
+                continue
+        files = safe_files
 
     results: list[str] = []
     await asyncio.to_thread(_grep_scan, regex, files, results)

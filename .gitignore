@@ -16,6 +16,9 @@ env/
 # Environment variables (contains API keys)
 .env
 
+# Key-rotation env backups (real API keys inside) — never commit
+.env.ra*
+
 # Debug and logs
 *.log
 debug*.log
@@ -70,3 +73,6 @@ _ra_exec_*.py
 # build.py --restricted 的 PyInstaller 产物 spec（每次构建重新生成）
 ResearchAssistant_Trial.spec
 *.spec
+
+# 内部计划文档（防误入库）
+plan260824.md

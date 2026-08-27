@@ -212,8 +212,8 @@ IMPORTANT - NO FIGURE NUMBERS:
         self.verbose = verbose
         self._last_error = None  # Track last error for better reporting
         self.base_url = os.environ.get("IMAGE_BASE_URL", "https://apihub.agnes-ai.com/v1")
-        self.image_model = os.getenv("IMAGE_MODEL", "agnes-image-2.1-flash")
-        self.review_model = os.getenv("IMAGE_REVIEW_MODEL", "agnes-image-2.1-flash")
+        self.image_model = os.getenv("IMAGE_MODEL", "agnes-image-2.0-flash")
+        self.review_model = os.getenv("IMAGE_REVIEW_MODEL", "agnes-2.0-flash")
         
     def _log(self, message: str):
         """Log message if verbose mode is enabled."""
@@ -337,9 +337,10 @@ IMPORTANT - NO FIGURE NUMBERS:
         payload = {
             "model": model,
             "prompt": prompt,
-            "n": 1,
             "size": size,
-            "response_format": "b64_json",
+            # Agnes images API contract: return_base64=true → data[0].b64_json
+            # (the endpoint ignores the legacy OpenAI response_format field).
+            "return_base64": True,
         }
 
         base_delay = 2
@@ -369,9 +370,9 @@ IMPORTANT - NO FIGURE NUMBERS:
                         raise RuntimeError("No image data in response")
 
                     first = data_list[0]
-                    if "b64_json" in first:
+                    if first.get("b64_json"):
                         return base64.b64decode(first["b64_json"])
-                    elif "url" in first:
+                    elif first.get("url"):
                         img_resp = requests.get(first["url"], timeout=60)
                         if img_resp.status_code != 200:
                             raise RuntimeError(f"Failed to download image: {img_resp.status_code}")

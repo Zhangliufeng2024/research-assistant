@@ -24,6 +24,7 @@ from typing import Any
 import yaml
 
 from ..config import load_project_env
+from ..constants import DEFAULT_ANTHROPIC_MODEL
 from ..kernel.budget import BudgetLimits
 from .metrics import check_thresholds, compute_metrics
 
@@ -88,7 +89,8 @@ def main() -> int:
         return 2
 
     task = load_task(args.task)
-    model = args.model or os.getenv("LLM_MODEL") or "claude-sonnet-4-6"
+    # 兜底默认与 constants 保持同源（避免再出现两处硬编码漂移）
+    model = args.model or os.getenv("LLM_MODEL") or DEFAULT_ANTHROPIC_MODEL
     workdir = Path(args.workdir or Path.cwd())
     workdir.mkdir(parents=True, exist_ok=True)
 

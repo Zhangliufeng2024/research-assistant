@@ -164,10 +164,11 @@ class TestRegistryRegression:
     @pytest.mark.asyncio
     async def test_bash_timeout_via_registry(self, tmp_path):
         registry = ToolRegistry(work_dir=str(tmp_path))
+        # 修复 F：registry 层超时钳位下限 5s——命令须长于 5 秒才能触发超时
         if os.name == "nt":
-            command = "ping -n 3 127.0.0.1"
+            command = "ping -n 30 127.0.0.1"
         else:
-            command = "sleep 3"
+            command = "sleep 8"
         result = await registry.execute("bash", {"command": command, "timeout": 1})
         assert "Error: Command timed out" in result
 
@@ -222,3 +223,40 @@ class TestWorkspaceRootForwarding:
         sig = inspect.signature(ExecProvider.run_python)
         assert "workspace_root" in sig.parameters
         assert sig.parameters["workspace_root"].default is None
+
+
+# ---------------------------------------------------------------------------
+# 修复 F：registry 层执行超时钳位到 [5, 600] 秒
+# ---------------------------------------------------------------------------
+
+class TestTimeoutClamp:
+    @pytest.mark.asyncio
+    async def test_bash_timeout_clamped_to_max(self, tmp_path):
+        fake = FakeExecProvider()
+        registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=fake)
+        await registry.execute("bash", {"command": "echo hi", "timeout": 99999})
+        assert fake.calls[0][1]["timeout"] == 600
+
+    @pytest.mark.asyncio
+    async def test_bash_timeout_clamped_to_min(self, tmp_path):
+        fake = FakeExecProvider()
+        registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=fake)
+        await registry.execute("bash", {"command": "echo hi", "timeout": 0})
+        assert fake.calls[0][1]["timeout"] == 5
+
+    @pytest.mark.asyncio
+    async def test_run_python_timeout_clamped_both_ends(self, tmp_path):
+        fake = FakeExecProvider()
+        registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=fake)
+        await registry.execute("run_python", {"code": "x = 1", "timeout": -3})
+        await registry.execute("run_python", {"code": "x = 1", "timeout": 10**9})
+        assert fake.calls[0][1]["timeout"] == 5
+        assert fake.calls[1][1]["timeout"] == 600
+
+    @pytest.mark.asyncio
+    async def test_non_numeric_timeout_falls_back_to_default(self, tmp_path):
+        # 垃圾值不再抛异常走 Error 分支，而是回默认 120（健壮性顺带修复）
+        fake = FakeExecProvider()
+        registry = ToolRegistry(work_dir=str(tmp_path), exec_provider=fake)
+        await registry.execute("bash", {"command": "echo hi", "timeout": "abc"})
+        assert fake.calls[0][1]["timeout"] == 120

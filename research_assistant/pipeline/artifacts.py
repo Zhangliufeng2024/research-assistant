@@ -13,6 +13,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+from ..core import atomic_write_text
+
 
 def sha256_of(path: Path) -> str:
     h = hashlib.sha256()
@@ -58,15 +60,15 @@ class ArtifactStore:
             data = json.loads(self._manifest_path.read_text(encoding="utf-8"))
             for e in data.get("artifacts", []):
                 self._entries[e["key"]] = ArtifactEntry(**e)
-        except (json.JSONDecodeError, KeyError, TypeError):
+        except (json.JSONDecodeError, KeyError, OSError, TypeError):
             self._entries = {}
 
     def _save(self) -> None:
         self._dir.mkdir(parents=True, exist_ok=True)
-        self._manifest_path.write_text(
+        atomic_write_text(
+            self._manifest_path,
             json.dumps({"artifacts": [e.to_dict() for e in self._entries.values()]},
                        indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
     # -- operations ----------------------------------------------------------

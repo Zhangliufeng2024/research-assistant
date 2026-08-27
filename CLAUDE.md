@@ -106,6 +106,8 @@ verify_citations(
 
 ## CRITICAL: Parallel Web Search Policy
 
+> **中文注记（打包/冻结环境）**：打包/冻结环境下禁止裸调 python——下表及全文的技能脚本命令一律改为经 run_python 工具内的 `run_script(路径, argv)` 执行（见 research_assistant/core.py 的冻结执行契约 `_FROZEN_CONTRACT`）；`python ...` 形式仅适用于开发态。
+
 **Use Parallel Web Systems APIs for ALL web searches, URL extraction, and deep research.**
 
 Parallel is the **primary tool for all web-related operations**. Do NOT use the built-in WebSearch tool except as a last-resort fallback if Parallel is unavailable.
@@ -116,12 +118,12 @@ Parallel is the **primary tool for all web-related operations**. Do NOT use the 
 
 | Task | Tool | Command |
 |------|------|---------|
-| Web search (any) | `parallel-web` skill | `python scripts/parallel_web.py search "query" -o sources/search_<topic>.md` |
-| Extract URL content | `parallel-web` skill | `python scripts/parallel_web.py extract "url" --objective "focus" -o sources/extract_<source>.md` |
-| Deep research (any topic) | `parallel-web` skill | `python scripts/parallel_web.py research "query" --processor pro-fast -o sources/research_<topic>.md` |
-| Academic paper search | `research-lookup` skill | `python research_lookup.py "find papers on..." -o sources/papers_<topic>.md` (auto-routes to Perplexity) |
-| DOI/metadata verification | `parallel-web` skill | `python scripts/parallel_web.py search "DOI query" -o sources/search_<topic>.md` or `extract` |
-| Current events/news | `parallel-web` skill | `python scripts/parallel_web.py search "news query" -o sources/search_<topic>.md` |
+| Web search (any) | `parallel-web` skill | `python .claude/skills/parallel-web/scripts/parallel_web.py search "query" -o sources/search_<topic>.md` |
+| Extract URL content | `parallel-web` skill | `python .claude/skills/parallel-web/scripts/parallel_web.py extract "url" --objective "focus" -o sources/extract_<source>.md` |
+| Deep research (any topic) | `parallel-web` skill | `python .claude/skills/parallel-web/scripts/parallel_web.py research "query" --processor pro-fast -o sources/research_<topic>.md` |
+| Academic paper search | `research-lookup` skill | `python .claude/skills/research-lookup/scripts/research_lookup.py "find papers on..." -o sources/papers_<topic>.md` (auto-routes to Perplexity) |
+| DOI/metadata verification | `parallel-web` skill | `python .claude/skills/parallel-web/scripts/parallel_web.py search "DOI query" -o sources/search_<topic>.md` or `extract` |
+| Current events/news | `parallel-web` skill | `python .claude/skills/parallel-web/scripts/parallel_web.py search "news query" -o sources/search_<topic>.md` |
 
 **Key Rules:**
 - Use `parallel_web.py search` instead of WebSearch for ALL web information gathering
@@ -372,7 +374,7 @@ Documents without sufficient visual elements are incomplete. Generate figures li
 Every scientific writeup (research papers, literature reviews, reports) MUST include a graphical abstract as the first figure. Generate this using the scientific-schematics skill:
 
 ```bash
-python scripts/generate_schematic.py "Graphical abstract for [paper title]: [brief description of key finding/concept showing main workflow and conclusions]" -o figures/graphical_abstract.png
+python .claude/skills/scientific-schematics/scripts/generate_schematic.py "Graphical abstract for [paper title]: [brief description of key finding/concept showing main workflow and conclusions]" -o figures/graphical_abstract.png
 ```
 
 **Graphical Abstract Requirements:**
@@ -395,7 +397,7 @@ python scripts/generate_schematic.py "Graphical abstract for [paper title]: [bri
 - Any concept that benefits from schematic visualization
 
 ```bash
-python scripts/generate_schematic.py "diagram description" -o figures/output.png
+python .claude/skills/scientific-schematics/scripts/generate_schematic.py "diagram description" -o figures/output.png
 ```
 
 **Use generate-image skill EXTENSIVELY for visual content:**
@@ -409,7 +411,7 @@ python scripts/generate_schematic.py "diagram description" -o figures/output.png
 - Any visual that enhances understanding or engagement
 
 ```bash
-python scripts/generate_image.py "image description" -o figures/output.png
+python .claude/skills/generate-image/scripts/generate_image.py "image description" -o figures/output.png
 ```
 
 **Unified image generation — single script, auto-detected provider:**
@@ -418,26 +420,26 @@ python scripts/generate_image.py "image description" -o figures/output.png
   - Key starts with `nvapi-` → NVIDIA NIM endpoint (free)
   - Model starts with `agnes-image` → Agnes Images API (`/images/generations`)
   - Otherwise → OpenAI-compatible chat/completions endpoint
-- Default model: `agnes-image-2.1-flash`
+- Default model: `agnes-image-2.0-flash`
 - Default endpoint: `https://apihub.agnes-ai.com/v1`
 - Requires: `IMAGE_API_KEY` in `.env`
 
 ```bash
-# Default model (agnes-image-2.1-flash)
-python scripts/generate_image.py "neural network architecture diagram" -o figures/output.png
+# Default model (agnes-image-2.0-flash)
+python .claude/skills/generate-image/scripts/generate_image.py "neural network architecture diagram" -o figures/output.png
 
 # Specific model
-python scripts/generate_image.py "flowchart" -o figures/flow.png --model agnes-image-2.1-flash
+python .claude/skills/generate-image/scripts/generate_image.py "flowchart" -o figures/flow.png --model agnes-image-2.0-flash
 
 # Image editing (with input image, chat/completions models only)
-python scripts/generate_image.py "Add labels" -o edited.png --input original.png
+python .claude/skills/generate-image/scripts/generate_image.py "Add labels" -o edited.png --input original.png
 ```
 
 **Image generation environment variables (decoupled from writing model):**
 - `IMAGE_API_KEY` — API key (required, auto-detects NVIDIA vs OpenAI-compatible)
 - `IMAGE_BASE_URL` — Base URL for image API endpoint (default: `https://apihub.agnes-ai.com/v1`)
-- `IMAGE_MODEL` — Image generation model (default: agnes-image-2.1-flash)
-- `IMAGE_REVIEW_MODEL` — Quality review model for iterative refinement (default: agnes-image-2.1-flash)
+- `IMAGE_MODEL` — Image generation model (default: agnes-image-2.0-flash)
+- `IMAGE_REVIEW_MODEL` — Quality review model for iterative refinement (default: agnes-2.0-flash)
 
 **MINIMUM Figure Requirements by Document Type:**
 
@@ -482,15 +484,15 @@ After writing each section (or at minimum before compiling the final PDF), scan 
 
 1. **Search for the missing metadata** using `parallel_web.py search`:
    ```bash
-   python scripts/parallel_web.py search "AUTHOR TITLE JOURNAL YEAR volume pages DOI" -o sources/search_YYYYMMDD_HHMMSS_citation_metadata.md
+   python .claude/skills/parallel-web/scripts/parallel_web.py search "AUTHOR TITLE JOURNAL YEAR volume pages DOI" -o sources/search_YYYYMMDD_HHMMSS_citation_metadata.md
    ```
 2. **If DOI is known but other fields missing**, extract metadata from the DOI:
    ```bash
-   python scripts/parallel_web.py extract "https://doi.org/DOI_HERE" --objective "extract volume, issue, pages, publication year" -o sources/extract_YYYYMMDD_HHMMSS_doi_metadata.md
+   python .claude/skills/parallel-web/scripts/parallel_web.py extract "https://doi.org/DOI_HERE" --objective "extract volume, issue, pages, publication year" -o sources/extract_YYYYMMDD_HHMMSS_doi_metadata.md
    ```
 3. **If DOI is unknown**, search for it:
    ```bash
-   python scripts/parallel_web.py search "AUTHOR TITLE JOURNAL DOI" -o sources/search_YYYYMMDD_HHMMSS_find_doi.md
+   python .claude/skills/parallel-web/scripts/parallel_web.py search "AUTHOR TITLE JOURNAL DOI" -o sources/search_YYYYMMDD_HHMMSS_find_doi.md
    ```
 4. **Update the BibTeX entry** with all found metadata
 5. **Log the fix**: `[HH:MM:SS] METADATA FIXED: [CitationKey] - added [fields] ✅`

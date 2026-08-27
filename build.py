@@ -6,9 +6,14 @@ R7 起默认打包为**无黑框桌面应用**（--noconsole，单窗口 pywebvi
 Usage:
     python build.py                    # 无控制台桌面版（发布用）
     python build.py --debug-console    # 保留控制台的调试版
-    python build.py --restricted       # restricted version (3-month expiry)
+    python build.py --restricted       # trial-branded entry (no expiry gate)
+
+打包前置检查（任一失败即中止）：
+    1. 四处版本号一致：pyproject.toml / __init__.py / installer.iss / package.json
+    2. 源码树密钥泄漏扫描（文本 + 二进制，含 dist/ 旧产物）
 """
 
+import json
 import re
 import shutil
 import subprocess
@@ -21,7 +26,154 @@ BUILD = ROOT / "build"
 PACKAGE = ROOT / "research_assistant"
 
 
+# ---------------------------------------------------------------------------
+# 版本一致性检查
+# ---------------------------------------------------------------------------
+
+def _read_versions() -> dict[str, str | None]:
+    """提取四处版本号；解析不到的记为 None（简单正则即可，不引入新依赖）。"""
+    out: dict[str, str | None] = {}
+
+    pyproject = (ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    m = re.search(r'(?m)^version\s*=\s*"([^"]+)"', pyproject)
+    out["pyproject.toml"] = m.group(1) if m else None
+
+    init_py = (PACKAGE / "__init__.py").read_text(encoding="utf-8")
+    m = re.search(r'(?m)^__version__\s*=\s*"([^"]+)"', init_py)
+    out["research_assistant/__init__.py"] = m.group(1) if m else None
+
+    iss = (ROOT / "packaging" / "installer.iss").read_text(encoding="utf-8")
+    m = re.search(r'#define\s+MyAppVersion\s+"([^"]+)"', iss)
+    out["packaging/installer.iss"] = m.group(1) if m else None
+
+    pkg = json.loads((ROOT / "frontend" / "package.json").read_text(encoding="utf-8"))
+    v = pkg.get("version")
+    out["frontend/package.json"] = str(v) if v else None
+
+    return out
+
+
+def _fail_if_inconsistent(versions: dict[str, str | None]) -> None:
+    bad = {k: v for k, v in versions.items() if not v}
+    if bad:
+        print("ERROR: 无法解析以下文件的版本号，请人工核对：")
+        for k in bad:
+            print(f"  - {k}")
+        sys.exit(1)
+
+    distinct = sorted(set(versions.values()))
+    print("  Version sources:")
+    for k, v in versions.items():
+        print(f"    - {k}: {v}")
+    if len(distinct) > 1:
+        print(f"\nERROR: 版本号不一致（{' vs '.join(distinct)}）—— 请先统一四处版本再打包。")
+        sys.exit(1)
+    print(f"[OK] 四处版本一致: {distinct[0]}\n")
+
+
+def check_version_consistency():
+    _fail_if_inconsistent(_read_versions())
+
+
+# ---------------------------------------------------------------------------
+# 泄漏扫描（文本 + 二进制）
+# ---------------------------------------------------------------------------
+
+# 文本扫描扩展名；二进制做字节级正则扫描的扩展名
+TEXT_EXTS = {
+    ".py", ".md", ".txt", ".cfg", ".ini", ".json",
+    ".yaml", ".yml", ".toml", ".html", ".js", ".ts",
+}
+BINARY_EXTS = {".exe", ".dll", ".pyd", ".pyc", ".pyz"}
+
+KEY_RE_TEXT = re.compile(r"\b(?:sk-|nvapi-)[A-Za-z0-9_-]{16,}")
+KEY_RE_BYTES = (
+    re.compile(rb"\bsk-[A-Za-z0-9_-]{16,}"),
+    re.compile(rb"\bnvapi-[A-Za-z0-9_-]{16,}"),
+)
+
+# 目录剪枝：node_modules/.git 按规约排除（dist **不排除**，同样要扫）；
+# 虚拟环境是第三方 site-packages——体积大、示例假钥匙多，纯噪声；
+# tests/ 的夹具故意放假钥匙（sk- 加一串字母表序号那种），且测试代码从不入包。
+SCAN_SKIP_DIRS = {"node_modules", ".git", ".venv", "venv"}
+
+# 明显占位符样例不算泄漏（技能文档/示例里常见 your_key_here、<your-key> 之类；
+# 这些文档会随 .claude/ 打入安装包，若不过滤则每次构建都会误报）。
+PLACEHOLDER_MARKS = ("your", "here", "example", "placeholder", "dummy", "xxx")
+
+_CHUNK = 1024 * 1024   # 二进制分块大小
+_OVERLAP = 4096        # 块间重叠，覆盖跨块边界的匹配
+
+
+def _mask(fragment: str) -> str:
+    if len(fragment) <= 8:
+        return "****"
+    return f"{fragment[:4]}****{fragment[-4:]}"
+
+
+def _is_placeholder(fragment: str) -> bool:
+    low = fragment.lower()
+    return any(mark in low for mark in PLACEHOLDER_MARKS)
+
+
+def _scan_file_for_keys(path: Path) -> list[str]:
+    """返回该文件中疑似真实密钥的片段（已去重、已滤除占位符样例）。"""
+    ext = path.suffix.lower()
+    found: list[str] = []
+    try:
+        if ext in TEXT_EXTS:
+            found = KEY_RE_TEXT.findall(path.read_text(encoding="utf-8", errors="ignore"))
+        elif ext in BINARY_EXTS:
+            tail = b""
+            with path.open("rb") as fh:
+                while True:
+                    chunk = fh.read(_CHUNK)
+                    if not chunk:
+                        break
+                    data = tail + chunk
+                    for pat in KEY_RE_BYTES:
+                        found.extend(
+                            m.decode("ascii", "ignore") for m in pat.findall(data)
+                        )
+                    tail = data[-_OVERLAP:]
+        else:
+            return []
+    except OSError:
+        return []
+    return [f for f in dict.fromkeys(found) if not _is_placeholder(f)]
+
+
+def _scan_leaked_keys(root: Path, skip_extra: frozenset[str] = frozenset()) -> list[tuple[Path, str]]:
+    """在 root 下递归扫描疑似密钥，返回 [(文件, 片段), ...]。"""
+    skip = SCAN_SKIP_DIRS | skip_extra
+    problems: list[tuple[Path, str]] = []
+    stack = [root]
+    while stack:
+        d = stack.pop()
+        try:
+            entries = sorted(d.iterdir())
+        except OSError:
+            continue
+        for entry in entries:
+            if entry.is_dir():
+                if entry.name not in skip:
+                    stack.append(entry)
+            elif entry.is_file():
+                for frag in _scan_file_for_keys(entry):
+                    problems.append((entry, frag))
+    return problems
+
+
+def _display_path(p: Path) -> Path:
+    try:
+        return p.relative_to(ROOT)
+    except ValueError:
+        return p
+
+
 def check_env_safety():
+    """打包前安全检查：.env 提醒 + 全仓（含 dist/）密钥泄漏扫描。"""
+    warned = False
     env_file = ROOT / ".env"
     if env_file.exists():
         content = env_file.read_text(encoding="utf-8")
@@ -35,7 +187,20 @@ def check_env_safety():
                 print(f"WARNING: .env contains a real key for {key}!")
                 print("The .env file will NOT be bundled into the exe.")
                 print("User keys are configured via the GUI at runtime.")
+                warned = True
                 break
+
+    # 预检扫描整个仓库（dist/ 旧产物一并扫）；tests/ 剪枝理由见 SCAN_SKIP_DIRS 上方注释
+    problems = _scan_leaked_keys(ROOT, skip_extra=frozenset({"tests"}))
+    if problems:
+        print("\nERROR: 源码树中发现疑似真实密钥，构建中止：")
+        for f, frag in problems:
+            print(f"  - {_display_path(f)} -> {_mask(frag)}")
+        sys.exit(1)
+
+    if warned:
+        # .env 允许存在用户自己的密钥（不会被打包），只提醒、不放行标记
+        print("[NOTE] .env 密钥扫描通过（.env 本身不入包，见上方提醒）。")
     print("[OK] .env safety check passed.\n")
 
 
@@ -82,7 +247,7 @@ HIDDEN_IMPORTS = [
     "httpcore", "httpcore._async", "httpcore._backends",
     "httpcore._backends.auto", "httpcore._backends.anyio",
     "h11", "anyio", "anyio._backends", "anyio._backends._asyncio", "sniffio",
-    "dotenv", "docx", "docx.opc", "docx.opc.constants", "fitz",
+    "dotenv", "docx", "docx.opc", "docx.opc.constants",
     "research_assistant", "research_assistant.web",
     "research_assistant.web.app", "research_assistant.web.routes", "research_assistant.web.ws",
     "research_assistant.api", "research_assistant.agent", "research_assistant.cli",
@@ -90,6 +255,12 @@ HIDDEN_IMPORTS = [
     "research_assistant.models", "research_assistant.docgen", "research_assistant.orchestrator",
     "research_assistant.retry", "research_assistant.display", "research_assistant.steer",
     "research_assistant.utils",
+    "research_assistant.runtime", "research_assistant.runtime.platform_store",
+    "research_assistant.runtime.task_hub", "research_assistant.runtime.scheduler",
+    "research_assistant.context", "research_assistant.context.sources",
+    "research_assistant.artifacts", "research_assistant.artifacts.versioning",
+    "research_assistant.workflows", "research_assistant.workflows.registry",
+    "research_assistant.workflows.runner",
     "research_assistant.llm", "research_assistant.llm.base",
     "research_assistant.llm.anthropic", "research_assistant.llm.openai_compat",
     "research_assistant.llm.factory",
@@ -109,19 +280,28 @@ HIDDEN_IMPORTS = [
 # 学习框架仍然排除（体积失控且研究助手场景极少用到）。
 HIDDEN_IMPORTS += ["numpy", "pandas", "matplotlib", "PIL"]
 
+# R13 打包瘦身：
+# - llvmlite/numba/shap 在全代码库零真实 import（此前的 grep 命中均为
+#   "shape" 单词误匹配），是 PyInstaller 依赖分析误卷入的死重（约 ~102MB）；
+# - pymupdf/fitz 仅 .claude 技能脚本（pdf_to_images.py）可选使用，缺库时
+#   自带降级分支；核心 PDF 文本处理走 pypdf。打包版不含 pymupdf，需要
+#   PDF→图片转换时在开发环境安装，或使用 pyproject 的 [pdf-images] extra。
 EXCLUDES = [
     "scipy", "cv2",
     "torch", "tensorflow", "pytest", "IPython", "notebook", "jupyter",
+    "llvmlite", "numba", "shap",
+    "pymupdf", "fitz",
 ]
 
 
 def build(restricted: bool = False, debug_console: bool = False):
+    check_version_consistency()
     check_env_safety()
 
     if restricted:
         app_name = "ResearchAssistant_Trial"
         entry = PACKAGE / "launcher_restricted.py"
-        print("Building RESTRICTED version (3-month expiry)...\n")
+        print("Building RESTRICTED version (trial-branded entry, expiry gate removed)...\n")
     else:
         app_name = "ResearchAssistant"
         # R7：桌面化入口——单窗口、无黑框、不跳浏览器（D10-D12）
@@ -168,35 +348,25 @@ def build(restricted: bool = False, debug_console: bool = False):
         print(f"Build SUCCESS! ({'RESTRICTED' if restricted else 'UNRESTRICTED'})")
         print(f"  Output: {exe_path}")
         print(f"  Size:   {exe_path.stat().st_size / 1024 / 1024:.1f} MB")
-        if restricted:
-            print("  Expiry: 2026-09-15")
         print(f"{'='*60}")
 
         leaked = _check_for_leaked_keys(DIST / app_name)
         if leaked:
-            print("\nWARNING: Potential key leaks:")
-            for f in leaked:
-                print(f"  - {f}")
-        else:
-            print("\n[OK] No .env or leaked keys found in output.")
+            print("\nERROR: 打包产物中发现疑似密钥泄漏，按发布流程应作废本产物：")
+            for f, frag in leaked:
+                print(f"  - {_display_path(f)} -> {_mask(frag)}")
+            sys.exit(1)
+        print("\n[OK] No .env or leaked keys found in output.")
     else:
         print(f"\nBuild completed but exe not found at {exe_path}")
 
 
-def _check_for_leaked_keys(dist_dir: Path) -> list[str]:
-    """扫描产物中是否混入 .env 或疑似密钥串（按前缀+长度泛式匹配，不硬编码具体值）。"""
-    leak_pattern = re.compile(r"\b(?:sk-|nvapi-)[A-Za-z0-9_-]{16,}")
-    problems = []
-    for f in dist_dir.rglob("*"):
-        if f.name == ".env" and f.is_file():
-            problems.append(str(f))
-        if f.suffix in (".json", ".txt", ".cfg", ".ini") and f.is_file():
-            try:
-                content = f.read_text(encoding="utf-8", errors="ignore")
-                if leak_pattern.search(content):
-                    problems.append(f"{f} (contains API key!)")
-            except Exception:
-                pass
+def _check_for_leaked_keys(dist_dir: Path) -> list[tuple[Path, str]]:
+    """扫描产物中是否混入 .env 或疑似密钥串（文本全量 + 二进制字节级，泛式匹配）。"""
+    problems = _scan_leaked_keys(dist_dir)
+    for f in dist_dir.rglob(".env"):
+        if f.is_file():
+            problems.append((f, "<.env file bundled>"))
     return problems
 
 

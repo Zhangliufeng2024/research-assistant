@@ -15,7 +15,7 @@ class TestResolveModel:
 
     def test_default(self, monkeypatch):
         monkeypatch.delenv("LLM_MODEL", raising=False)
-        assert resolve_model() == "claude-sonnet-4-6"
+        assert resolve_model() == "claude-sonnet-5"
 
     def test_explicit_takes_priority_over_env(self, monkeypatch):
         monkeypatch.setenv("LLM_MODEL", "env-model")

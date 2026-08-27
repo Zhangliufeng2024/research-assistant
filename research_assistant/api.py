@@ -96,6 +96,8 @@ async def generate_paper(
     approver: Any | None = None,
     use_pipeline: bool | None = None,
     steer_queue: asyncio.Queue | None = None,
+    project_instructions: str | None = None,
+    retrieval_block: str = "",
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate a scientific document asynchronously with progress updates.
 
@@ -141,6 +143,17 @@ async def generate_paper(
     else:
         paper_output_dir = work_dir / "writing_outputs" / target_dir_name
     system_instructions = build_system_instructions(work_dir, target_dir_name)
+    # Long-term project context applies to single-agent runs as well as the
+    # multi-agent pipeline.  Keeping this at the shared entry point prevents
+    # the chat/task surfaces from silently diverging in research conventions.
+    if project_instructions and project_instructions.strip():
+        system_instructions += (
+            "\n\n## 项目长期指令\n"
+            "以下要求来自项目设置，必须在本次任务中持续遵守：\n"
+            f"{project_instructions.strip()}"
+        )
+    if retrieval_block:
+        system_instructions += f"\n\n{retrieval_block.strip()}"
 
     # Resolve data files once; reuse the list later for actual processing.
     data_file_paths: list = []
@@ -186,6 +199,8 @@ async def generate_paper(
                 budget_limits=budget_limits,
                 approver=approver,
                 steer_queue=steer_queue,  # B4: 中途转向透传给各阶段子代理
+                project_instructions=project_instructions,
+                retrieval_block=retrieval_block,
             ):
                 yield update
         else:
@@ -296,7 +311,12 @@ async def generate_paper(
             stage="complete",
         ).to_dict()
 
-        output_directory = _find_most_recent_output(output_folder, start_time)
+        # A durable task allocates its artifact root before entering the
+        # generator.  Never guess from child-directory mtimes in that case;
+        # guessing can select ``drafts/`` or ``figures/`` after a restart.
+        output_directory = (
+            paper_output_dir if output_dir else _find_most_recent_output(output_folder, start_time)
+        )
 
         if not output_directory:
             error_result = _create_error_result("Output directory not found after generation")

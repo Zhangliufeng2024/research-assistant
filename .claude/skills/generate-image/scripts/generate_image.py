@@ -17,7 +17,7 @@ Usage:
 Environment variables (all IMAGE_* — fully decoupled from writing model):
     IMAGE_API_KEY        API key (required) — auto-detects NVIDIA vs OpenAI
     IMAGE_BASE_URL       Base URL for image API endpoint
-    IMAGE_MODEL          Model name (default: agnes-image-2.1-flash)
+    IMAGE_MODEL          Model name (default: agnes-image-2.0-flash)
 """
 
 import argparse
@@ -41,7 +41,7 @@ if sys.platform == "win32":
 # ── Constants ────────────────────────────────────────────────────────────────
 NVIDIA_NIM_BASE_URL = "https://ai.api.nvidia.com/v1/genai"
 DEFAULT_OPENAI_BASE_URL = "https://apihub.agnes-ai.com/v1"
-DEFAULT_IMAGE_MODEL = "agnes-image-2.1-flash"
+DEFAULT_IMAGE_MODEL = "agnes-image-2.0-flash"
 REQUEST_TIMEOUT = 120
 MAX_RETRIES = 3
 DEFAULT_IMAGE_REQUEST_INTERVAL = 4.0
@@ -340,9 +340,11 @@ def _generate_images_api(
     payload: Dict[str, Any] = {
         "model": model,
         "prompt": full_prompt,
-        "n": 1,
         "size": size,
-        "response_format": "b64_json",
+        # Agnes images API contract (2026-08): return_base64=true makes the
+        # endpoint fill data[0].b64_json; replaces the legacy OpenAI-style
+        # response_format field, which this endpoint does not honor.
+        "return_base64": True,
     }
 
     last_exception = None
@@ -400,9 +402,9 @@ def _generate_images_api(
         raise RuntimeError("[ERROR] No image data in response.")
 
     first = data_list[0]
-    if "b64_json" in first:
+    if first.get("b64_json"):
         return base64.b64decode(first["b64_json"])
-    elif "url" in first:
+    elif first.get("url"):
         img_resp = requests.get(first["url"], timeout=60)
         if img_resp.status_code != 200:
             raise RuntimeError(f"[ERROR] Failed to download image from URL: {img_resp.status_code}")
@@ -699,7 +701,7 @@ def main():
         epilog=f"""
 Examples:
   python generate_image.py "Neural network architecture" -o nn.png
-  python generate_image.py "Flowchart" -o flow.png --model agnes-image-2.1-flash
+  python generate_image.py "Flowchart" -o flow.png --model agnes-image-2.0-flash
   python generate_image.py "Add a hat" -o edited.png --input original.png
   python generate_image.py "Circuit" -o circuit.png --no-scientific
 

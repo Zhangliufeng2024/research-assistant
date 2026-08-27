@@ -91,6 +91,19 @@ class HookBus:
         """Register *handler* for *kind*. Multiple handlers run in registration order."""
         self._handlers.setdefault(kind, []).append(handler)
 
+    def fork(self) -> HookBus:
+        """Return an independent bus containing the current observers.
+
+        Hosts may reuse one bus across concurrent agents.  Each run mounts
+        private policy/guard hooks, so sharing the original mutable handler
+        lists would accumulate handlers and leak guard state between agents.
+        """
+        child = HookBus()
+        child._handlers = {
+            kind: list(handlers) for kind, handlers in self._handlers.items()
+        }
+        return child
+
     def off(self, kind: EventKind, handler: HookHandler) -> None:
         """Remove a previously registered handler (no-op if absent)."""
         try:

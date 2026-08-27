@@ -16,6 +16,15 @@ D2（history.json 权威持久化）/ D4（安全基线不放宽）：
 - 工具卡片（C4）：on_tool_start 推 running 卡，on_tool_use 回填
   status/result_preview/files。
 
+R16 起回合与连接解耦（耐久化）：断开/刷新只减少观察者计数，运行中的
+回合继续跑到终态并把回复全路径落盘（用户消息之后必有 assistant 条目，
+取消/失败条目带 ``partial: true``）。重连后发 ``{"action":"attach",
+"after":<seq>}`` 从环形缓冲（FRAME_RING_CAP）回放错过的帧；孤儿回合由
+看门狗在宽限（RA_CHAT_ORPHAN_GRACE_SECONDS，默认 900s）到期后先协作停
+止、再硬取消。历史治理 REST：POST …/truncate 截断、PATCH …/messages/
+{i} 改写用户消息、POST …/attachments 上传附件（落 outputs/<sid>/
+uploads/，send 时引用校验同一围栏）。
+
 挂载方式（app.py 由主会话完成，本文件不改动它）：REST 需 /api 前缀而
 WS 必须落在 /ws/chat（前端 ws.js PATHS.chat 硬编码），因此同一 router
 include 两次：
@@ -31,11 +40,13 @@ import asyncio
 import itertools
 import json
 import logging
+import os
 import re
 import shutil
 import time
 import uuid
 from collections import deque
+from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -45,11 +56,17 @@ from fastapi import APIRouter, HTTPException, Request, WebSocket, WebSocketDisco
 from ..agent import RunConfig, run_agent
 from ..api import usage_ticks
 from ..config import build_llm_client, resolve_model
-from ..core import execution_contract_addendum, load_system_instructions, safe_resolve
+from ..core import (
+    atomic_write_text,
+    execution_contract_addendum,
+    load_system_instructions,
+    safe_resolve,
+)
 from ..kernel.approval import QueueApprover, ToolApprovalRequest
 from ..kernel.budget import BudgetGuard
 from ..llm.base import LLMClient, LLMResponse, OnChunkCallback
 from ..session.store import SessionStore
+from ..tools.file_ops import _reject_windows_hazard
 from ..tools.registry import ToolRegistry
 
 router = APIRouter()
@@ -81,6 +98,41 @@ ZERO_TURN_TTL_S = 3600.0
 #: 已落盘的历史不受影响。相比"拒绝新连接"，刷新页面/换标签页体验更好。
 _LIVE: dict[str, WebSocket] = {}
 
+#: sid → 当前活跃连接的出站信箱（asyncio.Queue.put_nowait 的绑定方法）。
+#: 与 _LIVE 在同两处登记/注销。回合帧的直播路由按 sid 现查此表，而**不是**
+#: 绑死发起回合的那条连接——重连/被踢后新连接接管信箱，运行中回合的尾流
+#: 必须跟人走；否则 attach 只补得历史快照、其后的帧永远发进尸体 socket，
+#: 前端永久停在「思考中」（对抗性审查抓出的缺陷）。存绑定方法是因为每次
+#: 属性访问都产生新对象，finally 的身份比对必须用同一引用。
+_SINKS: dict[str, Any] = {}
+
+#: 幽灵会话墓碑（A3）：已删除会话的 session_id 集合。此后该会话的一切磁盘
+#: 写回（history.json / run.json / events.jsonl）都在写回点被静默拦截，
+#: 回合收尾晚于删除流程时也不会把目录重建回「幽灵会话」。
+#: 并发模型：REST 端点与 WS 收尾协程同属一个事件循环（uvicorn 单循环调度，
+#: 测试经 TestClient portal 亦然），set 的 add / 成员判断是无 await 的同步
+#: 语句、不会被打断，因此无需加锁；也不存在跨线程访问。
+#: 生命周期：加入后保留到进程结束，唯一的出口是「名字被重新创建」（见
+#: _new_session_dir）——那是用户显式新建/重开对同名目录的接管，不是迟到
+#: 写回；而幽灵复活恰恰只能来自写回路径，写回永远不经过 _new_session_dir。
+_TOMBSTONES: set[str] = set()
+
+#: 删除运行中会话时等待回合收尾的上限（秒）：需覆盖「取消传播 + 最终落盘」
+#: 的正常耗时；超时说明回合僵死（未响应取消），按墓碑口径强删。
+DELETE_SETTLE_TIMEOUT_S = 8.0
+
+
+def _blocked_by_tombstone(run_dir: Path) -> bool:
+    """写回点共用的墓碑检查；命中返回 True 并顺手自删残留目录。
+
+    自删（ignore_errors）是对「目录已被其他写回路径重建」的兜底清理：
+    多数情况下目录早已被 delete_session 移除，此时 rmtree 是无害空操作。
+    """
+    if run_dir.name not in _TOMBSTONES:
+        return False
+    shutil.rmtree(run_dir, ignore_errors=True)
+    return True
+
 
 # ---------------------------------------------------------------------------
 # history.json 读写（D2 唯一权威）
@@ -88,13 +140,29 @@ _LIVE: dict[str, WebSocket] = {}
 
 
 def _read_history(run_dir: Path) -> list[dict]:
-    """容错读取归约历史；损坏/缺失一律返回空列表（不阻塞会话进入）。"""
+    """容错读取归约历史；损坏留档后按空历史继续（不阻塞会话进入）。
+
+    半截 JSON（断电/崩溃残留）若被静默当作空历史，下一回合的整份写回
+    会把原对话永久清零——因此先把坏文件改名留档（证据可追溯），再返回
+    空列表。留档改名失败（文件被占用等）则放弃留档但不抛出。
+    """
     path = run_dir / HISTORY_FILE
     if not path.is_file():
         return []
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
+    except OSError:
+        return []  # 读失败（占用/权限）：与缺失同等对待，不阻塞会话
+    except json.JSONDecodeError as exc:
+        backup = run_dir / f"{HISTORY_FILE}.corrupt.{int(time.time())}"
+        if backup.exists():  # 同秒多次损坏：追加纳秒避免覆盖前一份留档
+            backup = run_dir / f"{HISTORY_FILE}.corrupt.{time.time_ns()}"
+        try:
+            path.rename(backup)
+            LOG.warning("历史文件损坏已留档 %s -> %s：%s",
+                        path, backup.name, exc)
+        except OSError as rename_exc:
+            LOG.warning("历史文件损坏且留档失败 %s：%s", path, rename_exc)
         return []
     if isinstance(data, list):
         msgs = data  # 容忍裸数组形式
@@ -102,24 +170,85 @@ def _read_history(run_dir: Path) -> list[dict]:
         msgs = data.get("messages") or []
     else:
         return []
-    return [
-        {"role": str(m["role"]), "content": str(m.get("content", ""))}
-        for m in msgs
-        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
-    ]
+
+    # 归一化的同时必须**透传结构化扩展字段**（R16）：attachments（UI 渲染
+    # 徽章）与 partial=True（被打断的回答标记）。此前这里把条目投影成裸
+    # {role, content}，而收尾写回走「读→追加→整份写」——等于每回合结束
+    # 都对历史做一次清洗，扩展字段全部蒸发（真实浏览器 E2E 抓出）。
+    out: list[dict] = []
+    for m in msgs:
+        if not isinstance(m, dict) or m.get("role") not in ("user", "assistant"):
+            continue
+        entry: dict = {"role": str(m["role"]), "content": str(m.get("content", ""))}
+        raw_atts = m.get("attachments")
+        if isinstance(raw_atts, list) and raw_atts:
+            clean_atts = [
+                {"name": str(a.get("name", "")), "path": str(a.get("path", ""))}
+                for a in raw_atts
+                if isinstance(a, dict)
+            ]
+            if clean_atts:
+                entry["attachments"] = clean_atts
+        if m.get("partial") is True:
+            entry["partial"] = True
+        out.append(entry)
+    return out
 
 
 def _write_history(run_dir: Path, messages: list[dict]) -> None:
-    """整份写回历史（唯一权威）。写失败不中断运行（审计仍留有事件）。"""
+    """整份写回历史（唯一权威）。写失败不中断运行（审计仍留有事件）。
+
+    经 core.atomic_write_text 原子替换（同目录临时文件 + fsync +
+    os.replace）：断电/崩溃不会留下半截 JSON——半截历史会被下一回合
+    误读为损坏而清零对话。
+    幽灵会话拦截（A3）：会话已删除（墓碑命中）时放弃写回并自删残留——
+    迟到的收尾写回不得把已删除的会话目录重建回来。
+    """
+    if _blocked_by_tombstone(run_dir):
+        return
     try:
-        run_dir.mkdir(parents=True, exist_ok=True)
         payload = {"schema_version": 1, "messages": messages}
-        (run_dir / HISTORY_FILE).write_text(
+        atomic_write_text(
+            run_dir / HISTORY_FILE,
             json.dumps(payload, ensure_ascii=False),
-            encoding="utf-8",
         )
     except OSError:
         pass
+
+
+class _GuardedSessionStore(SessionStore):
+    """墓碑感知的 SessionStore：已删除会话的 run_state / events 写回一律放弃。
+
+    会话模式的全部 run.json / events.jsonl 落盘都经 save() / finish() /
+    log_event() 三个口子，在此统一拦截即可覆盖收尾路径的全部写回点。
+    不改 ws_chat/_run_turn 一行的关键在于：函数体内的 ``SessionStore(...)``
+    名字解析发生在**调用期**（模块全局查找），因此只需在模块级把该名字
+    重绑到本子类（见类定义之后的赋值），ws_chat 拿到的即是守卫子类；
+    任务模式等其他模块直接从 session.store import 原类，不受影响。
+    """
+
+    def _blocked(self) -> bool:
+        return _blocked_by_tombstone(self.run_dir)
+
+    def save(self) -> None:  # noqa: D102 — 语义与父类一致，仅加墓碑短路
+        if self._blocked():
+            return
+        super().save()
+
+    def log_event(self, kind: str, data: dict | None = None) -> None:  # noqa: D102
+        if self._blocked():
+            return
+        super().log_event(kind, data)
+
+    def finish(self, status: str, budget_snapshot: dict | None = None) -> None:  # noqa: D102
+        if self._blocked():
+            return
+        super().finish(status, budget_snapshot)
+
+
+#: 重绑模块内名字：让 ws_chat 调用期的 ``SessionStore`` 解析到守卫子类
+#: （原理见 _GuardedSessionStore 类注释；最小侵入的墓碑接线点）。
+SessionStore = _GuardedSessionStore
 
 
 # ---------------------------------------------------------------------------
@@ -151,6 +280,11 @@ def _new_session_dir(root: Path, title: str) -> Path:
         n += 1
         run_dir = root / f"{base}_{n}"
     run_dir.mkdir(parents=True)
+    if run_dir.name in _TOMBSTONES:
+        # 同秒同 slug 的名字再生（删除后 <1s 内新建同名会话）：新化身接管
+        # 该名字，旧墓碑随之失效——否则新会话的一切落盘会被误拦甚至被自删。
+        # 迟到写回不经过本函数，幽灵拦截不受影响。
+        _TOMBSTONES.discard(run_dir.name)
     return run_dir
 
 
@@ -265,6 +399,10 @@ def _sweep_zero_turn_sessions(root: Path, outputs_root: Path | None = None) -> N
         try:
             if not child.is_dir() or child.name.startswith("."):
                 continue
+            if child.name in _TOMBSTONES:
+                # 墓碑会话归删除端点负责（可能仍在等回合退出）：清退不得
+                # 介入，避免与 delete_session 的 rmtree 竞争同一目录。
+                continue
             state = _load_run_state(child)
             if state is None:
                 continue  # 与 list 的准入口径一致：无 run.json 不算会话
@@ -314,19 +452,107 @@ async def get_session(session_id: str, request: Request):
     return {"id": session_id, "messages": _read_history(run_dir)}
 
 
+async def _settle_active_turn(handle: _TurnHandle | None) -> None:
+    """等一轮回合真正收尾（上限 DELETE_SETTLE_TIMEOUT_S）。
+
+    R16 注册结构带真实 asyncio.Task，直接精确等待；超时（工具僵死未响应
+    协作取消）则补一次协作信号加短硬取消兜底——即便仍未退出，迟到的写回
+    也已被墓碑拦截，rmtree 不会被复活。
+    """
+    if handle is None or handle.task is None or handle.task.done():
+        return
+    _, pending = await asyncio.wait({handle.task}, timeout=DELETE_SETTLE_TIMEOUT_S)
+    if pending:
+        LOG.warning("删除会话：回合 %.0fs 未收尾，硬取消兜底",
+                    DELETE_SETTLE_TIMEOUT_S)
+        handle.cancel_event.set()
+        handle.task.cancel()
+        await asyncio.wait({handle.task}, timeout=2.0)
+
+
 @router.delete("/chat/sessions/{session_id}")
 async def delete_session(session_id: str, request: Request):
-    """删除整个会话目录（含 run/events/history）。"""
+    """删除整个会话目录（含 run/events/history）。
+
+    删除**运行中**的会话时先通知活跃连接：close(code=4002) 让前端立即
+    离场，随后从 ``_ACTIVE`` 取真实回合句柄——置位 cancel_event 协作停止，
+    并精确等到回合收尾（回复落盘/注册项摘除都发生在其 finally 里）再删。
+
+    幽灵会话修复（A3）：rmtree 前**先落墓碑**——此后该会话的一切磁盘写回
+    （history.json / run.json / events.jsonl）都在写回点被静默拦截并自删
+    残留。即使回合收尾超过等待窗口，迟到的写回也不会把目录重建回幽灵
+    会话；墓碑保留到进程结束或同名重建接管（见 _TOMBSTONES）。
+    """
     try:
         run_dir = _resolve_session_dir(_cwd_of(request), session_id)
     except ValueError as exc:
         raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
     except FileNotFoundError as exc:
         raise HTTPException(status_code=404, detail="会话不存在") from exc
+
+    # 墓碑先行：本语句与下方 rmtree 之间无 await（事件循环不会插入其他
+    # 协程的写回），「先标后删」不给迟到写回任何复活窗口。
+    _TOMBSTONES.add(session_id)
+
+    live = _LIVE.get(session_id)
+    if live is not None:
+        try:
+            await live.close(code=4002, reason="会话已被删除")
+        except Exception:
+            pass
+
+    handle = _ACTIVE.get(session_id)
+    if handle is not None:
+        handle.cancel_event.set()
+        await _settle_active_turn(handle)
+    # 会话级运行时一并出清：预算账本与帧缓冲随目录一起消亡。
+    _ACTIVE.pop(session_id, None)
+    _SESSIONS.pop(session_id, None)
+
     shutil.rmtree(run_dir, ignore_errors=True)
     # R12 P2 双轨制：产物目录 1:1 归会话所有，显式删除时一并清掉
     shutil.rmtree(_outputs_root(_cwd_of(request)) / session_id, ignore_errors=True)
     return {"ok": True}
+
+
+@router.patch("/chat/sessions/{session_id}")
+async def rename_session(session_id: str, request: Request):
+    """重命名会话：更新 run.json 的标题字段（query，列表摘要 title 的来源）。
+
+    只改标题不动时间戳：SessionStore.save() 会把 updated_at 刷成当前时刻，
+    而列表按 updated_at 倒序——改名不应把会话顶到列表最前。因此读出完整
+    状态、仅替换 query 并原样保留 updated_at，经 atomic_write_text 原子写回
+    （与 history.json 同一套断电安全口径）。run.json 损坏时按默认状态重建
+    （与 SessionStore._load 的既有语义一致）。
+    """
+    try:  # body 容错与 create_session 同风格：空 body / 非 JSON 按 422 收场
+        body = await request.json()
+    except Exception:
+        body = None
+    raw_title = body.get("title") if isinstance(body, dict) else None
+    title = str(raw_title or "").strip()[:80]  # 截断口径对齐 create_session
+    if not title:
+        raise HTTPException(status_code=422, detail="会话标题不能为空")
+    try:
+        run_dir = _resolve_session_dir(_cwd_of(request), session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    # 幽灵会话拦截（A3，run_state 保存点）：已删除会话的改名写回会把目录
+    # 重建回来——墓碑命中时按「会话不存在」收场（与 GET 同一 404 口径）。
+    if session_id in _TOMBSTONES:
+        raise HTTPException(status_code=404, detail="会话不存在")
+
+    store = SessionStore(run_dir)
+    state = store.state.to_dict()
+    state["query"] = title  # 其余字段（含 created_at/updated_at）原样保留
+    atomic_write_text(
+        run_dir / SessionStore.RUN_FILE,
+        json.dumps(state, indent=2, ensure_ascii=False),
+    )
+    store.log_event("session_rename", {"title": title})
+    return {"ok": True, "id": session_id, "title": title}
 
 
 # ---------------------------------------------------------------------------
@@ -517,7 +743,310 @@ def _is_network_error(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# C2/C3/C4: WS /ws/chat — 会话循环
+# 回合运行时（R16 耐久化）：回合生命周期与 socket 解耦
+# ---------------------------------------------------------------------------
+
+#: 断连后孤儿回合的宽限（秒）：宽限内重连 attach 可无缝接管并撤销看门狗；
+#: 到期先协作停止（cancel_event，内核在安全点正常落盘），再等
+#: ORPHAN_HARD_CANCEL_S 仍未结束才硬取消兜底。预算守卫（RA_MAX_*）始终是
+#: 支出上界，宽限只是体验参数。
+ORPHAN_GRACE_S = max(30.0, float(os.getenv("RA_CHAT_ORPHAN_GRACE_SECONDS", "900")))
+ORPHAN_HARD_CANCEL_S = 30.0
+
+#: 单回合帧环形缓冲上限：断连期间帧在内存累积，重连后按 seq 回放。
+#: usage 帧约 1s 一帧是大头，数千秒的回合也在千帧量级；4000 封住内存上界，
+#: 超出丢最旧（丢的只是最老的 usage 快照，不影响语义完整性）。
+FRAME_RING_CAP = 4000
+
+
+@dataclass
+class _TurnHandle:
+    """一个活动/刚结束回合的全部可迁移状态——连接断了，回合照跑。
+
+    并发模型：全部字段只在事件循环协程内读写；所有 check-then-act 都落在
+    无 await 的同步段（_start_turn 独占创建、_turn_main 独占收尾、观察者
+    增减在同步辅助函数内），因此 dict 与字段都不需要锁。
+    """
+
+    task: Any = None                  # asyncio.Task[_turn_main]
+    cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
+    budget: Any = None                # BudgetGuard（会话级共享，跨回合累计）
+    approvals: asyncio.Queue = field(default_factory=asyncio.Queue)
+    steers: asyncio.Queue = field(default_factory=asyncio.Queue)
+    approver: Any = None              # QueueApprover（per-turn 装配）
+    ask_state: dict = field(default_factory=lambda: {"current": ""})
+    frames: deque = field(default_factory=deque)  # 已发射帧（含 seq），回放源
+    #: 帧序号游标——**会话内单调**，新建句柄时从上一回合句柄续接（见
+    #: _start_turn）。前端以收到的最大 seq 作断线重连的 attach 游标，服务端
+    #: 按 seq>after 过滤回放；若每回合从 1 重来，重连后错过的帧会被旧游标
+    #: 永久滤掉（真实浏览器 E2E 抓出的缺陷，单回合协议测试覆盖不到）。
+    seq: int = 0
+    partial_text: str = ""            # on_text 增量累积——异常/硬取消时的兜底文本
+    status: str = "running"           # running | complete | failed | cancelled
+    observers: int = 0                # 观察者连接数（孤儿看门狗的触发依据）
+    orphan_task: Any = None           # 看门狗任务（有人观察时为 None）
+    feeder: Any = None                # usage_ticks 泵任务
+
+    def next_seq(self, frame: dict) -> dict:
+        """登记一帧：注入自增 seq、入环形缓冲（超限丢最旧），返回发送体。"""
+        self.seq += 1
+        out = dict(frame)
+        out["seq"] = self.seq
+        self.frames.append(out)
+        if len(self.frames) > FRAME_RING_CAP:
+            self.frames.popleft()
+        return out
+
+
+#: 会话级运行时：sid → {"budget": BudgetGuard, "last": _TurnHandle | None}。
+#: 预算跨连接与回合持续累计（上限口径仍自 RA_MAX_* 继承）；last 保留刚
+#: 结束回合的帧缓冲供 attach 回放，被下一回合或删除流程取代。
+_SESSIONS: dict[str, dict] = {}
+
+#: sid → 当前活动回合句柄。同一会话同时最多一个活动回合；键位的写入只在
+#: _start_turn（独占创建）与 _turn_main 收尾（独占清理）两处。
+_ACTIVE: dict[str, _TurnHandle] = {}
+
+
+async def _orphan_reap(sid: str, handle: _TurnHandle) -> None:
+    """孤儿回合看门狗：最后一个观察者离开满 ORPHAN_GRACE_S 后收尸。
+
+    先协作停止（内核在安全点响应 cancel_event 并正常落盘 partial 文本），
+    短暂等待后仍未结束才硬取消。重连 attach 会 cancel 本任务——看门狗被
+    取消是正常路径，在此吞掉 CancelledError 即可。
+    """
+    try:
+        await asyncio.sleep(ORPHAN_GRACE_S)
+        if _ACTIVE.get(sid) is not handle:
+            return
+        LOG.info("孤儿回合宽限到期，协作停止 sid=%s", sid)
+        handle.cancel_event.set()
+        await asyncio.wait({handle.task}, timeout=ORPHAN_HARD_CANCEL_S)
+        if not handle.task.done():
+            LOG.warning("回合未响应协作停止，硬取消兜底 sid=%s", sid)
+            handle.task.cancel()
+    except asyncio.CancelledError:
+        pass
+
+
+def _content_for_llm(entry: dict) -> dict:
+    """把历史条目展平为内核可见的 {role, content}：附件以路径清单并入正文。
+
+    history.json 存结构化 attachments 字段供 UI 渲染；模型侧只需要知道
+    「文件在哪、怎么读」，因此在喂给内核前（且仅在此处）拼进文本——权威
+    数据保持结构化，不因模型的展示口径而失真。
+    """
+    flat = {"role": entry.get("role", "user"), "content": str(entry.get("content", ""))}
+    atts = entry.get("attachments")
+    if isinstance(atts, list) and atts:
+        lines = "\n".join(
+            f'- {a.get("name", "")}: {a.get("path", "")}（可用 read_file/grep 直接读取）'
+            for a in atts
+            if isinstance(a, dict) and a.get("path")
+        )
+        if lines:
+            flat["content"] = (
+                f'{flat["content"]}\n\n[本条消息携带的附件]\n{lines}'
+            )
+    return flat
+
+
+# ---------------------------------------------------------------------------
+# 会话历史治理 REST：截断 / 改写 / 附件上传（R16）
+# ---------------------------------------------------------------------------
+
+ATTACHMENTS_MAX = 8  # 单条消息最多携带附件数
+UPLOAD_TOTAL_LIMIT = 50 * 1024 * 1024  # 单次上传请求总字节上限
+_UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9\u4e00-\u9fff._ ()\[\]-]+")
+
+
+def _safe_upload_name(raw: str) -> str:
+    """把客户端文件名消毒成可直接落盘的安全名。
+
+    取 basename（剥掉目录成分与盘符）、剔除非法字符（冒号随之消失，ADS
+    形态无从构造）、Windows 保留设备名加下划线前缀降级、限长保扩展名。
+    """
+    name = Path(str(raw).replace("\\", "/")).name
+    name = _UPLOAD_NAME_RE.sub("_", name).strip(" ._") or "file.bin"
+    if _reject_windows_hazard(name):
+        name = "_" + name  # CON/NUL 等：降级而非拒绝，用户视角更顺
+    dot = name.rfind(".")
+    if len(name) > 120:
+        if dot > 0:
+            name = name[: 120 - (len(name) - dot)] + name[dot:]
+        else:
+            name = name[:120]
+    return name or "file.bin"
+
+
+def _validate_attachment_refs(cwd: Path, sid: str, raw: Any) -> list[dict] | str:
+    """校验 user 动作携带的 attachments 引用：必须指向本会话 uploads 目录。
+
+    返回规范化的 [{"name","path"}]；不合法时返回中文错误串（调用方转成
+    error 帧）。围栏用 safe_resolve——即便是绝对路径也必须落在
+    outputs/<sid>/uploads 内，杜绝跨会话/跨目录引用。
+    """
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return "attachments 必须是数组"
+    if len(raw) > ATTACHMENTS_MAX:
+        return f"附件数量超过上限（{ATTACHMENTS_MAX} 个）"
+    uploads_root = _outputs_root(cwd) / sid / "uploads"
+    out: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return "attachments 元素必须是对象"
+        path = str(item.get("path") or "").strip()
+        if not path:
+            return "附件缺少 path"
+        try:
+            resolved = safe_resolve(Path(path), uploads_root)
+        except ValueError:
+            return f"附件路径越界（仅允许本会话 uploads 目录内的文件）：{path}"
+        out.append({
+            "name": str(item.get("name") or resolved.name)[:120],
+            "path": str(resolved),
+        })
+    return out
+
+
+def _history_write_conflict(session_id: str) -> HTTPException | None:
+    """历史改写类端点共用的运行中守卫：回合在跑时历史正被追加，不可截断。"""
+    if session_id in _ACTIVE:
+        return HTTPException(status_code=409, detail="回合运行中，请等待结束后再操作历史")
+    return None
+
+
+def _resolve_session_or_404(session_id: str, request: Request) -> Path:
+    """REST 历史治理端点共用的目录解析：403/404/墓碑 404 口径一致。"""
+    try:
+        run_dir = _resolve_session_dir(_cwd_of(request), session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    if session_id in _TOMBSTONES:
+        raise HTTPException(status_code=404, detail="会话不存在")
+    return run_dir
+
+
+@router.post("/chat/sessions/{session_id}/truncate")
+async def truncate_history(session_id: str, request: Request):
+    """把 history.json 截断为前 *keep* 条（真·重新生成 / 编辑重发的支点）。
+
+    前端「重新生成」= 截断到目标用户消息之后 + 原文重发；「编辑重发」=
+    先 PATCH 该消息文本、再截断、再重发——三步全部服务端落盘，重开 会话
+    时被历史回灌的不再是旧答案。409 保护运行中的回合。
+    """
+    conflict = _history_write_conflict(session_id)
+    if conflict is not None:
+        raise conflict
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    try:
+        keep = int((body or {}).get("keep"))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=422, detail="keep 必须是整数") from None
+    if keep < 0:
+        raise HTTPException(status_code=422, detail="keep 不能为负数")
+    run_dir = _resolve_session_or_404(session_id, request)
+    messages = _read_history(run_dir)
+    kept = min(keep, len(messages))
+    _write_history(run_dir, messages[:kept])
+    return {"ok": True, "kept": kept, "removed": len(messages) - kept}
+
+
+@router.patch("/chat/sessions/{session_id}/messages/{index}")
+async def edit_user_message(session_id: str, index: int, request: Request):
+    """就地改写一条 user 消息文本（编辑重发第一步）。assistant 条目不可改。"""
+    conflict = _history_write_conflict(session_id)
+    if conflict is not None:
+        raise conflict
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    text = str((body or {}).get("text") or "").strip()
+    if not text:
+        raise HTTPException(status_code=422, detail="消息内容不能为空")
+    if len(text) > MAX_USER_LENGTH:
+        raise HTTPException(
+            status_code=422,
+            detail=f"消息过长（最大 {MAX_USER_LENGTH} 字符）",
+        )
+    run_dir = _resolve_session_or_404(session_id, request)
+    messages = _read_history(run_dir)
+    if index < 0 or index >= len(messages):
+        raise HTTPException(status_code=404, detail="消息序号不存在")
+    if messages[index].get("role") != "user":
+        raise HTTPException(status_code=422, detail="只能编辑用户消息")
+    messages[index]["content"] = text
+    _write_history(run_dir, messages)
+    return {"ok": True, "index": index}
+
+
+@router.post("/chat/sessions/{session_id}/attachments")
+async def upload_chat_attachments(session_id: str, request: Request):
+    """multipart 附件上传：文件落入本会话产物目录的 uploads/ 子目录。
+
+    双轨制口径：uploads 挂在 outputs/<sid>/（写锚点）之内，send 时引用
+    校验与这里同一围栏；文件名消毒 + 总量上限，1MB 流式写盘避免整文件
+    进内存。运行中的回合也允许上传（本轮用不上，下一条消息即可引用）。
+    """
+    run_dir = _resolve_session_or_404(session_id, request)
+    del run_dir  # 仅作存在性校验；落盘位置由双轨制决定
+    cwd = _cwd_of(request)
+    try:
+        form = await request.form()
+    except Exception:
+        raise HTTPException(
+            status_code=422, detail="请求不是合法的 multipart 表单"
+        ) from None
+    files = [v for v in form.values() if hasattr(v, "read")]
+    if not files:
+        raise HTTPException(status_code=422, detail="至少需要一个文件字段")
+
+    dest = _outputs_root(cwd) / session_id / "uploads"
+    try:
+        dest.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"无法创建附件目录：{exc}") from exc
+
+    stamp = datetime.now().strftime("%H%M%S_%f")
+    results: list[dict] = []
+    total = 0
+    for i, uf in enumerate(files):
+        safe_name = _safe_upload_name(getattr(uf, "filename", "") or "file.bin")
+        target = dest / f"{stamp}_{i}_{safe_name}"
+        overflow = False
+        size = 0
+        try:
+            with open(target, "wb") as fh:
+                while True:
+                    chunk = await uf.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    total += len(chunk)
+                    if total > UPLOAD_TOTAL_LIMIT:
+                        overflow = True
+                        break
+                    fh.write(chunk)
+                    size += len(chunk)
+        except OSError as exc:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=500, detail=f"附件写盘失败：{exc}") from exc
+        if overflow:
+            target.unlink(missing_ok=True)
+            raise HTTPException(status_code=413, detail="上传总量超过上限（50MB）")
+        results.append({"name": safe_name, "path": str(target), "size": size})
+    return {"files": results}
+
+
+# ---------------------------------------------------------------------------
+# C2/C3/C4: WS /ws/chat —— 会话循环（R16 起回合与连接解耦）
 # ---------------------------------------------------------------------------
 
 
@@ -526,23 +1055,99 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
     """通用 agentic 会话端点。
 
     server→client / client→server 全部帧型见 docs/protocol.md
-    「§ 会话协议 (/ws/chat)」。断连即取消（cancel_event），与 ws.py 同构。
+    「会话协议 (/ws/chat)」一节。
+
+    R16 耐久化：回合生命周期不再绑定连接——断开/刷新/Wi-Fi 抖动只让本
+    连接退场（观察者 -1），运行中的回合继续跑到终态并把回复落盘；客户端
+    重连后发 ``{"action":"attach","after":<seq>}`` 从环形缓冲回放错过的
+    帧。回合的唯一终止途径：显式 stop、删除会话、或孤儿宽限到期
+    （RA_CHAT_ORPHAN_GRACE_SECONDS，默认 900s）。这是对「断连即失败、
+    回复永不落盘」缺陷（InvalidStateError 连锁）的结构性消除：发射路径
+    不感知连接状态，不存在「发送失败→同步取任务结果」的窗口。
     """
     await websocket.accept()
 
-    cancel_event = asyncio.Event()  # 断连兜底：任何阶段置位都终止底层运行
-    send_lock = asyncio.Lock()  # 多任务共用一个 socket，串行化发送帧
+    outbox: asyncio.Queue = asyncio.Queue()  # 本连接出站信箱（无界）
     sid = ""
-    llm_client: _HistoryClient | None = None
+    #: 本连接在 _SINKS 里的登记凭证（finally 按引用比对注销）。
+    sink_fn: Any = None
+    #: 本连接正在观察的回合句柄：finally 时逐个释放名额——归零且回合仍在
+    #: 跑则在那里武装孤儿看门狗。同一连接至多观察一个活动回合。
+    watching: list[_TurnHandle] = []
 
-    async def _send(frame: dict) -> bool:
-        """发一帧；断连后静默失败（由 receive 端感知断连），返回是否成功。"""
-        try:
-            async with send_lock:
+    async def _pump() -> None:
+        """出站泵：全连接唯一真正 send_json 的地方。
+
+        单消费者天然串行化所有帧（取代旧 send_lock）；发送失败即退出——
+        余帧已入环形缓冲的照旧可 attach 回放，本连接此后不再出帧。
+        """
+        while True:
+            frame = await outbox.get()
+            try:
                 await websocket.send_json(frame)
-            return True
-        except Exception:
-            return False
+            except Exception:
+                break
+
+    pump_task = asyncio.get_running_loop().create_task(_pump())
+
+    def _post(frame: dict) -> None:
+        """同步入箱（不 await）。事件循环协作式调度下，「快照→过滤→补发」
+        因此可以写成无 await 的原子段——回合任务的发射不可能插进回放中间，
+        回放帧与直播帧在同一 FIFO 里严格保序、不重不漏。"""
+        outbox.put_nowait(frame)
+
+    async def _drain() -> None:
+        """等信箱清空再返回（close 前确保错误帧真的发出去）。
+
+        仅用于早退路径（信箱至多一两帧）：每次 sleep(0) 让泵推进一步。
+        迭代上限是防御——泵若意外退出也不至于在这里挂死。"""
+        for _ in range(200):
+            if outbox.empty():
+                return
+            await asyncio.sleep(0)
+
+    async def _send(frame: dict) -> None:
+        """发一帧：入箱由泵串行送达；断连后泵退场、帧自然弃发（静默）。"""
+        _post(frame)
+
+    async def _emit(handle: _TurnHandle, frame: dict) -> None:
+        """回合帧统一出口：登记 seq 入环形缓冲，再路由到当前活跃连接。
+
+        路由按 sid 现查 _SINKS——不是闭包绑死的发起连接（那是「attach 只
+        回放快照」缺陷的根源）。next_seq + 查表 + 入箱全程无 await，与
+        _handle_attach 的同步回放段互斥，跨源帧序由此保证。无连接时静默：
+        帧留在环形缓冲等 attach 回放。
+        """
+        stamped = handle.next_seq(frame)
+        sink = _SINKS.get(sid)
+        if sink is not None:
+            sink(stamped)
+
+    def _release(handle: _TurnHandle) -> None:
+        """归还一个观察者名额；归零且回合仍在跑则武装孤儿看门狗。"""
+        if handle not in watching:
+            return
+        watching.remove(handle)
+        handle.observers = max(0, handle.observers - 1)
+        if (
+            handle.observers == 0
+            and sid in _ACTIVE
+            and _ACTIVE.get(sid) is handle
+            and handle.orphan_task is None
+            and not handle.task.done()
+        ):
+            handle.orphan_task = asyncio.get_running_loop().create_task(
+                _orphan_reap(sid, handle)
+            )
+
+    def _observe(handle: _TurnHandle) -> None:
+        """登记观察者：有人看着了，撤销孤儿看门狗。"""
+        if handle.orphan_task is not None:
+            handle.orphan_task.cancel()
+            handle.orphan_task = None
+        handle.observers += 1
+        if handle not in watching:
+            watching.append(handle)
 
     try:
         cwd = _cwd_of(websocket)
@@ -553,6 +1158,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             candidate = session.strip()
             if not _valid_session_id(candidate):
                 await _send({"type": "error", "message": "会话 ID 不合法"})
+                await _drain()
                 await websocket.close()
                 return
             # 目录不存在时按同名自动重建（幂等进入：删除后的会话可无缝再开）
@@ -562,8 +1168,12 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 safe_resolve(run_dir, root)
             except ValueError:  # 符号链接等越界：与 _valid_session_id 双保险
                 await _send({"type": "error", "message": "会话 ID 不合法"})
+                await _drain()
                 await websocket.close()
                 return
+            # 显式以旧名字重连 = 新化身接管（与 _new_session_dir 同一口径）：
+            # 解除墓碑，否则本会话的一切落盘都会被拦截成幽灵。
+            _TOMBSTONES.discard(candidate)
         else:
             run_dir = _new_session_dir(root, "")
         sid = run_dir.name
@@ -591,10 +1201,11 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             LOG.warning("产物目录创建失败 sid=%s：%s", sid, exc)
             await _send({"type": "error",
                          "message": f"无法创建产物目录 {outputs_abs}：{exc}"})
+            await _drain()
             await websocket.close()
             return
         if store.state.outputs_dir != f"outputs/{sid}":
-            store.state.outputs_dir = f"outputs/{sid}"  # 相对 POSIX，权威在帧
+            store.state.outputs_dir = f"outputs/{sid}"  # 相对 POSIX 口径
             store.save()
 
         # ---- 并发连接：踢掉同会话旧 socket --------------------------------
@@ -604,19 +1215,23 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 await previous.close(code=4001, reason="replaced by newer connection")
             except Exception:
                 pass
+            # 被踢连接在自己的 finally 里释放观察者名额——若它正观察着活动
+            # 回合且无新连接接替，孤儿看门狗会在那里武装。
         _LIVE[sid] = websocket
+        sink_fn = outbox.put_nowait
+        _SINKS[sid] = sink_fn  # 运行中回合的尾流自此路由到本连接
 
-        # ---- 组装循环依赖（照 ws.py generate 的方式） ----------------------
-        approvals: asyncio.Queue = asyncio.Queue()
-        steers: asyncio.Queue = asyncio.Queue()
-        # 连接期仅确定预算的初始计价模型；LLM 客户端改为**每轮实时构建**
-        # （见 _run_turn 开头）。不能用 lifespan 的 app.state.model 快照——
-        # 它会把「启动时未配置而回退的默认模型名」永久钉死在会话上；
-        # 也不能只在连接时构建一次——那样设置页保存的新 Key/模型对已打开
-        # 的会话永远不生效（R7 反馈 #3 主因 + 残留路径一并修掉）。
-        budget = BudgetGuard(model=resolve_model(None))  # limits 自 RA_MAX_* 继承
+        # ---- 会话级运行时：预算跨重连持续累计 ------------------------------
+        rt = _SESSIONS.setdefault(sid, {})
+        budget = rt.get("budget")
+        if budget is None:
+            # 连接期确定初始计价模型，每轮开始前跟随实际配置重新计价——
+            # 不能用 lifespan 的模型快照钉死会话。
+            budget = BudgetGuard(model=resolve_model(None))  # limits 自 RA_MAX_* 继承
+            rt["budget"] = budget
+
         # 双轨制注入：sandbox 围栏恒为工作区根；相对写入与执行默认 CWD 归巢
-        # 产物目录（savefig 相对保存自动落家）；读共享数据靠契约里的绝对路径口径。
+        # 产物目录（savefig 相对保存自动落家）；读共享数据靠契约绝对路径口径。
         tools = ToolRegistry(
             work_dir=str(cwd),
             write_anchor=str(outputs_abs),
@@ -624,172 +1239,302 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         )
         system_instructions = _chat_system_instructions(cwd, outputs_abs)
 
-        ask_state = {"current": ""}  # 当前待应答的审批请求 ID（防迟到回执污染）
-
-        def _push_approval(req: ToolApprovalRequest) -> None:
-            ask_id = uuid.uuid4().hex[:8]
-            ask_state["current"] = ask_id
-            asyncio.get_running_loop().create_task(
-                _send(
-                    {
-                        "type": "approval_request",
-                        "id": ask_id,
-                        "tool": req.tool_name,
-                        "summary": req.summary(),
-                    }
-                )
-            )
-
-        approver = QueueApprover(approvals, timeout=120.0, on_request=_push_approval)
-
-        tasks_reg = getattr(websocket.app.state, "active_tasks", None)
-        if isinstance(tasks_reg, dict):  # 注册到任务表：REST stop 可达（可选能力）
-            tasks_reg[f"chat:{sid}"] = {
-                "status": "running",
-                "query": sid[:100],
-                "cancel_event": cancel_event,
-                "approvals": approvals,
-                "steers": steers,
-            }
-
         card_seq = itertools.count(1)  # 卡片 ID 连接内唯一（跨轮不重置：
-        pending_cards: deque[str] = deque()  # 前端 cards 映射按 id 合并）
+        # 前端 cards 映射按 id 合并；回合私有的是 pending_cards FIFO 配对表）
 
-        async def _on_text(delta: str) -> None:
+        async def _on_text(handle: _TurnHandle, delta: str) -> None:
             # 流式路径：run_agent 把该回调作为 on_chunk 传给 LLM client，
-            # 因此这里是逐段增量而非整轮文本。
+            # 因此这里是逐段增量而非整轮文本。增量同步入账 partial_text：
+            # 异常/硬取消路径的兜底文本来源（agent_result 拿不到时仍有它）。
             if delta:
-                await _send({"type": "text", "delta": delta})
+                handle.partial_text += delta
+                await _emit(handle, {"type": "text", "delta": delta})
 
-        async def _on_tool_start(tool: str, args: dict) -> None:
-            cid = f"c{next(card_seq)}"
-            pending_cards.append(cid)  # 工具顺序执行：FIFO 配对结束回调
-            await _send(
-                {
-                    "type": "tool_card",
-                    "id": cid,
-                    "tool": tool,
-                    "arguments": _jsonable_arguments(args),
-                    "status": "running",
-                    "result_preview": "",
-                    "files": [],
-                }
-            )
-
-        async def _on_tool_use(tool: str, args: dict, result: object) -> None:
-            text = result if isinstance(result, str) else str(result)
-            # 被拒/出错的调用不会触发 on_tool_start，这里兜底补发终态卡
-            cid = pending_cards.popleft() if pending_cards else f"c{next(card_seq)}"
-            status = "error" if text.startswith(("Error", "[DENIED")) else "done"
-            await _send(
-                {
-                    "type": "tool_card",
-                    "id": cid,
-                    "tool": tool,
-                    "arguments": _jsonable_arguments(args),
-                    "status": status,
-                    "result_preview": text[:PREVIEW_LIMIT],
-                    "files": extract_artifact_paths(tool, args, text),
-                }
-            )
-
-        async def _run_turn(text: str) -> None:
-            """一轮完整对话：载入历史 → 追加用户消息 → run_agent → 写回。"""
-            nonlocal llm_client
+        async def _start_turn(text: str, attachments: list[dict]) -> None:
+            """装配并 spawn 一轮对话；立即返回，主循环继续收 steer/审批/stop。"""
             turn_t0 = time.monotonic()
-            cancel_event.clear()  # 新回合重置上一轮遗留的停止信号
-            # ---- 每轮实时构建客户端：设置页保存 / 工作区切换即刻生效 -------
-            model_now = resolve_model(None)
-            budget.model = model_now  # 计价跟随实际模型，预算口径不漂移
-            try:
-                fresh_client = _HistoryClient(build_llm_client(model=model_now))
-            except ValueError as exc:  # 未配置 Key 等 → 错误帧收场，不踢连接
-                store.finish("failed", budget.snapshot())
-                LOG.warning("回合配置缺失 sid=%s：%s", sid, exc)
-                await _send({"type": "error", "message": str(exc)})
-                return
-            if llm_client is not None:  # 释放上一轮客户端，防连接句柄泄漏
-                try:
-                    await llm_client.close()
-                except Exception:
-                    pass
-            llm_client = fresh_client
 
+            handle = _TurnHandle(cancel_event=asyncio.Event(), budget=budget)
+            # seq 会话内单调续接：此刻 rt["last"] 仍是上一回合句柄（本回合
+            # 的赋值在 spawn 之后），新游标从它续跑，保证 attach(after) 的
+            # 过滤语义跨回合成立。
+            prev_handle = rt.get("last")
+            if prev_handle is not None:
+                handle.seq = prev_handle.seq
+            # 队列以句柄字段为权威（数据类自带实例）：_dispatch 的回执/steer、
+            # 任务表注册项与内核消费的必须是同一对象——各建各的会让回执永远
+            # 等不到人收（审批侧表现为 120s 超时假死）。
+            approvals = handle.approvals
+            steers = handle.steers
+            ask_state = handle.ask_state
+
+            def _push_approval(req: ToolApprovalRequest) -> None:
+                ask_id = req.request_id or uuid.uuid4().hex
+                ask_state["current"] = ask_id
+                # 同步回调里发帧只能借道任务；审批帧稀疏，顺序抖动可接受，
+                # seq 已在缓冲中保序、回放侧不受影响。
+                asyncio.get_running_loop().create_task(
+                    _emit(
+                        handle,
+                        {
+                            "type": "approval_request",
+                            "id": ask_id,
+                            "tool": req.tool_name,
+                            "summary": req.summary(),
+                            "agent_id": req.agent_id,
+                            "role": req.agent_role,
+                        },
+                    )
+                )
+
+            handle.approver = QueueApprover(
+                approvals, timeout=120.0, on_request=_push_approval
+            )
+
+            pending_cards: deque[str] = deque()  # 工具顺序执行：FIFO 配对结束回调
+
+            async def _on_tool_start(tool: str, args: dict) -> None:
+                cid = f"c{next(card_seq)}"
+                pending_cards.append(cid)
+                await _emit(
+                    handle,
+                    {
+                        "type": "tool_card",
+                        "id": cid,
+                        "tool": tool,
+                        "arguments": _jsonable_arguments(args),
+                        "status": "running",
+                        "result_preview": "",
+                        "files": [],
+                    },
+                )
+
+            async def _on_tool_use(tool: str, args: dict, result: object) -> None:
+                text_out = result if isinstance(result, str) else str(result)
+                # 被拒/出错的调用不会触发 on_tool_start，这里兜底补发终态卡
+                cid = pending_cards.popleft() if pending_cards else f"c{next(card_seq)}"
+                status = "error" if text_out.startswith(("Error", "[DENIED")) else "done"
+                await _emit(
+                    handle,
+                    {
+                        "type": "tool_card",
+                        "id": cid,
+                        "tool": tool,
+                        "arguments": _jsonable_arguments(args),
+                        "status": status,
+                        "result_preview": text_out[:PREVIEW_LIMIT],
+                        "files": extract_artifact_paths(tool, args, text_out),
+                    },
+                )
+
+            # ---- 历史：用户消息先行落盘（崩溃可恢复） -------------------------
             messages = _read_history(run_dir)
-            messages.append({"role": "user", "content": text})
-            _write_history(run_dir, messages)  # 用户消息先落盘（崩溃可恢复）
-            store.save()  # 刷新 run.json updated_at
+            user_entry: dict[str, Any] = {"role": "user", "content": text}
+            if attachments:
+                user_entry["attachments"] = attachments
+            messages.append(user_entry)
+            _write_history(run_dir, messages)
+            store.save()
             store.log_event("turn_start", {"chars": len(text)})
+            model_now = resolve_model(None)
             LOG.info("回合开始 sid=%s 字数=%d 模型=%s", sid, len(text), model_now)
-            llm_client.set_prefix(messages[:-1])  # 注入既往对话（适配层）
+            history_prefix = [_content_for_llm(m) for m in messages[:-1]]
 
             async def _invoke():
-                return await run_agent(
-                    prompt=text,
-                    system_prompt=system_instructions,
-                    llm_client=llm_client,
-                    tools=tools,
-                    config=RunConfig(
-                        # 会话语义：一条用户消息一轮回复，自然停即停。
-                        # 截断续跑不受影响——max_tokens 分支由内核自行注入
-                        # "Continue from where you left off."，长文档产出仍连贯。
-                        auto_continue=False,
-                        budget=budget,
-                        cancel_event=cancel_event,
-                        approver=approver,
-                        session_log=store,  # events.jsonl 审计镜像（msg_add 等）
-                    ),
-                    on_text=_on_text,
-                    on_tool_start=_on_tool_start,
-                    on_tool_use=_on_tool_use,
-                    steer_queue=steers,
-                )
+                # 每轮实时构建客户端：设置页保存即刻生效；历史由包装层前置
+                # 进本轮首个请求（_HistoryClient），内核仍从单条 user 起步。
+                llm_client = _HistoryClient(build_llm_client(model=model_now))
+                llm_client.set_prefix([])
+                try:
+                    return await run_agent(
+                        prompt=text,
+                        system_prompt=system_instructions,
+                        llm_client=llm_client,
+                        tools=tools,
+                        config=RunConfig(
+                            # 会话语义：一条用户消息一轮回复，自然停即停。
+                            auto_continue=False,
+                            budget=budget,
+                            cancel_event=handle.cancel_event,
+                            approver=handle.approver,
+                            session_log=store,  # events.jsonl 审计镜像
+                            initial_messages=history_prefix,
+                        ),
+                        on_text=lambda delta: _on_text(handle, delta),
+                        on_tool_start=_on_tool_start,
+                        on_tool_use=_on_tool_use,
+                        steer_queue=steers,
+                    )
+                finally:
+                    try:
+                        await llm_client.close()
+                    except Exception:
+                        pass
 
-            agent_task = asyncio.ensure_future(_invoke())
-            try:
-                # B5 思路复用：运行期每 ~1s 推一帧 usage 快照，结束时至少一帧。
+            async def _feeder(agent_task):
+                # 运行期每 ~1s 推一帧 usage 快照，结束至少一帧。本循环从不
+                # 中途 break——usage_ticks 的生成器只在自然耗尽（任务已完成）
+                # 时才走 finally，其 task.cancel() 兜底不可能误杀运行中回合。
                 async for frame in usage_ticks(agent_task, budget):
-                    if not await _send(frame):
-                        break  # 断连：usage_ticks 会兜底硬停 agent_task
-                agent_result = agent_task.result()
-            except asyncio.CancelledError:
-                # 真·取消（断连硬停/服务关闭）：状态落盘后交还控制权，
-                # 由主循环的 receive 感知断连收尾。
-                store.finish("cancelled", budget.snapshot())
-                return
-            except Exception as exc:
-                store.finish("failed", budget.snapshot())
-                message = str(exc) + (_NETWORK_HINT if _is_network_error(exc) else "")
-                LOG.warning("回合失败 sid=%s 用时=%.1fs：%s",
-                            sid, time.monotonic() - turn_t0, str(exc)[:300])
-                await _send({"type": "error", "message": message})
-                return
+                    await _emit(handle, frame)
 
-            reply = (agent_result.text_output or "").strip()
-            if reply:
-                messages.append({"role": "assistant", "content": reply})
-                _write_history(run_dir, messages)
-            # stop 动作/断连取消时内核正常返回，stop_reason=cancelled —— 状态如实落盘
-            final_status = "cancelled" if agent_result.stop_reason == "cancelled" else "complete"
-            LOG.info("回合结束 sid=%s 状态=%s 用时=%.1fs 轮次=%s",
-                     sid, final_status, time.monotonic() - turn_t0, agent_result.turns)
-            store.finish(final_status, budget.snapshot())
-            await _send(
-                {
-                    "type": "result",
-                    "stop_reason": agent_result.stop_reason,
-                    "turns": agent_result.turns,
+            async def _turn_main() -> None:
+                agent_result: Any = None
+                failure: BaseException | None = None
+                try:
+                    agent_task = asyncio.ensure_future(_invoke())
+                    handle.feeder = asyncio.ensure_future(_feeder(agent_task))
+                    agent_result = await agent_task
+                except asyncio.CancelledError:
+                    # 硬取消（服务关闭 / 删除兜底）：已流出文本回调层有账
+                    failure = asyncio.CancelledError()
+                except Exception as exc:
+                    failure = exc
+                finally:
+                    # 收尾帧保证：agent 落定后 usage_ticks 生成器会被已满足的
+                    # wait 立即唤醒、发出最后一帧再自然返回——给泵最多 0.5s
+                    # 发完；超时（理论上仅 socket 死锁）才取消兜底。不能盲目
+                    # cancel，否则「结束至少一帧 usage」语义丢失。
+                    if handle.feeder is not None and not handle.feeder.done():
+                        done, _ = await asyncio.wait({handle.feeder}, timeout=0.5)
+                        if not done:
+                            handle.feeder.cancel()
+                            try:
+                                await handle.feeder
+                            except BaseException:
+                                pass
+                    handle.feeder = None
+
+                # ---- 全路径持久化：用户消息之后必有 assistant 条目 -------------
+                if failure is None:
+                    reply = ((getattr(agent_result, "text_output", "") or "")
+                             or handle.partial_text).strip()
+                    stop_reason = str(getattr(agent_result, "stop_reason", "") or "")
+                elif isinstance(failure, asyncio.CancelledError):
+                    reply, stop_reason = handle.partial_text.strip(), "cancelled"
+                else:
+                    reply, stop_reason = handle.partial_text.strip(), "error"
+                cancelled = (
+                    stop_reason == "cancelled"
+                    or isinstance(failure, asyncio.CancelledError)
+                )
+                errored = (
+                    (failure is not None and not isinstance(failure, asyncio.CancelledError))
+                    or stop_reason == "error"
+                )
+                status = "cancelled" if cancelled else ("failed" if errored else "complete")
+                # partial 标记：文本是残缺回答（被打断/失败），前端可提示续问
+                partial_flag = bool(reply) and (cancelled or errored)
+
+                if reply:
+                    done_entry: dict[str, Any] = {"role": "assistant", "content": reply}
+                    if partial_flag:
+                        done_entry["partial"] = True
+                    messages.append(done_entry)
+                    _write_history(run_dir, messages)
+                LOG.info("回合结束 sid=%s 状态=%s 用时=%.1fs 字数=%d",
+                         sid, status, time.monotonic() - turn_t0, len(reply))
+                store.finish(status, budget.snapshot())
+
+                if errored and failure is not None:
+                    message = str(failure) + (
+                        _NETWORK_HINT if _is_network_error(failure) else ""
+                    )
+                    LOG.warning("回合失败 sid=%s 用时=%.1fs：%s",
+                                sid, time.monotonic() - turn_t0, str(failure)[:300])
+                    await _emit(handle, {"type": "error", "message": message})
+                await _emit(
+                    handle,
+                    {
+                        "type": "result",
+                        "stop_reason": stop_reason,
+                        "turns": int(getattr(agent_result, "turns", 0) or 0),
+                    },
+                )
+                handle.status = status
+
+            def _cleanup_turn() -> None:
+                """回合收尾清理：活动表/任务注册项。幂等，硬取消路径同样覆盖。"""
+                if _ACTIVE.get(sid) is handle:
+                    _ACTIVE.pop(sid, None)
+                tasks_reg = getattr(websocket.app.state, "active_tasks", None)
+                if isinstance(tasks_reg, dict):
+                    reg = tasks_reg.get(f"chat:{sid}")
+                    if isinstance(reg, dict) and reg.get("task") is handle.task:
+                        tasks_reg.pop(f"chat:{sid}", None)
+
+            async def _turn_main_wrapped() -> None:
+                try:
+                    await _turn_main()
+                finally:
+                    _cleanup_turn()
+
+            handle.task = asyncio.ensure_future(_turn_main_wrapped())
+            _ACTIVE[sid] = handle
+            rt["last"] = handle
+            tasks_reg = getattr(websocket.app.state, "active_tasks", None)
+            if isinstance(tasks_reg, dict):  # 注册到任务表：REST stop 可达 +
+                # 删除端点的精确等待分支自此有真实 task 对象可等。
+                tasks_reg[f"chat:{sid}"] = {
+                    "status": "running",
+                    "query": text[:100],
+                    "cancel_event": handle.cancel_event,
+                    "approvals": approvals,
+                    "steers": steers,
+                    "task": handle.task,
                 }
-            )
+            _observe(handle)
+
+        async def _handle_attach(msg: dict) -> None:
+            """回放协议入口：把错过的帧按 seq 补发给（重）连接的客户端。
+
+            有活动回合→接管观察（撤销孤儿看门狗）；只有刚结束的回合→照常
+            回放（客户端借此无损恢复上一回合全过程）；都没有→replay_empty，
+            客户端回落 REST 历史渲染。
+            """
+            try:
+                after = int(msg.get("after") or 0)
+            except (TypeError, ValueError):
+                after = 0
+            after = max(0, after)
+            target = _ACTIVE.get(sid) or (_SESSIONS.get(sid) or {}).get("last")
+            if target is None:
+                await _send({"type": "replay_empty"})
+                return
+            already = target in watching
+            _observe(target)
+            # 下面整段无 await（_post 同步入箱）：快照、过滤、begin/帧/end
+            # 的入箱顺序对回合任务的并发发射是原子的——要么 emit 整段先跑
+            # （其 seq 进了快照、由回放补发），要么整段后跑（由直播路由送
+            # 达）。绝不出现「半段回放 + 半段直播」交错导致的乱序/重复。
+            _post({
+                "type": "replay_begin",
+                "last_seq": target.seq,
+                "status": target.status,
+            })
+            for frame in list(target.frames):  # 快照迭代：边回放边新增也安全
+                if frame.get("seq", 0) > after:
+                    _post(frame)
+            _post({
+                "type": "replay_end",
+                "status": target.status,
+                "last_seq": target.seq,
+            })
+            if already:
+                LOG.debug("重复 attach 同一回合 sid=%s after=%d", sid, after)
 
         async def _dispatch(msg: dict) -> None:
-            """处理非 user 类动作：审批回执 / steer / stop（泵与空闲态共用）。"""
+            """处理非 user 动作：审批回执 / steer / stop / attach。"""
             action = msg.get("action")
+            handle = _ACTIVE.get(sid)
             if action == "approval":
+                if handle is None:
+                    return  # 无活动回合：迟到回执无处可去，忽略
                 ask_id = str(msg.get("id") or "")
-                if ask_id and ask_id == ask_state["current"]:
-                    ask_state["current"] = ""
-                    approvals.put_nowait(bool(msg.get("approved")))
+                if ask_id and ask_id == handle.ask_state["current"]:
+                    handle.ask_state["current"] = ""
+                    # QueueApprover 按字符串真值判定："true" 在 _YES 集内
+                    handle.approvals.put_nowait(str(bool(msg.get("approved"))).lower())
                 # 迟到 / 未知 id 的回执直接忽略：避免残留答案自动应答下一次问询
             elif action == "steer":
                 message = str(msg.get("message") or "").strip()
@@ -797,32 +1542,20 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     await _send({"type": "error", "message": "steer 内容不能为空"})
                 elif len(message) > MAX_STEER_LENGTH:
                     await _send(
-                        {
-                            "type": "error",
-                            "message": f"steer 过长（最大 {MAX_STEER_LENGTH} 字符）",
-                        }
+                        {"type": "error",
+                         "message": f"steer 过长（最大 {MAX_STEER_LENGTH} 字符）"}
                     )
+                elif handle is None:
+                    await _send({"type": "error", "message": "当前没有运行中的回合"})
                 else:
-                    steers.put_nowait(message)
+                    handle.steers.put_nowait(message)
             elif action == "stop":
-                cancel_event.set()
-            elif action == "user":
-                # 容忍运行中误发的 user 动作：按 steer 处理（与前端行为一致）
-                message = str(msg.get("text") or "").strip()
-                if message:
-                    steers.put_nowait(message[:MAX_STEER_LENGTH])
+                if handle is not None:
+                    handle.cancel_event.set()
+            elif action == "attach":
+                await _handle_attach(msg)
             else:
                 await _send({"type": "error", "message": f"未知 action: {action}"})
-
-        async def _pump() -> None:
-            """轮次运行期间持续接收客户端消息并分发。"""
-            try:
-                while True:
-                    await _dispatch(await websocket.receive_json())
-            except Exception:
-                # 断连 / 解析失败：取消本轮运行，并解除阻塞中的审批问询
-                cancel_event.set()
-                approvals.put_nowait(None)
 
         LOG.info("会话连接建立 sid=%s outputs=%s", sid, store.state.outputs_dir)
         # connected 帧是前端 dock 的权威源：REST 列表在工作区切换后会把
@@ -833,7 +1566,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             "outputs_dir": store.state.outputs_dir,
         })
 
-        # ---- 主循环：空闲期直接接收，user 动作触发一轮 ---------------------
+        # ---- 主循环：空闲期直接接收；user 触发回合（spawn 后立即返回） -----
         while True:
             msg = await websocket.receive_json()
             if msg.get("action") == "user":
@@ -848,37 +1581,48 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                         }
                     )
                 else:
-                    pump = asyncio.create_task(_pump())
-                    try:
-                        await _run_turn(text)
-                    finally:
-                        pump.cancel()
-                        # 注意：不能直接 ``await pump`` —— 被取消的任务会把
-                        # CancelledError（BaseException）抛进本协程并杀掉连接；
-                        # asyncio.wait 只等状态不传播任务异常。
-                        try:
-                            await asyncio.wait({pump})
-                        except Exception:
-                            pass
+                    active = _ACTIVE.get(sid)
+                    # 收尾窗口守卫：result 帧在 _turn_main 的 finally（含最长
+                    # 0.5s 的 feeder 等待）之前就到了客户端，客户端立刻追问
+                    # 时 _ACTIVE 可能还挂着已结束的旧句柄——此刻转 steer 等于
+                    # 把话塞进无人消费的队列（幽灵消息，界面永久沉默）。
+                    # 任务对象已 done 即视为空闲，放行走新回合。
+                    active_live = active is not None and not (
+                        active.task is not None and active.task.done()
+                    )
+                    if active_live:
+                        # 运行中收到新消息：按 steer 转交（原行为保留——
+                        # 前端输入框在运行期本就是 steer 通道）。
+                        active.steers.put_nowait(text[:MAX_STEER_LENGTH])
+                        continue
+                    checked = _validate_attachment_refs(cwd, sid, msg.get("attachments"))
+                    if isinstance(checked, str):
+                        await _send({"type": "error", "message": checked})
+                        continue
+                    await _start_turn(text, checked)
             else:
                 await _dispatch(msg)
 
     except WebSocketDisconnect:
-        # 客户端离开 —— 确保底层运行停止消耗 token（与 ws.py 同构）
+        # R16：断连不再是取消信号——回合继续跑；观察者名额在 finally 归还。
         LOG.info("会话连接断开 sid=%s", sid)
-        cancel_event.set()
     except Exception as exc:
         LOG.warning("会话连接异常 sid=%s：%s", sid, str(exc)[:300])
-        await _send({"type": "error", "message": str(exc)})
+        try:  # 直发绕过泵：此刻 socket 大概率已坏，尽力而为、不掩盖原异常
+            await websocket.send_json({"type": "error", "message": str(exc)})
+        except Exception:
+            pass
     finally:
-        if sid:
-            if _LIVE.get(sid) is websocket:
-                _LIVE.pop(sid, None)
-            tasks_reg = getattr(websocket.app.state, "active_tasks", None)
-            if isinstance(tasks_reg, dict):
-                tasks_reg.pop(f"chat:{sid}", None)
-        if llm_client is not None:
-            try:
-                await llm_client.close()
-            except Exception:
-                pass
+        for h in list(watching):
+            _release(h)
+        if sid and _LIVE.get(sid) is websocket:
+            _LIVE.pop(sid, None)
+        if sink_fn is not None and _SINKS.get(sid) is sink_fn:
+            _SINKS.pop(sid, None)
+        pump_task.cancel()
+        try:
+            await pump_task
+        except asyncio.CancelledError:
+            pass
+        # 注意：不清 active_tasks 注册项——回合生命周期归 _turn_main 收尾管
+        # （注册项带真实 task 对象，删除端点的精确等待依赖它）。

@@ -9,7 +9,7 @@ from research_assistant.agent import RunConfig, run_agent
 from research_assistant.kernel.budget import BudgetGuard, BudgetLimits
 from research_assistant.kernel.events import EventKind, HookBus, HookVerdict
 from research_assistant.llm.base import LLMClient, LLMResponse
-from research_assistant.llm.errors import HeartbeatTimeoutError
+from research_assistant.llm.errors import HeartbeatTimeoutError, NetworkError
 from research_assistant.tools.registry import ToolRegistry
 
 
@@ -105,13 +105,77 @@ async def test_lifecycle_events_emitted(tmp_path):
     assert EventKind.RUN_END in kinds
 
 
+@pytest.mark.asyncio
+async def test_reused_hook_bus_does_not_accumulate_per_run_handlers(tmp_path):
+    bus = HookBus()
+    observed: list[EventKind] = []
+    bus.on(EventKind.RUN_START, lambda event: observed.append(event.kind))
+    original_counts = {k: len(v) for k, v in bus._handlers.items()}
+
+    for _ in range(2):
+        await run_agent(
+            prompt="p", system_prompt="s",
+            llm_client=ScriptedClient([
+                LLMResponse(content="[TASK_COMPLETE] ok"),
+            ]),
+            tools=ToolRegistry(work_dir=str(tmp_path)),
+            config=RunConfig(hooks=bus, auto_continue=False),
+        )
+
+    assert observed == [EventKind.RUN_START, EventKind.RUN_START]
+    assert {k: len(v) for k, v in bus._handlers.items()} == original_counts
+    assert EventKind.PRE_TOOL_USE not in bus._handlers
+
+
+@pytest.mark.asyncio
+async def test_restored_history_is_model_visible_and_audited(tmp_path):
+    class Log:
+        def __init__(self):
+            self.events = []
+
+        def log(self, kind, data=None):
+            self.events.append({"kind": kind, "data": data or {}})
+
+    log = Log()
+    captured: list[list[dict]] = []
+
+    class CaptureClient(ScriptedClient):
+        async def chat(self, messages, **kwargs):
+            captured.append([dict(m) for m in messages])
+            return await super().chat(messages, **kwargs)
+
+    await run_agent(
+        prompt="new question", system_prompt="s",
+        llm_client=CaptureClient([
+            LLMResponse(content="[TASK_COMPLETE] answer"),
+        ]),
+        tools=ToolRegistry(work_dir=str(tmp_path)),
+        config=RunConfig(
+            auto_continue=False,
+            initial_messages=[
+                {"role": "user", "content": "old question"},
+                {"role": "assistant", "content": "old answer"},
+            ],
+            session_log=log,
+        ),
+    )
+
+    assert [m["content"] for m in captured[0]] == [
+        "old question", "old answer", "new question",
+    ]
+    additions = [e["data"] for e in log.events if e["kind"] == "msg_add"]
+    assert [e["origin"] for e in additions[:3]] == [
+        "history", "history", "current",
+    ]
+
+
 # ---------------------------------------------------------------------------
 # Budget
 # ---------------------------------------------------------------------------
 
 @pytest.mark.asyncio
 async def test_budget_exceeded_stops_gracefully(tmp_path):
-    guard = BudgetGuard(BudgetLimits(max_turns=1), model="claude-sonnet-4-6")
+    guard = BudgetGuard(BudgetLimits(max_turns=1), model="claude-sonnet-5")
     client = ScriptedClient([
         LLMResponse(content="turn one"),
         LLMResponse(content="turn two"),  # would need turn 2 -> blocked by budget
@@ -240,6 +304,150 @@ class SilentSlowClient(LLMClient):
 
     async def close(self):
         pass
+
+
+class PartialThenSuccessfulClient(LLMClient):
+    """Fails after a visible chunk, then succeeds on the retry."""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, *, on_chunk=None, **kw):
+        self.calls += 1
+        if self.calls == 1:
+            if on_chunk:
+                result = on_chunk("discarded partial ")
+                if hasattr(result, "__await__"):
+                    await result
+            raise NetworkError("temporary disconnect")
+        if on_chunk:
+            result = on_chunk("final text")
+            if hasattr(result, "__await__"):
+                await result
+        return LLMResponse(content="final text", stop_reason="end_turn")
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_passes_through_and_marks_interrupted_attempt(
+        tmp_path, monkeypatch):
+    """R12.x 流式直通：失败尝试的正文实时可见，重试前补一条中断标注。
+
+    （旧行为：整次调用被缓冲到成功后一次性回放，UI 全程看不到正文。）
+    """
+    monkeypatch.setenv("RA_MAX_RETRIES", "1")
+    monkeypatch.setenv("RA_RETRY_BASE_DELAY", "0")
+    client = PartialThenSuccessfulClient()
+    emitted: list[str] = []
+
+    result = await run_agent(
+        prompt="p", system_prompt="s", llm_client=client,
+        tools=ToolRegistry(work_dir=str(tmp_path)),
+        config=RunConfig(auto_continue=False),
+        on_text=emitted.append,
+    )
+
+    assert client.calls == 2
+    # 失败尝试的 chunk 实时透传；重试开始前插入诚实的中断标注。
+    assert emitted == [
+        "discarded partial ",
+        "\n\n[生成中断，正在自动重试…]\n\n",
+        "final text",
+    ]
+    # collected_text 只含最终响应内容（流式 chunk 不重复计入）。
+    assert result.text_output == "final text"
+
+
+class FailBeforeFirstChunkClient(LLMClient):
+    """首块之前就失败（连接/429 等最常见场景），重试后成功。"""
+
+    def __init__(self):
+        self.calls = 0
+
+    async def chat(self, messages, *, on_chunk=None, **kw):
+        self.calls += 1
+        if self.calls == 1:
+            raise NetworkError("connection reset by peer")
+        if on_chunk:
+            result = on_chunk("hello")
+            if hasattr(result, "__await__"):
+                await result
+        return LLMResponse(content="hello", stop_reason="end_turn")
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_stream_retry_before_first_chunk_is_silent(tmp_path, monkeypatch):
+    """首块之前的失败依旧无痕重试：不插入中断标注、不重复内容。"""
+    monkeypatch.setenv("RA_MAX_RETRIES", "1")
+    monkeypatch.setenv("RA_RETRY_BASE_DELAY", "0")
+    client = FailBeforeFirstChunkClient()
+    emitted: list[str] = []
+
+    await run_agent(
+        prompt="p", system_prompt="s", llm_client=client,
+        tools=ToolRegistry(work_dir=str(tmp_path)),
+        config=RunConfig(auto_continue=False),
+        on_text=emitted.append,
+    )
+
+    assert client.calls == 2
+    assert emitted == ["hello"]
+
+
+class HangingStreamClient(LLMClient):
+    """挂死在 LLM 调用中：供硬取消测试打断。"""
+
+    async def chat(self, messages, **kw):
+        await asyncio.Event().wait()
+
+    async def close(self):
+        pass
+
+
+@pytest.mark.asyncio
+async def test_hard_cancel_releases_reservation_and_emits_run_end(tmp_path):
+    """硬取消（task.cancel()）必须归还预算预留并尽力补发 RUN_END。
+
+    （缺陷 A：CancelledError 是 BaseException 直接穿堂——预留永久滞留
+    BudgetGuard、RUN_END 缺失。）
+    """
+    guard = BudgetGuard(BudgetLimits(), model="m")
+    bus = HookBus()
+    ended: list[dict] = []
+    request_started = asyncio.Event()
+
+    bus.on(EventKind.RUN_END, lambda e: ended.append(dict(e.payload)))
+    bus.on(EventKind.LLM_REQUEST, lambda e: request_started.set())
+
+    task = asyncio.create_task(run_agent(
+        prompt="p", system_prompt="s", llm_client=HangingStreamClient(),
+        tools=ToolRegistry(work_dir=str(tmp_path)),
+        config=RunConfig(budget=guard, hooks=bus, auto_continue=False),
+    ))
+    try:
+        await asyncio.wait_for(request_started.wait(), timeout=2.0)
+        # 预留在途（LLM 调用挂死期间）
+        assert guard.snapshot()["in_flight"] == 1
+
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    finally:
+        if not task.done():
+            task.cancel()
+
+    # 预留已归还，不再滞留共享预算
+    snap = guard.snapshot()
+    assert snap["in_flight"] == 0
+    assert snap["reserved_tokens"] == 0
+    # RUN_END 尽力补发，前端才能收尾
+    assert len(ended) == 1
+    assert ended[0]["stop_reason"] == "cancelled"
 
 
 @pytest.mark.asyncio

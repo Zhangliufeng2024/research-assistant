@@ -92,22 +92,26 @@ function refineIdx(current: number, message: string): number {
   return current;
 }
 
-/** 归约单条消息；返回新 task 对象（不修改入参）。 */
-export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
-  const t: TaskState = {
-    ...prev,
-    timeline: [...prev.timeline],
-    tlNote: { ...prev.tlNote },
-  };
+function clone(t: TaskState): TaskState {
+  return { ...t, timeline: [...t.timeline], tlNote: { ...t.tlNote } };
+}
 
+/** 归约单条消息；返回新 task 对象（不修改入参）。
+ * 克隆契约对齐 protocolChat「无可观测变化返回原引用」：default 帧型与
+ * 无关帧（空 usage、空白 text、已收束后的重复 done）原样返回——
+ * usage 帧频率极高，无谓的新引用只会让订阅方整面板重绘。 */
+export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
   switch (msg.type) {
-    case "connected":
+    case "connected": {
+      const t = clone(prev);
       t.phase = "running";
       t.taskId = msg.task_id || t.taskId;
       t.startedAt = t.startedAt || Date.now();
       return t;
+    }
 
     case "progress": {
+      const t = clone(prev);
       // 未收到 connected 的 progress（如重放/异常路径）也应推进状态
       if (t.phase === "idle") t.phase = "running";
       if (msg.stage === "cancelled") {
@@ -151,21 +155,29 @@ export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
       return t;
     }
 
-    case "text":
-      if (msg.content && msg.content.trim()) {
-        t.activity = addActivity(t, "text", "模型输出", msg.content);
-      }
+    case "text": {
+      if (!msg.content || !msg.content.trim()) return prev;
+      const t = clone(prev);
+      t.activity = addActivity(t, "text", "模型输出", msg.content);
       return t;
+    }
 
     case "usage":
-      if (msg.budget) t.budget = msg.budget;
-      return t;
+      if (!msg.budget) return prev;
+      {
+        const t = clone(prev);
+        t.budget = msg.budget;
+        return t;
+      }
 
     case "approval_request": {
+      const t = clone(prev);
       const approval: ApprovalInfo = {
         id: msg.id,
         tool: msg.tool || "",
         summary: msg.summary || "",
+        agentId: msg.agent_id || "",
+        role: msg.role || "",
         deadline: Date.now() + APPROVAL_TIMEOUT_S * 1000,
       };
       t.approval = approval;
@@ -173,11 +185,14 @@ export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
       return t;
     }
 
-    case "steer_ok":
+    case "steer_ok": {
+      const t = clone(prev);
       t.activity = addActivity(t, "info", "转向指令已注入 agent");
       return t;
+    }
 
     case "result": {
+      const t = clone(prev);
       t.finishedAt = Date.now();
       t.result = msg;
       if (msg.status === "failed") {
@@ -199,6 +214,7 @@ export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
     }
 
     case "error": {
+      const t = clone(prev);
       const errText = msg.message || "未知错误";
       t.phase = "error";
       t.error = errText;
@@ -208,13 +224,17 @@ export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
       return t;
     }
 
-    case "done":
+    case "done": {
+      // 已收束（非 running 且 finishedAt 已记）的重复 done：原引用返回
+      if (prev.phase !== "running" && prev.finishedAt !== null) return prev;
+      const t = clone(prev);
       if (t.phase === "running") t.phase = "done";
       t.finishedAt = t.finishedAt || Date.now();
       return t;
+    }
 
     default:
-      return t;
+      return prev;
   }
 }
 

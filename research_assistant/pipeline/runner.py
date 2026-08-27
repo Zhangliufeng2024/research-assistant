@@ -164,6 +164,8 @@ async def run_pipeline(
     approver: Any | None = None,
     max_revision_rounds: int = 3,
     steer_queue: asyncio.Queue | None = None,
+    project_instructions: str | None = None,
+    retrieval_block: str = "",
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Execute the full generation pipeline, yielding progress updates.
 
@@ -176,6 +178,13 @@ async def run_pipeline(
     from ..constants import OUTPUT_SUBDIRS
 
     total_start = time.time()
+    # 项目长期指令：注入到每个子代理的系统提示（单点收口）。
+    context_text = (project_instructions or "").strip()
+    project_context = (
+        f"\n\n# 项目长期指令（用户为整个研究项目设定，所有阶段必须遵守）\n{context_text}"
+        if context_text
+        else ""
+    )
     work_dir = Path(work_dir)
     output_dir = Path(output_dir)
     for subdir in OUTPUT_SUBDIRS:
@@ -213,10 +222,13 @@ async def run_pipeline(
     async def _run_stage(
         stage: str, prompt: str, system_prompt: str, **kw: Any,
     ) -> LoopResult:
-        result = await _run_stage_agent(stage, prompt, system_prompt, **_stage_kwargs(**kw))
+        result = await _run_stage_agent(
+            stage, prompt, system_prompt + project_context, **_stage_kwargs(**kw),
+        )
         session.log_event(f"stage_{stage}", {
             "stop_reason": result.stop_reason, "turns": result.turns,
             "tokens": result.token_usage.input_tokens + result.token_usage.output_tokens,
+            "duration_seconds": round(result.duration_seconds, 3),
         })
         return result
 
@@ -313,7 +325,7 @@ async def run_pipeline(
                 section_description=s.description, venue=plan.venue,
                 search_queries="\n".join(f"- {q}" for q in s.search_queries),
                 output_file=out_bib, summary_file=out_sum,
-            ),
+            ) + (f"\n\n{retrieval_block}" if retrieval_block else ""),
             "You are a research agent. Find REAL papers. Write BibTeX. Never fabricate.",
             max_continuations=10,
         )
@@ -348,28 +360,35 @@ async def run_pipeline(
         return (fg.name, bool(ok), "ok" if ok else (r.error or "file missing"),
                 time.time() - started)
 
-    tasks = [_limited(_research_one(s)) for s in plan.sections]
-    tasks += [_limited(_figure_one(fg)) for fg in plan.figures]
-    # B5: gather 期间没有其他 yield 点，用 usage_ticks 周期推送预算快照。
-    gather_task = asyncio.ensure_future(
-        asyncio.gather(*tasks, return_exceptions=True),
-    )
-    async for frame in usage_ticks(gather_task, budget):
-        yield frame
-    outcomes = gather_task.result()
-
+    tasks = [asyncio.create_task(_limited(_research_one(s))) for s in plan.sections]
+    tasks += [asyncio.create_task(_limited(_figure_one(fg))) for fg in plan.figures]
     partial = False
-    labels = [f"research:{s.name}" for s in plan.sections] + \
-             [f"figure:{fg.name}" for fg in plan.figures]
-    for label, outcome in zip(labels, outcomes, strict=False):
-        if isinstance(outcome, Exception):
-            partial = True
-            yield _t(f"  [{label}] FAILED: {outcome}")
-        else:
+    # Report each completed agent immediately instead of making the UI wait for
+    # the slowest sibling.  Budget frames continue through timed queue polls.
+    pending = set(tasks)
+    while pending:
+        done, pending = await asyncio.wait(
+            pending, timeout=1.0, return_when=asyncio.FIRST_COMPLETED,
+        )
+        if not done:
+            yield {"type": "usage", "budget": budget.snapshot()}
+            continue
+        for completed in done:
+            try:
+                outcome = completed.result()
+            except Exception as exc:
+                outcome = exc
+            if isinstance(outcome, Exception):
+                label = "agent"
+                partial = True
+                yield _t(f"  [{label}] FAILED: {outcome}")
+                continue
             name, ok, note, dur = outcome
+            label = name
             if not ok:
                 partial = True
             yield _t(f"  [{label}] {'OK' if ok else 'FAILED'}: {note} ({dur:.1f}s)")
+    yield {"type": "usage", "budget": budget.snapshot()}
 
     session.mark_stage("research_figures", "partial" if partial else "done")
 
@@ -466,6 +485,7 @@ async def run_pipeline(
         return report
 
     session.mark_stage("gates", "running")
+    yield _p("[Phase 3b] Running citation and document quality gates...", "gates")
     gate_report = await _run_gates(round_no=0)
     revision_round = 0
 
@@ -494,7 +514,36 @@ async def run_pipeline(
             docx_file = latest
         gate_report = await _run_gates(revision_round)
 
-    session.mark_stage("gates", "done" if gate_report.passed else "partial")
+    if not gate_report.passed:
+        # Blocking gates are a hard finalization boundary.  Keeping a draft
+        # available is useful for resume/debugging, but publishing it under
+        # ``final/`` would make an invalid manuscript look successful to API
+        # consumers and downstream scanners.
+        session.mark_stage("gates", "failed", error="; ".join(gate_report.blocking_failures))
+        stale_final = output_dir / "final" / "manuscript.docx"
+        if stale_final.exists():
+            try:
+                stale_final.unlink()
+            except OSError:
+                pass
+        session.finish("failed", budget.snapshot())
+        yield _t("[Quality gates] FAILED after maximum revision rounds; "
+                  "final manuscript was not published.")
+
+        from ..api import _build_paper_result  # lazy to avoid circular import
+        from ..utils import scan_paper_directory
+        failed_result = _build_paper_result(
+            output_dir, scan_paper_directory(output_dir),
+        )
+        failed_result.status = "failed"
+        failed_result.compilation_success = False
+        failed_result.errors = gate_report.blocking_failures or [
+            "Blocking quality gates did not pass",
+        ]
+        yield failed_result.to_dict()
+        return
+
+    session.mark_stage("gates", "done")
 
     # -------------------------------------------------------------- FINALIZE
     session.mark_stage("finalize", "running")
@@ -519,10 +568,7 @@ async def run_pipeline(
             yield _t(f"  [Review] skipped: {e}")
 
     total_duration = time.time() - total_start
-    session.finish(
-        "complete" if gate_report.passed else "partial",
-        budget.snapshot(),
-    )
+    session.finish("complete", budget.snapshot())
     yield _p(f"Pipeline complete in {total_duration:.0f}s "
              f"(gates: {'PASS' if gate_report.passed else 'PARTIAL'}, "
              f"cost ${budget.state.cost_usd:.2f})", "complete")

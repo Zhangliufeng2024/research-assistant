@@ -1,6 +1,47 @@
 # PROJECT_STATUS — 研究助手 (research-assistant-v3)
 
-> 交接文档 · 更新于 2026-08-23 · 已发布版本 **v3.4.0**（commit `a773fbb`；
+> **聊天耐久化增量（2026-08-26，R16）**：会话回合与 WebSocket 连接彻底解耦——「断连即取消」废除。
+> **后端**（`web/chat.py`）：回合状态收敛进 `_TurnHandle`（预算/审批/steer 队列/环形缓冲/partial_text），
+> 断连仅减少观察者计数；孤儿看门狗宽限 `RA_CHAT_ORPHAN_GRACE_SECONDS`（默认 900s）到期先协作停止、
+> 再 30s 硬取消兜底；帧环形缓冲 `FRAME_RING_CAP=4000` + **会话内单调 seq**，重连 `attach{after}` 按
+> seq 续播（`replay_begin/replay_end/replay_empty`）；回复全路径落盘，被打断的回答带 `partial:true`
+> 不丢字。新增三个历史治理端点：`POST …/truncate`、`PATCH …/messages/{i}`（编辑用户消息）、
+> `POST …/attachments`（multipart 上传落 `outputs/<sid>/uploads/`，围栏校验）；`_read_history`
+> 透传 `attachments`/`partial` 结构化扩展字段。
+> **前端**：断线指数退避自动重连（~28s 放弃转手动「重连」按钮），重连成功按 lastSeq 续播；
+> 附件 chips（选择/拖拽/粘贴，单条 ≤8 个、总量 50MB）随消息入史并在刷新后恢复徽章；
+> 重新生成/编辑改为**真替换**（服务端 truncate + 本地同步裁剪 + 重发，旧回答真正消失而非追加平行答案），
+> 草稿态/离线回落保守重发。协议文档同步至 `docs/protocol.md §10`。
+> **真实浏览器 E2E 再立功**：新增 `scripts/e2e_smoke_r16.py`（断连回放/真替换/附件链路/刷新恢复五断言），
+> 首轮即抓出三个协议级测试集体漏掉的缺陷——① seq 每回合归零致重连后整回合帧被游标滤掉；
+> ② result 帧先于收尾清理到达，「立刻追问」被转成无人消费的幽灵 steer；③ `_read_history`
+> 清洗扩展字段致每回合写回都丢附件/打断标记。均已修复并固化回归测试
+> （`tests/test_chat_durability.py`，17 用例）。R13–R15（流式合帧 R14-S、切换竞态 R13-D、
+> 审批超时兜底 R13-C、首导向极性修复 R15 等）以代码内标注为准，此处补记。
+> 当前全量 Python **941 passed / 1 skipped**，前端 Vitest **213 passed**（24 文件），tsc/Vite 构建通过，ruff 全绿（2026-08-27 复核）。
+
+
+> **科研操作系统增量（2026-08-24）**：平台已从“任务/论文生成器”扩展为可追溯的
+> 研究对象内核。SQLite WAL 现在持久化研究问题/假设、主张、证据链接、决策、可复现
+> 运行和 provenance 图；新增 DurableScheduler 租约队列与“研究工作台”前端。详见
+> `docs/protocol.md §5.4`。旧论文 pipeline、citation/doc gates、ArtifactStore 和
+> 产物变更恢复保持不变。
+
+> **统一 Agent 工作空间增量（2026-08-24）**：按 `plan260824.md` 完成第一轮可运行
+> 重构。数据库 schema v10 新增 Thread/Turn/AgentItem/AgentRun、QualityItem、ArtifactReview、通知、资源租约字段和持久化 Agent 审批收件箱；
+> 默认首页改为 Project Home，新增研究线程、证据矩阵和产物审阅入口。旧 chat/task/ws
+> 协议继续兼容，durable task 会自动映射到统一线程时间线。
+
+> **Supervisor / 复现运行增量（2026-08-24）**：通用 workflow ready 节点已接入
+> `AgentSupervisor`，新增并发上限和 Agent 生命周期事件；schema v10 包含 `analysis_runs`、`agent_runs` 与跨进程资源租约，
+> 前端增加运行队列和分析运行面板。
+
+> **科研闭环增量（2026-08-24）**：产物 Inspector 已接入真实预览、变更 diff、provenance、
+> Citation/Doc Gate 摘要和“要求 Agent 修改”回写；分析运行支持比较与后台复现；研究包支持
+> 安全导出/导入；节点人工跳过/接管和审批 request_id 防迟到回执已接入。当前全量 Python
+> **717 passed / 1 skipped**，前端 Vitest **60 passed**，TypeScript/Vite 构建通过。
+
+> 交接文档 · 更新于 2026-08-24 · 已发布版本 **v3.4.0**（commit `a773fbb`；
 > R12：执行契约 + 文件双轨制 + 产出 dock + 草稿入列）。真实 UI E2E 六断言全过（§5）；安装包
 > `dist/ResearchAssistant_setup_3.4.0.exe` 静默装/卸验证通过。
 > 下一步：目标机验证 v3.4.0（无 Python 机器画图 / 产物归巢 / dock）。
@@ -147,7 +188,13 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 
 ## 5. 测试与验证结果
 
-- **pytest**：644 passed / 1 skipped（R12 后；唯一 warning 是 test_utils docx 测试在
+本轮（schema v10，从 v9 幂等迁移）新增并验收：持久化审批收件箱、AgentRun、项目活动流、输入 schema/runtime 环境变化检测、项目依赖锁、跨进程资源租约、真实 source upload、
+全局 Ctrl/Cmd+K 项目搜索、Agent 协作状态面板、导入 skip/overwrite/rename 冲突策略、删除资料后的
+source_integrity 风险回写，以及 Citation/Doc/复现门禁失败时禁止产物 accepted。真实浏览器全流程脚本
+`scripts/e2e_research_os.py` 输出 `[UI-E2E-RESEARCH-OS] PASS`；合成性能脚本
+`scripts/perf_research_os.py` 输出 `[PERF-RESEARCH-OS] PASS`。
+
+- **pytest**：717 passed / 1 skipped（当前全量回归；唯一 warning 是 test_utils docx 测试在
   Windows Proactor 下的 asyncio 传输 GC 噪音，与本仓库逻辑无关、系既有）。
   R12 新增 ~70 项：执行契约、run_script 助手、bash 守卫、write_anchor、desktop 分类、
   provider kwarg 转发、会话 outputs_dir 全生命周期（connected 帧/run.json/清退配对删/
@@ -198,7 +245,7 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 6. **仓库卫生**：`dist/` 存有 3.3.0/3.3.1/3.3.2/3.3.3 四个安装包，发版后可清理旧版；
    `D:\vscode files\research-assistant-history-backup-20260822.bundle` 含旧历史，
    确认无需回溯后删除。
-7. **R12 已知缺口（如实记录）**：
+7. **R12 已知边界（如实记录）**：
    - `verify_citations` 处理器以相对路径写 output_file 时不过 write_anchor（独立处理器
      路径，未走 registry 注入）——调用方需传绝对路径；
    - bash python 守卫只在冻结态生效（开发态有系统 Python，有意不拦）；`where python`
@@ -206,6 +253,11 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
    - 会话 dock 的 REST 列表 outputs_dir 仅恢复期兜底——工作区切换后权威源是 connected 帧；
    - 任务页 dock 展示选中运行的 `writing_outputs/<name>`，新启动的运行要等回合结束
      refreshRuns 后才会出现在历史列表并被选中。
+8. **科研 OS 资源边界**：`DurableScheduler` 已提供持久化队列、租约、重试、优先级、资源
+   key、预计等待时间和 provider/worker 并发限制；资源槽位争用会延迟回队且不消耗重试预算；
+   `PlatformStore.resource_usage` 聚合项目、workflow 和 Agent role 的成本/token/耗时；
+   `resource_leases` 已支持多进程横向 provider/model 槽位协调，项目依赖锁 hash 已进入分析
+   manifest。真正的容器镜像级隔离仍属于后续增强，不影响单机科研 OS beta 主流程。
 
 ## 7. 尝试过但失败 / 踩过的坑（避免重蹈）
 
@@ -264,3 +316,45 @@ start 全部发不出去。服务端握手正常却等不到帧（用户 desktop
 ---
 
 *本文档只记录交接所需事实；运行细节与排查过程见 git log（R7~R10 提交信息）与会话记录。*
+
+
+---
+
+## 平台化改造（v3.5 进行中 · 2026-08-24）
+
+本轮把应用从「论文生成工具」推进为科研工作平台，已落地并验证（后端 717 passed, 1 skipped / ruff clean / 前端 60 tests + build 通过）：
+
+- **后台任务运行时**：`research_assistant/runtime/`（SQLite WAL PlatformStore + BackgroundTaskHub）。任务与 WebSocket 解耦：断连只停止观察，不取消生成；observe 协议 + seq 事件回放；孤儿任务重启标记 interrupted。REST /api/tasks*。
+- **前端后台任务 UX**：任务页「后台任务」卡（running 任务列表 + 继续观察），active taskId/seq 本地持久化，重连回放错过事件。
+- **性能治理**：LLM/工具逐次计时审计（llm_timing/tool_timing）；研究与图表阶段 FIRST_COMPLETED 即时推进；引用校验持久缓存（DOI/标题键、30 天 TTL、原子写）；移除规划器硬性章节数偏置。
+- **产物版本化**：ArtifactVersionStore 记录 agent write/edit 前后快照，REST 列表/diff/一键恢复；设置页「变更」入口。
+- **项目长期上下文**：项目指令持久化于平台库（GET/PUT /api/project/instructions），注入流水线每个子代理系统提示；设置页可视化编辑。
+- **上下文一致性与恢复**：项目指令和资料检索块同时注入单代理任务；进程重启产生的 `interrupted` 任务在任务页可一键重新运行（保留查询与模式）。
+- **文档**：docs/protocol.md §5.3 后台任务协议、§5.3.1 DAG、§5.3.2 脚本产物版本化。
+- **工作流 DAG**：论文任务创建时持久化 `plan → {research, figures} → assemble → gates → finalize` 节点、依赖和状态；`GET /api/tasks/{id}/plan` 在断线后仍可恢复，任务页同步展示。
+- **通用 Agent 工作流**：新增 `AgentRole` / `WorkflowDefinition` / `WorkflowRegistry`，保留论文专用执行器，并提供研究问题冲刺、可复现数据分析两种通用 DAG；任务页可选择工作流，节点检查点写入 `.ra/workflow/`。
+- **产物版本化补齐**：`bash`/`run_python` 的间接新增、修改、删除也记录进可恢复变更历史；快照仅覆盖产物锚点并有文件数/字节上限，避免影响任务关键路径。
+- **产物审阅闭环**：后台任务完成或失败后自动索引真实输出文件，写入相对路径、版本、SHA-256、
+  文件类型和 Citation/Doc Gate 汇总状态；变更版本自动递增，失败门禁写入质量风险，并通过
+  task → artifact provenance 关联到线程和研究运行。
+- **性能可观测性**：`GET /api/tasks/{id}/metrics` 提供总耗时、DAG 关键路径、节点耗时和事件数，任务页实时显示，便于定位慢阶段；事件写入、资料库读写和检索均移出事件循环。
+- **混合资料检索**：资料库新增 `keyword` / `semantic` / `hybrid` 模式和离线确定性向量，保留页码、片段、哈希锚点；任务页可切换检索模式。
+- **模型分级路由**：通用 Agent 角色支持 `fast` / `strong` / `default` 分级，配置 `RA_MODEL_FAST`、`RA_MODEL_STRONG` 即可降低规划/审阅延迟，同时保留单模型兼容。
+
+后续路线（见 docs/protocol.md 与本文件历史）：用户可配置工作流持久化、真正的模型向量服务与
+跨项目知识图谱、增量质量门，以及多任务共享连接池与限流策略。
+
+## 当前闭环状态（plan260824.md 后续实施）
+
+- `ArtifactReviewView` 已提供文件真实预览、版本 diff、provenance/质量门禁和审阅回写；
+  `/api/artifacts/reviews/{id}/request-changes` 会写线程 Agent Item 与通知。
+- `AnalysisRunsView` 已支持比较、复现运行和将结果挂接主张；复现通过
+  `RA_ANALYSIS_*_JSON` 环境契约执行脚本，失败进入 `quality_items`。
+- `/api/project/export` / `/api/project/import` 提供研究包闭环：manifest 含研究图谱、任务、
+  运行、审阅、质量和通知，workspace 文件安全打包，排除 `.env`、`.ra`、VCS 和缓存。
+- 工作流节点可经 `/skip` 或 `/takeover` 人工控制并留下审计 item；审批请求具有一次性
+  `request_id`，前端显示 Agent/角色，错误或迟到回执不会被下一次审批消费。
+
+科研 OS beta 主流程已串成真实浏览器 Playwright E2E，并继续保留真实模型长任务、目标机和
+多进程 worker 作为发布后的持续验收；schema diff、导入冲突策略、审批收件箱和 Agent roster
+已完成并纳入自动化测试。

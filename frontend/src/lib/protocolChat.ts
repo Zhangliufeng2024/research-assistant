@@ -7,6 +7,7 @@
  * 卡片实体存于 cards 映射、按 ref 引用——工具卡的多次推送合并在同一位置。
  */
 import type {
+  AttachmentRef,
   ChatItem,
   ChatPhase,
   ChatState,
@@ -42,8 +43,13 @@ function clone(c: ChatState): ChatState {
 /* ---- 本地动作（不经服务端回显，由视图在发送时调用） ---- */
 
 /** 用户发言；agent 运行中发送视为 steer（服务端并入下一步），
- * 不重启回合计时，也不清除已有错误之外的状态。 */
-export function applyUserMessage(prev: ChatState, text: string): ChatState {
+ * 不重启回合计时，也不清除已有错误之外的状态。
+ * attachments（R16）：随消息上传的附件引用，乐观上屏到同一气泡。 */
+export function applyUserMessage(
+  prev: ChatState,
+  text: string,
+  attachments?: AttachmentRef[],
+): ChatState {
   if (!text) return prev;
   const c = clone(prev);
   c.items.push({
@@ -51,6 +57,7 @@ export function applyUserMessage(prev: ChatState, text: string): ChatState {
     text,
     t: Date.now(),
     steer: prev.phase === "running",
+    ...(attachments && attachments.length ? { attachments } : {}),
   });
   if (prev.phase !== "running") {
     c.phase = "running";
@@ -178,6 +185,8 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
         id: msg.id,
         tool: msg.tool || "",
         summary: msg.summary || "",
+        agentId: msg.agent_id || "",
+        role: msg.role || "",
         deadline: Date.now() + APPROVAL_TIMEOUT_S * 1000,
       };
       return c;
@@ -185,43 +194,83 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
 
     case "result": {
       const c = clone(prev);
-      c.phase = "done";
+      // 后端口径：result 是唯一收尾帧。stop_reason=error 时终态就是出错——
+      // 若无条件置 done，工具条会亮绿点「已完成」而红色出错横幅同时挂着，
+      // 「终态是谁」前后端互相打架（对抗性审查抓出）。
+      const failed = String(msg.stop_reason || "") === "error";
+      c.phase = failed ? "error" : "done";
       c.finishedAt = Date.now();
       c.stopReason = msg.stop_reason || c.stopReason;
       if (typeof msg.turns === "number") c.turns = msg.turns;
+      // cancelled/error 的流式文本是残缺回答：标记末条文本气泡（与
+      // history.json 落盘的 partial 标记同口径），视图据此提示续问。
+      const stop = String(msg.stop_reason || "");
+      if (stop === "cancelled" || stop === "error") {
+        for (let i = c.items.length - 1; i >= 0; i--) {
+          const it = c.items[i]!;
+          if (it.kind === "text") {
+            c.items[i] = { ...it, partial: true };
+            break;
+          }
+          if (it.kind === "user") break; // 本回合没有文本气泡，无需标记
+        }
+      }
       c.approval = null;
       return c;
     }
 
-    case "error": {
-      const c = clone(prev);
-      c.phase = "error";
-      c.error = msg.message || "未知错误";
-      c.finishedAt = Date.now();
-      c.approval = null;
-      return c;
-    }
-
-    case "done":
-      if (prev.phase === "running") {
+    case "replay_begin": {
+      // R16 断线重连回放：服务端回合仍在跑时恢复「思考中」——否则重连后
+      // 帧继续流入而 phase 还停在 idle，停止按钮/占位符全错位。
+      if (msg.status === "running" && prev.phase !== "running") {
         const c = clone(prev);
-        c.phase = "done";
-        c.finishedAt = c.finishedAt || Date.now();
+        c.phase = "running";
+        c.startedAt = c.startedAt || Date.now();
         return c;
       }
       return prev;
+    }
+
+    case "error": {
+      // error 是伴随通知、不是终态帧：失败回合后端紧跟着还会发
+      // result{stop_reason:"error"}（唯一收尾帧），请求级拒绝（steer 为空/
+      // 超长等）则根本没有 result。这里只记录消息与清理审批，相位留给
+      // 真正的收尾帧决定——否则先到的 error 把 phase 打成 error、随后
+      // 的 result 又改写成 done，重放同一帧序同样复现。
+      const c = clone(prev);
+      c.error = msg.message || "未知错误";
+      c.approval = null;
+      return c;
+    }
+
+    // 注：chat 通道不存在 {type:"done"} 帧（server→client 帧型见协议文档
+    // §10.3；/ws/task 任务通道的 done 由 protocolTask 自行归约）。旧代码
+    // 的死分支已删，避免误导协议读者。
 
     default:
       return prev;
   }
 }
 
-/** history.json 归约历史 → 聊天流条目（会话恢复用；t=0 表示无时间信息）。 */
+/** history.json 归约历史 → 聊天流条目（会话恢复用；t=0 表示无时间信息）。
+ * 附件与 partial 标记随条目透传（R16 全路径持久化的 UI 口径）。 */
 export function historyToItems(messages: HistoryMessage[]): ChatItem[] {
   return messages.map((m) =>
     m.role === "user"
-      ? { kind: "user" as const, text: m.content, t: 0 }
-      : { kind: "text" as const, text: m.content, t: 0 },
+      ? {
+          kind: "user" as const,
+          text: m.content,
+          t: 0,
+          ...(m.attachments && m.attachments.length
+            ? { attachments: m.attachments }
+            : {}),
+        }
+      : {
+          kind: "text" as const,
+          text: m.content,
+          t: 0,
+          ...(m.partial ? { partial: true } : {}),
+        },
   );
 }
 

@@ -134,3 +134,55 @@ describe("ws.ts socket 登记（R10 回归）", () => {
     expect(statuses).toEqual(["connecting", "error"]);
   });
 });
+
+/* ---------- R13-G：迟到 onclose/onerror 不得污染状态上报 ---------- */
+describe("ws.ts 迟到事件的状态守卫（R13-G 回归）", () => {
+  beforeEach(() => {
+    vi.stubGlobal("WebSocket", FakeWebSocket);
+    vi.stubGlobal("location", { protocol: "http:", host: "127.0.0.1:50000" });
+    FakeWebSocket.instances = [];
+  });
+  afterEach(() => {
+    wsClose();
+    vi.unstubAllGlobals();
+  });
+
+  it("旧 socket 的迟到 onclose/onerror 不上报 closed/error（状态归新连接管）", () => {
+    const statuses: string[] = [];
+    wsConnect({ channel: "chat", onStatus: (s) => statuses.push(s) });
+    const oldSock = FakeWebSocket.instances.at(-1)!;
+    oldSock.simulateOpen();
+
+    wsConnect({ channel: "chat", onStatus: (s) => statuses.push(s) });
+    const newSock = FakeWebSocket.instances.at(-1)!;
+    newSock.simulateOpen();
+
+    // 新连接在位后，旧 socket 的事件才迟到触发
+    oldSock.readyState = FakeWebSocket.OPEN;
+    oldSock.onclose?.();
+    oldSock.onerror?.();
+
+    // 中间的 "closed" 是 wsConnect 重连时的**有意关闭**（此刻旧 socket 尚在表中，
+    // 如实上报）；随后旧 socket 迟到的 onclose/onerror 必须被守卫吞掉
+    expect(statuses).toEqual(["connecting", "open", "closed", "connecting", "open"]);
+    expect(wsConnected("chat")).toBe(true);
+    expect(socksHas("chat", newSock)).toBe(true);
+  });
+
+  it("新连接自身的 close 照常上报（守卫不误伤）", () => {
+    const statuses: string[] = [];
+    wsConnect({ channel: "chat", onStatus: (s) => statuses.push(s) });
+    const sock = FakeWebSocket.instances.at(-1)!;
+    sock.simulateOpen();
+    sock.close();
+    expect(statuses).toEqual(["connecting", "open", "closed"]);
+  });
+});
+
+/** 测试辅助：直接窥探登记表（经公开 API 只能验证 connected，这里要验证身份）。 */
+function socksHas(channel: "chat" | "task", sock: unknown): boolean {
+  // 借 wsSend 的可观察行为间接断言：表里是 newSock 时帧会进 newSock.sent
+  const before = (sock as FakeWebSocket).sent.length;
+  return wsSend({ probe: before }, channel) &&
+    (sock as FakeWebSocket).sent.length === before + 1;
+}

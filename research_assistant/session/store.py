@@ -15,6 +15,8 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any
 
+from ..core import atomic_write_text
+
 SCHEMA_VERSION = 1
 
 
@@ -74,15 +76,15 @@ class SessionStore:
                 k: v for k, v in data.items() if k in SessionState.__dataclass_fields__
             })
             self.state = state
-        except (json.JSONDecodeError, TypeError):
+        except (json.JSONDecodeError, OSError, TypeError):
             pass  # corrupt file -> start fresh state; artifacts still recover us
 
     def save(self) -> None:
         self.run_dir.mkdir(parents=True, exist_ok=True)
         self.state.updated_at = time.time()
-        self._path(self.RUN_FILE).write_text(
+        atomic_write_text(
+            self._path(self.RUN_FILE),
             json.dumps(self.state.to_dict(), indent=2, ensure_ascii=False),
-            encoding="utf-8",
         )
 
     @classmethod
@@ -139,7 +141,11 @@ class SessionStore:
         if not p.exists():
             return []
         out = []
-        for line in p.read_text(encoding="utf-8").splitlines():
+        try:
+            lines = p.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            return []
+        for line in lines:
             try:
                 out.append(json.loads(line))
             except json.JSONDecodeError:

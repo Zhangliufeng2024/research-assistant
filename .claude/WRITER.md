@@ -461,3 +461,18 @@ Request: "Create a NeurIPS paper on attention mechanisms"
 - **When in doubt, add a figure** - visual content enhances all scientific communication
 - **Review generated documents** - read .docx to verify content and formatting
 - **Complete tasks fully** - never stop mid-task to ask permission
+
+## Research Ledger (Optional Enhancement)
+
+When your task produces verifiable scientific claims, record them in the project's research ledger instead of leaving them only in prose:
+
+- **Claims**: after reaching a key finding, call `record_research_claim(statement=..., confidence=...)`. It returns a `claim_id` — keep it for linking evidence.
+- **Evidence**: attach at least one source to every recorded claim via `record_research_evidence(claim_id=..., source_title=..., source_url=..., note=...)`. A claim without supporting evidence blocks the synthesis gate.
+- **Decisions**: record method choices, scope cuts, and protocol trade-offs with `record_research_decision(title=..., rationale=...)`.
+- **Questions / hypotheses**: use `record_research_item(title=..., kind=question|hypothesis|objective|note)` for open questions worth tracking.
+
+These records appear in Project Home's evidence matrix and feed the synthesis-writing gate (`ready_for_synthesis`): every claim needs at least one supporting evidence link before synthesis can proceed.
+
+**Before citing any ledger id, call `list_research_ledger()` to look up valid ids** — never guess an id from memory.
+
+Ledger writes are optional: skip them for purely editorial work (formatting, polishing) that produces no new verifiable claims.

@@ -10,6 +10,7 @@ from research_assistant.llm.errors import (
     AuthError,
     BadRequestError,
     ContextLimitError,
+    LLMError,
     ModelConfigError,
     OverloadedError,
     RateLimitError,
@@ -115,6 +116,132 @@ def _client_with_mock(cls, handler):
     client = cls(api_key="test-key", base_url="http://fake.local", model="test-model")
     client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
     return client
+
+
+def _sse_response(lines: list[str]) -> httpx.Response:
+    body = "\n".join(lines) + "\n"
+    return httpx.Response(
+        200,
+        content=body.encode("utf-8"),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+class TestAnthropicInStreamErrorEvent:
+    """缺陷 C：HTTP 200 流内的 error 事件必须抛类型化 LLMError，而非被吞掉。"""
+
+    @pytest.mark.asyncio
+    async def test_overloaded_error_event_is_retryable(self, monkeypatch):
+        from research_assistant.llm.anthropic import AnthropicClient
+
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _sse_response([
+                'data: {"type":"message_start","message":{"usage":{"input_tokens":3}}}',
+                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"half"}}',
+                'data: {"type":"error","error":{"type":"overloaded_error",'
+                '"message":"Overloaded"}}',
+            ])
+
+        client = _client_with_mock(AnthropicClient, handler)
+        try:
+            with pytest.raises(OverloadedError) as exc_info:
+                await client.chat([{"role": "user", "content": "hi"}], on_chunk=lambda t: None)
+            assert exc_info.value.retryable
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_api_error_event_maps_to_retryable_server_error(self, monkeypatch):
+        from research_assistant.llm.anthropic import AnthropicClient
+
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _sse_response([
+                'data: {"type":"error","error":{"type":"api_error",'
+                '"message":"Internal server error"}}',
+            ])
+
+        client = _client_with_mock(AnthropicClient, handler)
+        try:
+            with pytest.raises(ServerError) as exc_info:
+                await client.chat([{"role": "user", "content": "hi"}], on_chunk=lambda t: None)
+            assert exc_info.value.retryable
+        finally:
+            await client.close()
+
+    @pytest.mark.asyncio
+    async def test_request_error_event_is_not_retryable(self, monkeypatch):
+        from research_assistant.llm.anthropic import AnthropicClient
+
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _sse_response([
+                'data: {"type":"error","error":{"type":"invalid_request_error",'
+                '"message":"bad parameter"}}',
+            ])
+
+        client = _client_with_mock(AnthropicClient, handler)
+        try:
+            with pytest.raises(LLMError) as exc_info:
+                await client.chat([{"role": "user", "content": "hi"}], on_chunk=lambda t: None)
+            assert not exc_info.value.retryable
+        finally:
+            await client.close()
+
+
+class TestAnthropicStreamingCacheUsage:
+    """缺陷 E：流式 message_start 需补齐 cache 计量，与非流式对齐。"""
+
+    @pytest.mark.asyncio
+    async def test_message_start_cache_counters_captured(self, monkeypatch):
+        from research_assistant.llm.anthropic import AnthropicClient
+
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            return _sse_response([
+                'data: {"type":"message_start","message":{"usage":'
+                '{"input_tokens":10,"cache_creation_input_tokens":7,'
+                '"cache_read_input_tokens":3}}}',
+                'data: {"type":"content_block_delta","delta":{"type":"text_delta","text":"ok"}}',
+                'data: {"type":"message_delta","delta":{"stop_reason":"end_turn"},'
+                '"usage":{"output_tokens":4}}',
+            ])
+
+        client = _client_with_mock(AnthropicClient, handler)
+        try:
+            resp = await client.chat(
+                [{"role": "user", "content": "hi"}], on_chunk=lambda t: None,
+            )
+        finally:
+            await client.close()
+
+        assert resp.usage.input_tokens == 10
+        assert resp.usage.cache_creation_input_tokens == 7
+        assert resp.usage.cache_read_input_tokens == 3
+        assert resp.usage.output_tokens == 4
+
+    def test_non_streaming_parse_parity(self):
+        # 对照组：非流式解析同样字段（既有行为，锁定口径一致）。
+        from research_assistant.llm.anthropic import AnthropicClient
+
+        client = AnthropicClient(api_key="test", model="test")
+        resp = client._parse_response({
+            "content": [{"type": "text", "text": "x"}],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 4,
+                "cache_creation_input_tokens": 7,
+                "cache_read_input_tokens": 3,
+            },
+        })
+        assert resp.usage.cache_creation_input_tokens == 7
+        assert resp.usage.cache_read_input_tokens == 3
 
 
 class TestClientWiring:

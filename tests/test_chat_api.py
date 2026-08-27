@@ -261,6 +261,107 @@ class TestZeroTurnGc:
         assert run_dir.exists()
 
 
+class TestSessionRename:
+    """PATCH /api/chat/sessions/{id}：重命名 = 更新 run.json 的 query 标题字段。
+
+    契约：成功 200 {ok,id,title}；不存在 404；空白/缺失标题 422；
+    非法 ID 403。改名不改 updated_at（列表按其倒序，改名不该跳动排序）。
+    """
+
+    def test_rename_updates_run_json_and_list_reflects(self, tmp_path):
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions",
+                          json={"title": "旧标题"}).json()["id"]
+
+        resp = client.patch(f"/api/chat/sessions/{sid}",
+                            json={"title": "  新标题啊  "})
+        assert resp.status_code == 200
+        assert resp.json() == {"ok": True, "id": sid, "title": "新标题啊"}
+
+        # 权威落盘：run.json 的 query 被替换（strip 后写入，不保留首尾空白）
+        state = json.loads((tmp_path / ".ra" / "sessions" / sid
+                            / "run.json").read_text(encoding="utf-8"))
+        assert state["query"] == "新标题啊"
+        assert state["mode"] == "chat"  # 其余字段不被破坏
+
+        # GET sessions 反映新名
+        items = client.get("/api/chat/sessions").json()
+        assert [i["title"] for i in items if i["id"] == sid] == ["新标题啊"]
+
+    def test_rename_unknown_404_and_bad_id_403(self, tmp_path):
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        assert client.patch("/api/chat/sessions/ghost",
+                            json={"title": "x"}).status_code == 404
+        # 路径穿越 / 盘符等非法 ID：与 get/delete 同一 403 口径
+        assert client.patch("/api/chat/sessions/a%5Cb",
+                            json={"title": "x"}).status_code == 403
+        with pytest.raises(ValueError):
+            chat_mod._resolve_session_dir(tmp_path, "C:evil")
+
+    def test_rename_blank_or_missing_title_422(self, tmp_path):
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions", json={"title": "t"}).json()["id"]
+        assert client.patch(f"/api/chat/sessions/{sid}",
+                            json={"title": "   "}).status_code == 422
+        assert client.patch(f"/api/chat/sessions/{sid}",
+                            json={}).status_code == 422
+        assert client.patch(f"/api/chat/sessions/{sid}",
+                            json={"title": None}).status_code == 422
+        # 非 JSON body 同样按 422 收场（与 create_session 的容错风格一致）
+        assert client.patch(f"/api/chat/sessions/{sid}",
+                            content=b"not-json",
+                            headers={"Content-Type": "application/json"},
+                            ).status_code == 422
+        # 目录未被误删
+        assert (tmp_path / ".ra" / "sessions" / sid).is_dir()
+
+    def test_rename_preserves_updated_at_ordering(self, tmp_path):
+        """改名不算「活跃」：updated_at 不变，旧会话不会跳到列表最前。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        first = client.post("/api/chat/sessions",
+                            json={"title": "先建的"}).json()["id"]
+        time.sleep(0.01)  # 保证 updated_at 可分
+        second = client.post("/api/chat/sessions",
+                             json={"title": "后建的"}).json()["id"]
+
+        before = json.loads((tmp_path / ".ra" / "sessions" / first
+                             / "run.json").read_text(encoding="utf-8"))
+        client.patch(f"/api/chat/sessions/{first}", json={"title": "改名的"})
+        after = json.loads((tmp_path / ".ra" / "sessions" / first
+                            / "run.json").read_text(encoding="utf-8"))
+        assert before["updated_at"] == after["updated_at"]
+        assert before["created_at"] == after["created_at"]
+
+        # 列表顺序不变：后建的仍在前
+        items = client.get("/api/chat/sessions").json()
+        assert [i["id"] for i in items] == [second, first]
+
+    def test_rename_writes_audit_event(self, tmp_path):
+        """events.jsonl 留痕 session_rename（审计镜像口径）。"""
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        sid = client.post("/api/chat/sessions",
+                          json={"title": "留痕"}).json()["id"]
+        run_dir = tmp_path / ".ra" / "sessions" / sid
+        kinds_before = {e["kind"] for e in (
+            json.loads(line) for line in
+            (run_dir / "events.jsonl").read_text(encoding="utf-8").splitlines())}
+        client.patch(f"/api/chat/sessions/{sid}", json={"title": "留痕二"})
+        events = [
+            json.loads(line)
+            for line in (run_dir / "events.jsonl")
+            .read_text(encoding="utf-8").splitlines()
+        ]
+        assert "session_rename" not in kinds_before
+        rename_events = [e for e in events if e["kind"] == "session_rename"]
+        assert len(rename_events) == 1
+        assert rename_events[0]["data"] == {"title": "留痕二"}
+
+
 # ---------------------------------------------------------------------------
 # C2/C3: WS 会话循环
 # ---------------------------------------------------------------------------
@@ -328,11 +429,14 @@ class TestWsChatTurn:
         assert items[0]["last_message"] == "你好，完成"
 
     def test_resume_injects_history_into_first_llm_call(self, tmp_path, monkeypatch):
-        """二次连接恢复历史：归约历史经适配层注入本轮首个 LLM 请求。"""
+        """二次连接恢复历史：归约历史由内核配置注入并可被审计。"""
 
         async def _resume_behavior(kw):
-            # 模拟内核的首个 LLM 调用：单条 user 消息 → 包装层应前置拼接历史
-            await kw["llm_client"].chat([{"role": "user", "content": kw["prompt"]}])
+            # fake run_agent 显式模拟内核 initial_messages 恢复行为。
+            restored = kw["config"].initial_messages
+            await kw["llm_client"].chat([
+                *restored, {"role": "user", "content": kw["prompt"]},
+            ])
             await kw["on_text"]("收到")
             return AgentResult(text_output="收到", stop_reason="completed")
 
@@ -350,9 +454,12 @@ class TestWsChatTurn:
                 ws.send_json({"action": "user", "text": "第二问"})
                 _collect_until(ws, ("result",))
 
-        # 适配层：本轮首个请求 = 既往归约历史 + 新用户消息
+        # 内核配置：本轮首个请求 = 既往归约历史 + 新用户消息
         llm = captured["llm_client"]
-        assert [m["content"] for m in llm.prefix] == ["第一问", "你好，完成"]
+        assert llm.prefix == []
+        assert [m["content"] for m in captured["config"].initial_messages] == [
+            "第一问", "你好，完成",
+        ]
         first_call = llm._inner.calls[0]  # 真实请求打在内层 client 上
         assert [m["content"] for m in first_call] == [
             "第一问", "你好，完成", "第二问"]
@@ -431,8 +538,12 @@ class TestWsChatControl:
         deltas = "".join(f["delta"] for f in frames if f["type"] == "text")
         assert deltas == "steer=改为英文"
 
-    def test_idle_steer_queued_for_next_turn(self, tmp_path, monkeypatch):
-        """空闲期收到的 steer 入队，下一轮开始时被内核消费。"""
+    def test_idle_steer_rejected_explicitly(self, tmp_path, monkeypatch):
+        """R16 语义：空闲期 steer 不再静默入队——显式报错。
+
+        静默入队会让消息「看不见地」影响下一轮（用户以为已作为独立消息
+        发出）；宁可明确拒绝，也不制造幽灵注入。
+        """
         app = _make_app(tmp_path)
         captured: dict = {}
 
@@ -453,14 +564,14 @@ class TestWsChatControl:
             with client.websocket_connect("/ws/chat") as ws:
                 ws.receive_json()
                 ws.send_json({"action": "steer", "message": "先想好再答"})
+                err = ws.receive_json()
+                assert err["type"] == "error"
+                assert "没有运行中的回合" in err["message"]
                 ws.send_json({"action": "user", "text": "问题"})
                 frames = _collect_until(ws, ("result",))
-                # 第二轮：队列已被第一轮消费，拿不到新 steer
-                ws.send_json({"action": "user", "text": "再来"})
-                _collect_until(ws, ("result",))
 
         deltas = [f["delta"] for f in frames if f["type"] == "text"]
-        assert deltas == ["got=['先想好再答']"]
+        assert deltas == ["got=[]"]
 
     def test_stop_action_cancels_turn(self, tmp_path, monkeypatch):
         app = _make_app(tmp_path)
@@ -481,13 +592,18 @@ class TestWsChatControl:
                 frames = _collect_until(ws, ("result",))
 
         assert frames[-1]["stop_reason"] == "cancelled"
-        # 取消轮的回复同样落盘（对话流完整）
+        # 取消轮的回复同样落盘（对话流完整），并带 partial 标记——
+        # 文本是打断时刻的残缺回答，前端据此提示用户续问。
         sid = None
         for child in (tmp_path / ".ra" / "sessions").iterdir():
             sid = child.name
         history = json.loads((tmp_path / ".ra" / "sessions" / sid
                               / "history.json").read_text(encoding="utf-8"))
-        assert history["messages"][-1] == {"role": "assistant", "content": "停了"}
+        assert history["messages"][-1] == {
+            "role": "assistant",
+            "content": "停了",
+            "partial": True,
+        }
 
     def test_approval_round_trip(self, tmp_path, monkeypatch):
         """审批问询帧 + 回执经 QueueApprover 闭环（沿用 ws.py 先例）。"""
@@ -560,24 +676,40 @@ class TestWsChatControl:
         texts = [f["delta"] for f in frames1 + frames2 if f["type"] == "text"]
         assert texts == ["r1=False", "r2=True"]
 
-    def test_disconnect_cancels_running_turn(self, tmp_path, monkeypatch):
+    def test_disconnect_does_not_kill_turn(self, tmp_path, monkeypatch):
+        """R16 耐久化：断连只是观察者离场，回合继续跑到终态并落盘回复。
+
+        旧契约「断连即取消」正是断连丢史缺陷（InvalidStateError 连锁）的
+        根源，已废除——取消的唯一途径：显式 stop / 删除会话 / 孤儿宽限。
+        重连 attach 回放的完整回归见 test_chat_durability.py。
+        """
         app = _make_app(tmp_path)
-        captured: dict = {}
 
         async def behavior(kw):
-            captured["cancel"] = kw["config"].cancel_event
-            while not kw["config"].cancel_event.is_set():
-                await asyncio.sleep(0.01)
-            return AgentResult(text_output="x", stop_reason="cancelled")
+            await kw["on_text"]("断连后仍在跑")
+            return AgentResult(text_output="断连后的完整回复",
+                               stop_reason="completed", turns=1)
 
         _install_fakes(monkeypatch, behavior)
+        hist = None
+
+        def messages() -> list[dict]:
+            data = json.loads(hist.read_text(encoding="utf-8"))
+            return data.get("messages", [])
+
         with TestClient(app) as client:
             with client.websocket_connect("/ws/chat") as ws:
-                ws.receive_json()
+                sid = ws.receive_json()["session_id"]
+                hist = (tmp_path / ".ra" / "sessions" / sid / "history.json")
                 ws.send_json({"action": "user", "text": "长任务"})
-                assert _wait_until(lambda: "cancel" in captured)
-            # 退出 with：socket 关闭 → 服务端必须置位 cancel_event
-            assert _wait_until(lambda: captured["cancel"].is_set())
+                # 用户消息先行落盘（回合启动即写，不等回复）
+                assert _wait_until(lambda: hist.exists())
+            # 立刻断开：不等 result 帧——回复仍必须在终态完整落盘
+            assert _wait_until(lambda: hist.exists() and len(messages()) >= 2)
+            last = messages()[-1]
+            assert last["role"] == "assistant"
+            assert last["content"] == "断连后的完整回复"
+            assert "partial" not in last
 
     def test_concurrent_connection_kicks_previous(self, tmp_path, monkeypatch):
         """同一会话并发连接：后连者踢前者（旧 socket 收到 close）。"""
@@ -798,6 +930,138 @@ class TestChatOutputsDir:
 
         assert client.delete(f"/api/chat/sessions/{sid}").json() == {"ok": True}
         assert not out.exists()
+
+
+# ---------------------------------------------------------------------------
+# 安全加固：history.json 数据完整性 + 删除运行中会话的通知闭环
+# ---------------------------------------------------------------------------
+
+
+class TestHistoryIntegrity:
+    """history.json 原子写与损坏留档（断电不丢对话、坏档可追溯）。"""
+
+    def test_write_history_uses_atomic_replace(self, tmp_path, monkeypatch):
+        """写入必须走 core.atomic_write_text（临时文件 + os.replace）。"""
+        run_dir = tmp_path / ".ra" / "sessions" / "s1"
+        run_dir.mkdir(parents=True)
+        real_atomic = chat_mod.atomic_write_text
+        calls: list[tuple] = []
+
+        def spy(path, content, **kwargs):
+            calls.append((Path(path), content))
+            return real_atomic(path, content, **kwargs)
+
+        monkeypatch.setattr(chat_mod, "atomic_write_text", spy)
+
+        msgs = [{"role": "user", "content": "原子吗"}]
+        chat_mod._write_history(run_dir, msgs)
+
+        assert len(calls) == 1
+        path, payload = calls[0]
+        assert path == run_dir / "history.json"
+        assert json.loads(payload)["messages"] == msgs
+        # 目标文件内容正确，且目录内无 .tmp 残留（临时文件已替换/清理）
+        data = json.loads(
+            (run_dir / "history.json").read_text(encoding="utf-8"))
+        assert data["messages"] == msgs
+        assert [p.name for p in run_dir.iterdir()] == ["history.json"]
+
+    def test_corrupt_history_archived_and_session_usable(
+            self, tmp_path, monkeypatch):
+        """半截 JSON：留档改名 + 会话按空历史正常打开与续写。"""
+        sid = "20260101_000000_broken"
+        run_dir = tmp_path / ".ra" / "sessions" / sid
+        run_dir.mkdir(parents=True)
+        broken = '{"schema_version": 1, "mess'  # 断电半截
+        (run_dir / "history.json").write_text(broken, encoding="utf-8")
+        # 新鲜时间戳：避免被 §6.4 零轮次清退干扰本测试
+        (run_dir / "run.json").write_text(json.dumps({
+            "mode": "chat", "query": "坏档会话",
+            "created_at": 1.0, "updated_at": time.time(),
+        }), encoding="utf-8")
+
+        app = _make_app(tmp_path)
+        client = TestClient(app)
+        data = client.get(f"/api/chat/sessions/{sid}").json()
+        assert data["id"] == sid
+        assert data["messages"] == []  # 功能正常：按空历史打开
+
+        archives = list(run_dir.glob("history.json.corrupt.*"))
+        assert len(archives) == 1  # 坏文件留档，证据保留
+        assert archives[0].read_text(encoding="utf-8") == broken
+        assert not (run_dir / "history.json").exists()  # 已改名移走
+
+        # 下一回合在干净的新档案上续写，且不再新增留档
+        _install_fakes(monkeypatch, _happy_behavior)
+        with TestClient(app) as tc:
+            with tc.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                assert ws.receive_json()["session_id"] == sid
+                ws.send_json({"action": "user", "text": "重来"})
+                _collect_until(ws, ("result",))
+        hist = json.loads(
+            (run_dir / "history.json").read_text(encoding="utf-8"))
+        assert [m["content"] for m in hist["messages"]] == ["重来", "你好，完成"]
+        assert len(list(run_dir.glob("history.json.corrupt.*"))) == 1
+
+    def test_corrupt_history_rename_failure_still_returns_empty(
+            self, tmp_path, monkeypatch):
+        """留档改名失败（占用/权限）：放弃留档但不抛出，会话可用。"""
+        run_dir = tmp_path / ".ra" / "sessions" / "locked"
+        run_dir.mkdir(parents=True)
+        (run_dir / "history.json").write_text("{broken", encoding="utf-8")
+
+        def boom(*args, **kwargs):
+            raise OSError("file locked")
+
+        monkeypatch.setattr(Path, "rename", boom)
+        assert chat_mod._read_history(run_dir) == []
+        # 原文件保留（未删未改），下次仍可尝试留档
+        assert (run_dir / "history.json").read_text(encoding="utf-8") == "{broken"
+
+
+class TestDeleteRunningSession:
+    """删除运行中的会话先通知活跃连接，再删目录（防幽灵会话复活）。"""
+
+    @staticmethod
+    def _recv_until_disconnect(ws, timeout: float = 5.0) -> int:
+        """收帧直到服务端关闭连接，返回 close code（超时即失败，不悬挂）。"""
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            try:
+                ws.receive_json()
+            except WebSocketDisconnect as exc:
+                return exc.code
+        raise AssertionError("活跃连接未被服务端关闭（超时）")
+
+    def test_delete_closes_live_socket_4002_and_cancels_turn(
+            self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        captured: dict = {}
+
+        async def behavior(kw):
+            captured["cancel"] = kw["config"].cancel_event
+            while not kw["config"].cancel_event.is_set():
+                await asyncio.sleep(0.01)
+            return AgentResult(text_output="x", stop_reason="cancelled")
+
+        _install_fakes(monkeypatch, behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat?session=doomed") as ws:
+                assert ws.receive_json()["session_id"] == "doomed"
+                ws.send_json({"action": "user", "text": "长任务"})
+                assert _wait_until(lambda: "cancel" in captured)
+
+                # 运行中删除：REST 先关连接再清目录
+                resp = client.delete("/api/chat/sessions/doomed")
+                assert resp.json() == {"ok": True}
+
+                # 活跃连接被服务端主动关闭；4002 标识「会话已被删除」
+                assert self._recv_until_disconnect(ws) == 4002
+
+            assert _wait_until(lambda: captured["cancel"].is_set())
+            # 目录连同产物目录一并移除
+            assert not (tmp_path / ".ra" / "sessions" / "doomed").exists()
+            assert not (tmp_path / "outputs" / "doomed").exists()
 
 
 class TestChatSystemInstructions:

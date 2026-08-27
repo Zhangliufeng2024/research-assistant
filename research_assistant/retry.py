@@ -23,6 +23,7 @@ RA_HEARTBEAT_TIMEOUT float Seconds of silence before "stuck" warning (default 30
 
 import asyncio
 import os
+import re
 
 from .constants import (
     DEFAULT_HEARTBEAT_TIMEOUT,
@@ -118,34 +119,25 @@ _RETRYABLE_TYPE_NAMES = {
     "aiohttp.ClientPayloadError",
 }
 
-# Substrings in the error message that identify retryable conditions.
-_RETRYABLE_MESSAGES = (
-    "connection reset",
-    "connection refused",
-    "connection aborted",
-    "broken pipe",
-    "timed out",
-    "timeout",
-    "network",
-    "eof",
-    "ssl",
-    "socket",
-    "temporary failure",
-    "service unavailable",
-    "bad gateway",
-    "gateway timeout",
-    "overloaded",
-    "rate limit",
-    "too many requests",
-    "529",   # Anthropic overload HTTP code
-    "503",
-    "502",
+# Retryable message patterns (缺陷 F：词边界匹配，替代裸子串).
+# - 数字状态码用 \b 包裹："150290" 不再命中 "502"，"HTTP 502" 照常命中；
+# - 网络词表同样词边界化，并删除裸 "network"——TypeError 提到 networkx、
+#   普通消息里偶然出现 network 一词都不再被误判成可重试的网络错误。
+_RETRYABLE_MESSAGE_PATTERN = re.compile(
+    r"\b(?:"
+    r"408|425|429|500|502|503|504|529"          # HTTP status codes
+    r"|timed out|timeout"
+    r"|connection reset|connection refused|connection aborted"
+    r"|broken pipe|eof occurred|ssl|socket"
+    r"|temporary failure|service unavailable|bad gateway"
+    r"|gateway timeout|overloaded|rate limit|too many requests"
     # SDK subprocess / stream errors (claude-agent-sdk process crash)
-    "stream closed",
-    "command failed with exit code",
-    "fatal error in message reader",
-    "exit code: 1",
-    "exit code: 2",
+    r"|stream closed"
+    r"|command failed with exit code"
+    r"|fatal error in message reader"
+    r"|exit code: [12]"
+    r")\b",
+    re.IGNORECASE,
 )
 
 # Substrings that identify non-retryable API errors that should surface clearly.
@@ -228,9 +220,8 @@ def _is_retryable(exc: BaseException) -> bool:
     if type_name in _RETRYABLE_TYPE_NAMES or qualified in _RETRYABLE_TYPE_NAMES:
         return True
 
-    # Check error message for known transient patterns
-    msg = str(exc).lower()
-    if any(kw in msg for kw in _RETRYABLE_MESSAGES):
+    # Check error message for known transient patterns (词边界匹配，见上方注释)
+    if _RETRYABLE_MESSAGE_PATTERN.search(str(exc)):
         return True
 
     return False

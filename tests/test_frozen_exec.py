@@ -173,3 +173,43 @@ class TestPythonExecForwardsWorkspaceRoot:
             "print('x')", cwd=str(tmp_path), workspace_root="/ws"))
         assert got == "in-process!"
         assert captured["workspace_root"] == "/ws"
+
+
+# ---------------------------------------------------------------------------
+# 修复 E：子进程异常退出码必须显式回报；临时输出文件清理失败要留痕
+# ---------------------------------------------------------------------------
+
+class TestChildExitCodeReporting:
+    async def test_nonzero_exit_code_appended(self, tmp_path):
+        # os._exit 绕过 _child_main 的异常捕获：真实传递非 0 返回码的场景
+        code = (
+            "print('partial')\n"
+            "import sys; sys.stdout.flush()\n"
+            "import os; os._exit(7)\n"
+        )
+        result = await run_python_inprocess(code, cwd=str(tmp_path))
+        assert "partial" in result
+        assert "exitcode=7" in result
+
+    async def test_clean_exit_has_no_marker(self, tmp_path):
+        result = await run_python_inprocess("print('ok')", cwd=str(tmp_path))
+        assert "exitcode" not in result
+
+
+class TestTempOutputCleanupLogging:
+    async def test_unlink_failure_logs_warning(self, tmp_path, monkeypatch, caplog):
+        import logging
+        import os as _os
+
+        real_unlink = _os.unlink
+
+        def flaky_unlink(path, *args, **kwargs):
+            if "_ra_exec_out_" in str(path):
+                raise PermissionError(32, "simulated lock")
+            return real_unlink(path, *args, **kwargs)
+
+        monkeypatch.setattr(_os, "unlink", flaky_unlink)
+        with caplog.at_level(logging.WARNING, logger="research_assistant.tools.frozen_exec"):
+            result = await run_python_inprocess("print('hi')", cwd=str(tmp_path))
+        assert "hi" in result  # 功能不受清理失败影响
+        assert "_ra_exec_out_" in caplog.text  # 不再静默 pass

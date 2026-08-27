@@ -71,3 +71,48 @@ describe("reduceTask", () => {
     expect(t.activity.length).toBe(ACTIVITY_CAP);
   });
 });
+
+/* ---------- 克隆契约（R13-K）：无可观测变化返回原引用 ---------- */
+describe("reduceTask 克隆契约（R13-K）", () => {
+  it("未知帧型返回原引用（高频无关帧不触发重绘）", () => {
+    const s = emptyTask();
+    expect(reduceTask(s, { type: "mystery" })).toBe(s);
+    expect(reduceTask(s, {} as never)).toBe(s);
+  });
+
+  it("空 usage / 空白 text 返回原引用", () => {
+    const s = emptyTask();
+    expect(reduceTask(s, { type: "usage" })).toBe(s);
+    expect(reduceTask(s, { type: "usage", budget: null })).toBe(s);
+    expect(reduceTask(s, { type: "text" })).toBe(s);
+    expect(reduceTask(s, { type: "text", content: "   " })).toBe(s);
+  });
+
+  it("有预算的 usage / 非空白 text 才产生新引用", () => {
+    const s = emptyTask();
+    const withBudget = reduceTask(s, { type: "usage", budget: { cost_usd: 1 } });
+    expect(withBudget).not.toBe(s);
+    expect(withBudget.budget).toEqual({ cost_usd: 1 });
+    const withText = reduceTask(s, { type: "text", content: "输出" });
+    expect(withText).not.toBe(s);
+  });
+
+  it("已收束后的重复 done 返回原引用；首个 done 正常收束", () => {
+    let t = reduceTask(emptyTask(), { type: "connected" });
+    const first = reduceTask(t, { type: "done" });
+    expect(first.phase).toBe("done");
+    expect(first.finishedAt).not.toBeNull();
+    expect(reduceTask(first, { type: "done" })).toBe(first);
+    // idle 态收到 done：finishedAt 未记 → 补记并出新引用
+    const idleDone = reduceTask(emptyTask(), { type: "done" });
+    expect(idleDone.finishedAt).not.toBeNull();
+  });
+
+  it("入参不被修改（timeline/tlNote/activity 均为新容器或整体替换）", () => {
+    const base = reduceTask(emptyTask(), { type: "progress", stage: "planning" });
+    const snapshot = JSON.stringify(base);
+    reduceTask(base, { type: "progress", stage: "research" });
+    reduceTask(base, { type: "approval_request", id: "a", tool: "bash" });
+    expect(JSON.stringify(base)).toBe(snapshot);
+  });
+});

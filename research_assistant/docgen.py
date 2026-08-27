@@ -708,7 +708,8 @@ class PaperBuilder:
 
 
 # ---------------------------------------------------------------------------
-# BibTeX parser (simple regex-based, sufficient for machine-generated entries)
+# BibTeX parser (regex entry split + brace-depth scanner for field values,
+# sufficient for machine-generated entries)
 # ---------------------------------------------------------------------------
 
 _ENTRY_RE = re.compile(
@@ -716,11 +717,110 @@ _ENTRY_RE = re.compile(
     re.DOTALL,
 )
 
-# Matches:  field = {value}  or  field = "value"  (machine-generated BibTeX).
-# Group 1 = field name, group 2 = brace-delimited value, group 3 = quote-delimited value.
-_FIELD_RE = re.compile(
-    r'(\w+)\s*=\s*(?:\{([^}]*)\}|"([^"]*)")'
-)
+# Locates the *start* of a field: the name and its ``=``.  The value body is
+# then consumed by a brace-depth scanner (_parse_fields), because a single
+# regex cannot match nested braces such as ``title = {Deep {Learning} ...}``.
+_FIELD_NAME_RE = re.compile(r"(\w+)\s*=\s*")
+
+
+def _scan_braced_value(text: str, start: int) -> tuple[str, int] | None:
+    """Scan a ``{...}`` value starting at *start* (which points at ``{``).
+
+    Tracks brace depth so nested braces are kept verbatim in the returned
+    inner text; ``\\{`` / ``\\}`` escapes count as literal characters.
+    Returns ``(inner_text, index_past_closing_brace)``, or None when the
+    value is never terminated.
+    """
+    depth = 0
+    i = start
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2  # escaped char (e.g. \{ or \\) is literal
+            continue
+        if ch == "{":
+            depth += 1
+        elif ch == "}":
+            depth -= 1
+            if depth == 0:
+                return text[start + 1 : i], i + 1
+        i += 1
+    return None
+
+
+def _scan_quoted_value(text: str, start: int) -> tuple[str, int] | None:
+    """Scan a ``"..."`` value starting at *start* (which points at ``"``).
+
+    Braces inside quotes are literal characters; ``\\"`` escapes are honoured.
+    Returns ``(inner_text, index_past_closing_quote)``, or None when the
+    value is never terminated.
+    """
+    i = start + 1
+    n = len(text)
+    while i < n:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == '"':
+            return text[start + 1 : i], i + 1
+        i += 1
+    return None
+
+
+def _scan_bare_value(text: str, start: int) -> tuple[str, int]:
+    """Scan a bare (unbraced, unquoted) value such as ``volume = 17``.
+
+    Reads until a ``,`` or newline and returns the stripped token plus the
+    index at the terminator.
+    """
+    i = start
+    n = len(text)
+    while i < n and text[i] not in ",\n":
+        i += 1
+    return text[start:i].strip(), i
+
+
+def _parse_fields(body: str) -> dict[str, str]:
+    """Extract ``name = value`` pairs from one BibTeX entry body.
+
+    Brace-delimited values support nested braces -- only the outermost
+    delimiters are stripped, matching standard BibTeX protection semantics.
+    Quoted values treat braces as literal characters.  Mildly malformed
+    input (an unterminated value) skips that field instead of raising.
+    """
+    fields: dict[str, str] = {}
+    pos = 0
+    n = len(body)
+    while pos < n:
+        m = _FIELD_NAME_RE.match(body, pos)
+        if m is None:
+            pos += 1
+            continue
+        name = m.group(1).lower()
+        i = m.end()  # trailing \s* in the pattern consumes leading whitespace
+        ch = body[i] if i < n else ""
+
+        if ch == "{":
+            scanned = _scan_braced_value(body, i)
+            if scanned is None:
+                break  # unterminated value: skip it; nothing sane follows
+            value, pos = scanned
+        elif ch == '"':
+            scanned = _scan_quoted_value(body, i)
+            if scanned is None:
+                break
+            value, pos = scanned
+        elif ch and ch != ",":
+            value, pos = _scan_bare_value(body, i)
+        else:
+            # ``name = `` with no value at all (malformed): skip the field.
+            pos = m.end()
+            continue
+
+        fields[name] = value.strip()
+    return fields
 
 
 def parse_bibtex(bib_path: str) -> list[Reference]:
@@ -740,11 +840,7 @@ def parse_bibtex(bib_path: str) -> list[Reference]:
         key = match.group(2)
         body = match.group(3)
 
-        fields: dict[str, str] = {}
-        for fm in _FIELD_RE.finditer(body):
-            # group(2) for {brace} values, group(3) for "quoted" values
-            value = fm.group(2) if fm.group(2) is not None else (fm.group(3) or "")
-            fields[fm.group(1).lower()] = value.strip()
+        fields = _parse_fields(body)
 
         year_str = fields.get("year", "0")
         try:

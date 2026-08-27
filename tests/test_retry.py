@@ -52,6 +52,34 @@ class TestErrorClassification:
         assert not _is_retryable(RuntimeError("not supported model"))
 
 
+class TestRetryableWordBoundaries:
+    """缺陷 F：裸子串误判——TypeError 提 networkx、消息含 150290 都不该重试。"""
+
+    def test_substring_lookalikes_not_retryable(self):
+        assert not _is_retryable(TypeError(
+            "unsupported operand type(s) for +: 'int' and 'networkx.classes.graph.Graph'"))
+        assert not _is_retryable(ValueError("row index 150290 out of range"))
+        assert not _is_retryable(RuntimeError("failed at step 5031"))  # 503 子串
+        assert not _is_retryable(RuntimeError("imported module 'sslyze' missing"))
+
+    def test_real_status_codes_still_retryable(self):
+        assert _is_retryable(RuntimeError("HTTP 502 bad gateway"))
+        assert _is_retryable(RuntimeError("HTTP/1.1 503 Service Unavailable"))
+        assert _is_retryable(RuntimeError("429 too many requests"))
+        assert _is_retryable(RuntimeError("529 overloaded_error"))
+
+    def test_network_words_still_retryable(self):
+        assert _is_retryable(RuntimeError("connection reset by peer"))
+        assert _is_retryable(RuntimeError("read timed out"))
+        assert _is_retryable(RuntimeError("[SSL: WRONG_VERSION_NUMBER]"))
+        assert _is_retryable(RuntimeError("socket hang up"))
+        assert _is_retryable(RuntimeError("peer closed connection (eof occurred)"))
+
+    def test_bare_network_word_no_longer_matches(self):
+        # 裸 "network" 已从词表移除：普通异常消息里的 incidental 词不再触发重试。
+        assert not _is_retryable(ValueError("network graph is disconnected"))
+
+
 class TestIsContextLimit:
     def test_positive(self):
         assert _is_context_limit(RuntimeError("input token limit reached"))

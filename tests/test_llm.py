@@ -1,5 +1,8 @@
 """Tests for research_assistant.llm — LLM client abstraction."""
 
+import json
+
+import httpx
 import pytest
 
 from research_assistant.llm.anthropic import (
@@ -27,6 +30,37 @@ class TestDetectProvider:
 
     def test_empty_provider_uses_key(self):
         assert detect_provider("sk-ant-test", "") == "anthropic"
+
+
+# ---------------------------------------------------------------------------
+# A2：provider 三级探测（显式 > base_url 含 anthropic > sk-ant- 前缀 > openai）
+# 动机：第三方 Anthropic 兼容网关的 key 往往不是 sk-ant- 前缀。
+# ---------------------------------------------------------------------------
+
+class TestDetectProviderBaseUrl:
+    def test_anthropic_in_base_url_wins_over_openai_style_key(self):
+        assert detect_provider("gw-key-123", "", "https://anthropic.gateway.example/v1") == "anthropic"
+
+    def test_base_url_case_insensitive(self):
+        assert detect_provider("gw-key-123", "", "https://api.ANTHROPIC.com") == "anthropic"
+
+    def test_sk_ant_prefix_still_recognized_without_url_hint(self):
+        assert detect_provider("sk-ant-api03-xyz", "", "https://example.com") == "anthropic"
+
+    def test_gateway_key_without_hints_defaults_openai(self):
+        assert detect_provider("gw-random-format", "") == "openai"
+
+    def test_explicit_provider_beats_base_url(self):
+        assert detect_provider("k", "openai", "https://anthropic.proxy.example") == "openai"
+
+    def test_create_client_routes_by_base_url(self, monkeypatch):
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        client = create_llm_client(
+            api_key="gateway-custom-key",
+            base_url="https://anthropic-compatible.gateway.example",
+            model="claude-sonnet-5",
+        )
+        assert isinstance(client, AnthropicClient)
 
 
 class TestConvertToolsAnthropic:
@@ -200,3 +234,145 @@ class TestCreateLlmClient:
         monkeypatch.delenv("LLM_API_KEY", raising=False)
         with pytest.raises(ValueError):
             create_llm_client()
+
+
+# ---------------------------------------------------------------------------
+# 缺陷 D：OpenAI 流式计量（stream_options.include_usage + 400 自动降级）
+# ---------------------------------------------------------------------------
+
+def _sse(lines: list[str]) -> httpx.Response:
+    body = "\n".join(lines) + "\n"
+    return httpx.Response(
+        200,
+        content=body.encode("utf-8"),
+        headers={"content-type": "text/event-stream"},
+    )
+
+
+def _openai_stream_client(responses: list[httpx.Response], calls: list):
+    """按顺序回放 *responses* 的假 OpenAI 端点；请求体记录进 *calls*。"""
+    idx = {"i": 0}
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(json.loads(request.content.decode("utf-8")))
+        i = min(idx["i"], len(responses) - 1)
+        idx["i"] += 1
+        return responses[i]
+
+    client = OpenAICompatClient(
+        api_key="test-key", base_url="http://fake.local", model="test-model",
+    )
+    client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+    return client
+
+
+class TestOpenAIStreamingUsage:
+    @pytest.mark.asyncio
+    async def test_final_usage_chunk_captured(self, monkeypatch):
+        """末尾 usage chunk（空 choices）应归集进 TokenUsage，正文照常流出。"""
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+        calls: list = []
+        client = _openai_stream_client([
+            _sse([
+                'data: {"choices":[{"delta":{"content":"He"}}]}',
+                'data: {"choices":[{"delta":{"content":"llo"}}]}',
+                'data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":7}}',
+                "data: [DONE]",
+            ]),
+        ], calls)
+
+        chunks: list[str] = []
+        try:
+            resp = await client.chat(
+                [{"role": "user", "content": "hi"}], on_chunk=chunks.append,
+            )
+        finally:
+            await client.close()
+
+        assert "".join(chunks) == "Hello"
+        assert resp.usage.input_tokens == 11
+        assert resp.usage.output_tokens == 7
+        # 流式请求必须带 stream_options.include_usage，否则拿不到 usage chunk
+        assert calls[0]["stream"] is True
+        assert calls[0]["stream_options"] == {"include_usage": True}
+
+    @pytest.mark.asyncio
+    async def test_endpoint_without_usage_chunk_still_parses(self, monkeypatch):
+        """端点忽略 stream_options 时无 usage chunk：解析不受影响，用量为 0。"""
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+        calls: list = []
+        client = _openai_stream_client([
+            _sse([
+                'data: {"choices":[{"delta":{"content":"ok"}}]}',
+                "data: [DONE]",
+            ]),
+        ], calls)
+
+        try:
+            resp = await client.chat(
+                [{"role": "user", "content": "hi"}], on_chunk=lambda t: None,
+            )
+        finally:
+            await client.close()
+
+        assert resp.content == "ok"
+        assert resp.usage.input_tokens == 0
+        assert resp.usage.output_tokens == 0
+
+    @pytest.mark.asyncio
+    async def test_400_mentioning_stream_options_degrades_once(self, monkeypatch):
+        """端点报 400 且报文含 stream_options：去掉该字段重发一次（只降一次）。"""
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+        calls: list = []
+
+        def handler(request: httpx.Request) -> httpx.Response:
+            body = json.loads(request.content.decode("utf-8"))
+            if "stream_options" in body:
+                calls.append(body)
+                return httpx.Response(
+                    400,
+                    json={"error": {"message":
+                         "Unrecognized request argument supplied: stream_options"}},
+                )
+            calls.append(body)
+            return _sse([
+                'data: {"choices":[{"delta":{"content":"fine"}}]}',
+                "data: [DONE]",
+            ])
+
+        client = OpenAICompatClient(
+            api_key="test-key", base_url="http://fake.local", model="test-model",
+        )
+        client._client = httpx.AsyncClient(transport=httpx.MockTransport(handler))
+
+        try:
+            resp = await client.chat(
+                [{"role": "user", "content": "hi"}], on_chunk=lambda t: None,
+            )
+        finally:
+            await client.close()
+
+        assert resp.content == "fine"
+        assert len(calls) == 2
+        assert "stream_options" in calls[0]
+        assert "stream_options" not in calls[1]
+
+    @pytest.mark.asyncio
+    async def test_unrelated_400_does_not_degrade(self, monkeypatch):
+        """与 stream_options 无关的 400 不触发降级，直接抛类型化错误。"""
+        from research_assistant.llm.errors import BadRequestError
+
+        monkeypatch.setenv("LLM_REQUEST_INTERVAL", "0")
+        calls: list = []
+        client = _openai_stream_client([
+            httpx.Response(400, json={"error": {"message": "invalid temperature"}}),
+        ], calls)
+
+        try:
+            with pytest.raises(BadRequestError):
+                await client.chat(
+                    [{"role": "user", "content": "hi"}], on_chunk=lambda t: None,
+                )
+        finally:
+            await client.close()
+        assert len(calls) == 1

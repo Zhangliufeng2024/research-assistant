@@ -218,8 +218,11 @@ Output a JSON plan with this structure (no markdown, no code fences, just raw JS
 }}
 
 Rules:
-- 4-8 sections minimum
-- 5-10 figures (graphical abstract is MANDATORY)
+- Scale the plan to the request. A focused task may need 2-4 sections; a full
+  manuscript commonly needs 4-8. Do not create sections merely to hit a quota.
+- Use 0-6 figures. Create a figure only when it materially supports a claim,
+  result, method, or synthesis. A graphical abstract is optional unless asked.
+- Prefer the smallest plan that can satisfy the requested scientific outcome.
 - Output ONLY JSON"""
 
 _RESEARCH_PROMPT = """You are a research agent for the section: {section_title}.

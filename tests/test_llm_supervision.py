@@ -80,6 +80,26 @@ class TestWatchdog:
         assert time.monotonic() - t0 < 2.0
         assert "首字节" in str(ei.value)
 
+    async def test_first_byte_window_not_poisoned_by_previous_attempt(self):
+        """同一重试循环的上一次尝试残留心跳，不得为本次首字节窗续命。"""
+        wd = _ActivityWatchdog(timeout=60.0, first_byte_timeout=0.2)
+
+        class _BeatOnceThenOK:
+            model = "fake"
+
+            async def chat(self, messages, on_activity=None, **kwargs):
+                if on_activity is not None:  # 模拟流式心跳后正常完成
+                    on_activity()
+                return LLMResponse(content="partial", usage=TokenUsage())
+
+        await wd.call(lambda: _BeatOnceThenOK().chat([]))  # 尝试1：留下一活动标记
+
+        t0 = time.monotonic()
+        with pytest.raises(HeartbeatTimeoutError) as ei:
+            await wd.call(lambda: _HangNoBeatClient().chat([]))  # 尝试2：静默悬挂
+        assert time.monotonic() - t0 < 2.0  # 若被污染会退化为 60s 静默窗
+        assert "首字节" in str(ei.value)
+
     async def test_wall_timeout_kills_endless_keepalive_drip(self):
         """滴流续期静默看门狗也逃不过墙钟兜底。"""
         wd = _ActivityWatchdog(

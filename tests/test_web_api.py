@@ -24,6 +24,7 @@ from fastapi.testclient import TestClient  # noqa: E402
 
 from research_assistant.agent import AgentResult  # noqa: E402
 from research_assistant.kernel.budget import BudgetLimits  # noqa: E402
+from research_assistant.runtime import PlatformStore  # noqa: E402
 from research_assistant.session.store import SessionStore  # noqa: E402
 from research_assistant.web.routes import router as api_router  # noqa: E402
 from research_assistant.web.ws import router as ws_router  # noqa: E402
@@ -421,6 +422,34 @@ class TestWsSteer:
         assert any(m["type"] == "error" for m in msgs), msgs
 
 
+class TestWsGenerationLifecycle:
+    def test_disconnect_cancels_and_closes_generation(self, tmp_path, monkeypatch):
+        app, _ = _make_ws_app(tmp_path)
+        captured: dict = {}
+
+        async def fake_generate(**kwargs):
+            captured["cancel"] = kwargs["cancel_event"]
+            try:
+                while not kwargs["cancel_event"].is_set():
+                    await asyncio.sleep(0.01)
+                if False:  # pragma: no cover - keep this an async generator
+                    yield {}
+            finally:
+                captured["closed"] = True
+
+        monkeypatch.setattr("research_assistant.web.ws.generate_paper", fake_generate)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/generate") as ws:
+                ws.send_json({"action": "start", "query": "q"})
+                assert ws.receive_json()["type"] == "connected"
+                # Leaving the context closes the client while __anext__ is
+                # still waiting; the pump must cancel the owned generation.
+
+        assert captured["cancel"].is_set()
+        assert captured["closed"] is True
+        assert app.state.active_tasks == {}
+
+
 # ---------------------------------------------------------------------------
 # B3: WS resume_run 断点续跑
 # ---------------------------------------------------------------------------
@@ -501,6 +530,59 @@ class TestWsResume:
             with client.websocket_connect("/ws/generate") as ws:
                 ws.send_json({"action": "start", "resume_run": "../victim"})
                 assert ws.receive_json()["type"] == "error"
+
+    def test_resume_task_reuses_durable_checkpoint(self, tmp_path, monkeypatch):
+        app, out = _make_ws_app(tmp_path)
+        store = PlatformStore(tmp_path / ".ra" / "platform.sqlite3")
+        project = store.ensure_project(tmp_path)
+        checkpoint = out / "checkpoint"
+        checkpoint.mkdir()
+        store.create_task(
+            task_id="old-task", project_id=project["id"], query="继续主题",
+            mode="pipeline", output_dir=str(checkpoint),
+        )
+        store.update_task("old-task", status="interrupted")
+
+        captured: dict = {}
+
+        async def fake_generate(**kwargs):
+            captured.update(kwargs)
+            yield {"type": "progress", "stage": "initialization", "message": "w"}
+
+        monkeypatch.setattr("research_assistant.web.ws.generate_paper", fake_generate)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/generate") as ws:
+                ws.send_json({"action": "resume_task", "task_id": "old-task"})
+                hello = ws.receive_json()
+                assert hello["type"] == "connected"
+                assert hello["resumed_from"] == "old-task"
+                while ws.receive_json()["type"] != "done":
+                    pass
+        assert captured["query"] == "继续主题"
+        assert captured["multi_agent"] is True
+        assert captured["output_dir"] == str(checkpoint)
+
+    def test_generic_workflow_start_uses_registry_executor(self, tmp_path, monkeypatch):
+        app, _ = _make_ws_app(tmp_path)
+        captured: dict = {}
+
+        async def fake_workflow(**kwargs):
+            captured.update(kwargs)
+            yield {"type": "progress", "stage": "scope", "message": "ok", "details": {"step_id": "scope", "status": "running"}}
+
+        monkeypatch.setattr("research_assistant.web.ws.run_registered_workflow", fake_workflow)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/generate") as ws:
+                ws.send_json({
+                    "action": "start", "query": "研究冲刺", "multi_agent": True,
+                    "workflow_id": "research_sprint",
+                })
+                hello = ws.receive_json()
+                assert hello["workflow_id"] == "research_sprint"
+                while ws.receive_json()["type"] != "done":
+                    pass
+        assert captured["workflow"].id == "research_sprint"
+        assert captured["output_dir"].parent.is_dir()
 
 
 # ---------------------------------------------------------------------------

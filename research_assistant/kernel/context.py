@@ -13,8 +13,10 @@ Two strategies keep long runs inside the model's context window:
 from __future__ import annotations
 
 import json
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
+from typing import Any
 
 SUMMARY_MARKER = "[CONTEXT SUMMARY"
 EXTERNALIZE_THRESHOLD_CHARS = 4_000
@@ -90,7 +92,13 @@ def externalize_tool_result(
 
     try:
         artifacts_dir.mkdir(parents=True, exist_ok=True)
+        # 同轮同名工具多次调用不得互相覆盖（审计要求每次产出都可回溯）：
+        # 首次落盘沿用旧命名 turn_NNNN_<tool>.txt，碰撞时追加单调递增序号。
         path = artifacts_dir / f"turn_{turn:04d}_{tool_name}.txt"
+        seq = 1
+        while path.exists():
+            seq += 1
+            path = artifacts_dir / f"turn_{turn:04d}_{tool_name}_{seq}.txt"
         path.write_text(result, encoding="utf-8")
     except OSError:
         return result  # best-effort: never lose a tool result over an IO error
@@ -106,6 +114,13 @@ def externalize_tool_result(
 # ---------------------------------------------------------------------------
 # Compaction
 # ---------------------------------------------------------------------------
+
+#: 受监督的单次 chat 调用工厂（由 run_agent 注入）。签名对齐
+#: ``LLMClient.chat`` 的关键字子集——``messages`` / ``system`` /
+#: ``temperature`` / ``max_tokens``，返回 ``LLMResponse``。实现方负责看门狗
+#: 击杀、cancel_event 打断与重试，使压缩摘要不再绕过主链路的 LLM 监督设施。
+#: ``None`` = 回退裸调 llm_client.chat（兼容旧构造方）。
+SupervisedChat = Callable[..., Awaitable[Any]]
 
 _SUMMARY_SYSTEM = (
     "You are compacting an AI agent's conversation history so work can continue "
@@ -174,13 +189,35 @@ async def summarize_span(
     llm_client,
     span_text: str,
     max_tokens: int = 1600,
+    budget: Any | None = None,
+    supervised_chat: SupervisedChat | None = None,
 ) -> str:
-    response = await llm_client.chat(
+    """Summarize one message span; the summary call itself is billable work.
+
+    缺陷 I：此前这里直接 llm_client.chat 绕过计量——摘要调用的 token 用量
+    不进预算。传入 *budget*（BudgetGuard 或任何带 record(response) 的对象，
+    hasattr 保护）即可把这次调用的用量归集进预算。
+
+    监督接线：*supervised_chat* 提供时摘要走它（看门狗/取消/重试由注入方
+    负责，见 :data:`SupervisedChat`）；否则回退裸调 llm_client.chat。
+    取消类异常（如主链路的 _TurnCancelled）原样穿出——本层不做降级，
+    「压缩失败照常继续」的优雅降级只属于调用方。
+    """
+    kwargs = dict(
         messages=[{"role": "user", "content": span_text}],
         system=_SUMMARY_SYSTEM,
         temperature=0.2,
         max_tokens=max_tokens,
     )
+    if supervised_chat is not None:
+        response = await supervised_chat(**kwargs)
+    else:
+        response = await llm_client.chat(**kwargs)
+    if budget is not None and hasattr(budget, "record"):
+        try:
+            budget.record(response)
+        except Exception:
+            pass  # 计量失败不影响压缩结果本身
     return response.content.strip()
 
 
@@ -192,6 +229,8 @@ async def maybe_compact(
     last_input_tokens: int = 0,
     keep_recent: int = KEEP_RECENT_MESSAGES,
     trigger_fraction: float = COMPACTION_TRIGGER_FRACTION,
+    budget: Any | None = None,
+    supervised_chat: SupervisedChat | None = None,
 ) -> tuple[list[dict], bool]:
     """Compact *messages* in place when nearing the context window.
 
@@ -214,7 +253,9 @@ async def maybe_compact(
 
     span = messages[1:cut]
     span_text = render_span_for_summary(span)
-    summary = await summarize_span(llm_client, span_text)
+    summary = await summarize_span(
+        llm_client, span_text, budget=budget, supervised_chat=supervised_chat,
+    )
 
     summary_msg = {
         "role": "user",
