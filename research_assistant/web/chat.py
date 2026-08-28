@@ -88,6 +88,10 @@ MAX_STEER_LENGTH = 2_000  # steer 上限（与 ws.py generate 端点一致）
 PREVIEW_LIMIT = 400  # tool_card.result_preview 最大字符数
 LAST_MESSAGE_LIMIT = 80  # 会话列表 last_message 摘要长度
 ARTIFACT_PATH_LIMIT = 8  # 单张工具卡最多提取的产物文件数
+#: Plan 确认门（方案 1）：plan_proposal 帧发出后等待客户端 plan_decision
+#: 的时限，超时按「拒绝」收场（与工具审批超时=deny 同口径）。用户需要
+#: 通读计划甚至离开片刻，时限远大于工具审批的 120s。
+PLAN_DECISION_TIMEOUT_S = 600.0
 #: 零轮次会话清退时限（§6.4）：POST 建目录后从未收到用户帧的残骸，
 #: 超过此时限在列表时整目录删除。远大于 建目录→连 WS→首帧 的正常间隔。
 ZERO_TURN_TTL_S = 3600.0
@@ -743,6 +747,120 @@ def _is_network_error(exc: BaseException) -> bool:
 
 
 # ---------------------------------------------------------------------------
+# slash 命令分派（方案 4）+ Plan 确认门（方案 1）——模块级纯逻辑，可单测
+# ---------------------------------------------------------------------------
+
+#: /help 的帮助文案（与前端 frontend/src/lib/commands.ts COMMAND_CATALOG
+#: 同步维护；前端下拉菜单用目录数据，这里的文案只服务 /help 回执）。
+COMMAND_HELP_TEXT = """可用命令：
+  /budget  设置本会话预算上限（覆盖 RA_MAX_* 环境配置）
+    用法：/budget cost=<美元> tokens=<N> turns=<N> wall_seconds=<秒>
+  /model   临时切换本会话后续回合使用的模型
+    用法：/model <模型名>
+  /role    为下一回合指定角色设定（注入系统上下文）
+    用法：/role <角色名>
+  /skill   为下一回合注入一个技能指南作为上下文
+    用法：/skill <技能名>
+  /plan    先出计划，等你确认后再执行
+    用法：/plan <请求内容>
+  /help    显示本帮助"""
+
+#: /budget 键 → BudgetLimits 字段（int 型键强转整数）。
+_BUDGET_FIELD_MAP: dict[str, tuple[str, type]] = {
+    "cost": ("max_cost_usd", float),
+    "tokens": ("max_total_tokens", int),
+    "turns": ("max_turns", int),
+    "wall_seconds": ("max_wall_seconds", float),
+}
+
+
+def _split_slash(text: str) -> tuple[str, str]:
+    """/name rest... → (name, rest)；"/plan 做X" → ("plan", "做X")。"""
+    head = text[1:].split(None, 1)
+    name = head[0].lower() if head else ""
+    rest = head[1].strip() if len(head) > 1 else ""
+    return name, rest
+
+
+def _apply_budget_override(budget: BudgetGuard, rest: str) -> str:
+    """把 ``/budget key=value …`` 覆盖写进会话级 BudgetGuard。
+
+    返回空串表示成功；否则返回中文错误串（调用方转 error 帧）。覆盖是
+    会话级持久的——写进共享 guard 的 limits，后续每一回合都生效，直到
+    下次 /budget 再次覆盖（不给「回滚」语义：重连/重启即回环境默认）。
+    """
+    pairs: dict[str, float] = {}
+    for token in rest.split():
+        key, eq, raw = token.partition("=")
+        if not eq:
+            return f"预算参数必须写成 key=value：{token}"
+        if key not in _BUDGET_FIELD_MAP:
+            return f"未知预算键: {key}（可用：cost / tokens / turns / wall_seconds）"
+        try:
+            num = float(raw)
+        except ValueError:
+            return f"budget {key}= 必须是正数"
+        if num <= 0:
+            return f"budget {key}= 必须是正数"
+        pairs[key] = num
+    if not pairs:
+        return ("用法：/budget cost=<美元> tokens=<N> turns=<N> wall_seconds=<秒>"
+                "（至少一项）")
+    for key, num in pairs.items():
+        field, typ = _BUDGET_FIELD_MAP[key]
+        setattr(budget.limits, field, int(num) if typ is int else float(num))
+    return ""
+
+
+def _budget_limits_summary(budget: BudgetGuard) -> str:
+    """/budget 成功后的确认文案：回显当前全部生效上限。"""
+    lim = budget.limits
+    parts: list[str] = []
+    if lim.max_cost_usd:
+        parts.append(f"cost=${lim.max_cost_usd:g}")
+    if lim.max_total_tokens:
+        parts.append(f"tokens={lim.max_total_tokens}")
+    if lim.max_turns:
+        parts.append(f"turns={lim.max_turns}")
+    if lim.max_wall_seconds:
+        parts.append(f"wall_seconds={lim.max_wall_seconds:g}")
+    return "本会话预算上限已更新：" + (
+        "；".join(parts) if parts else "当前无生效上限（不限制）"
+    )
+
+
+def _planner_instructions(base: str) -> str:
+    """Plan 门 planner 回合的系统提示：只出计划，不执行、不用工具。"""
+    return base + """
+
+## 计划模式（Plan Gate——只读规划阶段）
+
+用户要求先看到计划、确认后再执行。当前你处于只读规划阶段：
+- 不能调用任何工具，也不会真正执行任务；不要假装已经执行。
+- 输出一份简明、可执行的中文计划：
+  1. 目标一句话确认（如有歧义，列出你的理解与假设）；
+  2. 步骤清单：每步一句话，说明做什么、产出什么文件或结论；
+  3. 需要的数据 / 文件 / 关键参数（未知处注明假设）；
+  4. 风险与替代方案（如有）。
+- 结尾固定加一行：「——请确认：同意后我将按此计划执行；也可直接提出修改意见。」
+"""
+
+
+class _PlannerTools:
+    """Plan 门 planner 回合的空工具面：不向模型暴露任何工具。
+
+    内核只触达 ``get_schemas()`` 与 ``execute()``；schemas 为空时模型无
+    工具可调，execute 兜底拒绝（防御性——正常不会触达）。
+    """
+
+    def get_schemas(self) -> list[dict]:
+        return []
+
+    async def execute(self, name: str, arguments: dict) -> str:
+        return "Error: 计划阶段不可用工具（只读规划）"
+
+
+# ---------------------------------------------------------------------------
 # 回合运行时（R16 耐久化）：回合生命周期与 socket 解耦
 # ---------------------------------------------------------------------------
 
@@ -772,9 +890,13 @@ class _TurnHandle:
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     budget: Any = None                # BudgetGuard（会话级共享，跨回合累计）
     approvals: asyncio.Queue = field(default_factory=asyncio.Queue)
+    #: Plan 门（方案 1）的裁决队列：plan_decision 回执入此，_wait_plan_decision
+    #: 消费。与工具审批队列分开——两类问询永不同回合并存（planner 无工具），
+    #: 分队列可避免迟到回执串道。
+    plans: asyncio.Queue = field(default_factory=asyncio.Queue)
     steers: asyncio.Queue = field(default_factory=asyncio.Queue)
     approver: Any = None              # QueueApprover（per-turn 装配）
-    ask_state: dict = field(default_factory=lambda: {"current": ""})
+    ask_state: dict = field(default_factory=lambda: {"current": "", "plan": ""})
     frames: deque = field(default_factory=deque)  # 已发射帧（含 seq），回放源
     #: 帧序号游标——**会话内单调**，新建句柄时从上一回合句柄续接（见
     #: _start_turn）。前端以收到的最大 seq 作断线重连的 attach 游标，服务端
@@ -1250,8 +1372,17 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 handle.partial_text += delta
                 await _emit(handle, {"type": "text", "delta": delta})
 
-        async def _start_turn(text: str, attachments: list[dict]) -> None:
-            """装配并 spawn 一轮对话；立即返回，主循环继续收 steer/审批/stop。"""
+        async def _start_turn(
+            text: str,
+            attachments: list[dict],
+            plan_query: str | None = None,
+        ) -> None:
+            """装配并 spawn 一轮对话；立即返回，主循环继续收 steer/审批/stop。
+
+            plan_query（方案 1）：非 None 时本回合先走 Plan 确认门——只读
+            planner 回合产出计划（text 帧直播给用户）→ plan_proposal 帧 →
+            等客户端 plan_decision；批准后才执行原请求（模型可见提示词里
+            附上已确认的计划）。"""
             turn_t0 = time.monotonic()
 
             handle = _TurnHandle(cancel_event=asyncio.Event(), budget=budget)
@@ -1336,19 +1467,31 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             _write_history(run_dir, messages)
             store.save()
             store.log_event("turn_start", {"chars": len(text)})
-            model_now = resolve_model(None)
-            LOG.info("回合开始 sid=%s 字数=%d 模型=%s", sid, len(text), model_now)
+            # 方案 4：/model 会话级覆盖优先；/role、/skill 攒在 pending_context
+            # 里，只对本回合生效（取用即清，不跨回合残留）。
+            model_now = rt.get("model_override") or resolve_model(None)
+            system_now = system_instructions
+            pending_ctx = rt.pop("pending_context", [])
+            if pending_ctx:
+                lines = "\n".join(
+                    f"- {'角色设定' if kind == 'role' else '技能注入'}：{value}"
+                    for kind, value in pending_ctx
+                )
+                system_now += f"\n\n## 本回合 slash 命令追加上下文\n{lines}"
+            LOG.info("回合开始 sid=%s 字数=%d 模型=%s%s",
+                     sid, len(text), model_now,
+                     " [plan]" if plan_query is not None else "")
             history_prefix = [_content_for_llm(m) for m in messages[:-1]]
 
-            async def _invoke():
+            async def _invoke(user_prompt: str):
                 # 每轮实时构建客户端：设置页保存即刻生效；历史由包装层前置
                 # 进本轮首个请求（_HistoryClient），内核仍从单条 user 起步。
                 llm_client = _HistoryClient(build_llm_client(model=model_now))
                 llm_client.set_prefix([])
                 try:
                     return await run_agent(
-                        prompt=text,
-                        system_prompt=system_instructions,
+                        prompt=user_prompt,
+                        system_prompt=system_now,
                         llm_client=llm_client,
                         tools=tools,
                         config=RunConfig(
@@ -1371,6 +1514,80 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     except Exception:
                         pass
 
+            async def _wait_plan_decision(active: _TurnHandle) -> str:
+                """等 plan_decision / stop / 超时，返回 approve|deny|timeout|cancel。"""
+                recv = asyncio.ensure_future(active.plans.get())
+                stop_wait = asyncio.ensure_future(active.cancel_event.wait())
+                done, pending_set = await asyncio.wait(
+                    {recv, stop_wait},
+                    timeout=PLAN_DECISION_TIMEOUT_S,
+                    return_when=asyncio.FIRST_COMPLETED,
+                )
+                for t in pending_set:
+                    t.cancel()
+                if recv in done:
+                    return str(recv.result())
+                return "cancel" if stop_wait in done else "timeout"
+
+            async def _run_plan_gate(query: str) -> tuple[bool, str]:
+                """方案 1：只读 planner 回合 → plan_proposal → 等待裁决。
+
+                返回 (是否批准, 计划文本)。计划经 on_text 已实时直播给用户
+                （并累积进 partial_text）；无论批准与否，计划都作为 assistant
+                条目落盘——它是本轮 /plan 请求的真实回复。
+                """
+                plan_text = ""
+                llm_client = _HistoryClient(build_llm_client(model=model_now))
+                try:
+                    result = await run_agent(
+                        prompt=query,
+                        system_prompt=_planner_instructions(system_now),
+                        llm_client=llm_client,
+                        tools=_PlannerTools(),  # 只读规划：无工具面
+                        config=RunConfig(
+                            auto_continue=False,
+                            budget=budget,
+                            cancel_event=handle.cancel_event,
+                            session_log=store,
+                            initial_messages=history_prefix,
+                        ),
+                        on_text=lambda delta: _on_text(handle, delta),
+                    )
+                    plan_text = (
+                        (getattr(result, "text_output", "") or "")
+                        or handle.partial_text
+                    ).strip()
+                finally:
+                    try:
+                        await llm_client.close()
+                    except Exception:
+                        pass
+                plan_id = uuid.uuid4().hex
+                handle.ask_state["plan"] = plan_id
+                await _emit(handle, {
+                    "type": "plan_proposal",
+                    "id": plan_id,
+                    "plan": plan_text,
+                })
+                decision = await _wait_plan_decision(handle)
+                handle.ask_state["plan"] = ""
+                store.log_event("plan_decision", {
+                    "decision": decision,
+                    "chars": len(plan_text),
+                })
+                if decision != "approve":
+                    # 未批准：给流里补一句明确的收场说明，随计划一并入史
+                    note = "\n\n——计划未获批准（或确认超时），本轮不执行。"
+                    handle.partial_text += note
+                    await _emit(handle, {"type": "text", "delta": note})
+                    plan_text = (plan_text + note).strip()
+                # 计划即刻落盘（批准与否都一样）：它是本轮 /plan 请求的真实
+                # 回复；即便执行阶段崩溃，计划也不丢（全路径持久化口径）。
+                if plan_text:
+                    messages.append({"role": "assistant", "content": plan_text})
+                    _write_history(run_dir, messages)
+                return decision == "approve", plan_text
+
             async def _feeder(agent_task):
                 # 运行期每 ~1s 推一帧 usage 快照，结束至少一帧。本循环从不
                 # 中途 break——usage_ticks 的生成器只在自然耗尽（任务已完成）
@@ -1381,10 +1598,27 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             async def _turn_main() -> None:
                 agent_result: Any = None
                 failure: BaseException | None = None
+                plan_text = ""
+                plan_denied = False
                 try:
-                    agent_task = asyncio.ensure_future(_invoke())
-                    handle.feeder = asyncio.ensure_future(_feeder(agent_task))
-                    agent_result = await agent_task
+                    if plan_query is not None:
+                        approved, plan_text = await _run_plan_gate(plan_query)
+                        if not approved:
+                            plan_denied = True
+                        else:
+                            # 计划已单独作为 assistant 条目落盘（见下），
+                            # 重置流式累积——执行阶段的 partial 只算执行文本。
+                            handle.partial_text = ""
+                    if not plan_denied:
+                        model_prompt = text
+                        if plan_query is not None and plan_text:
+                            model_prompt = (
+                                f"{text}\n\n[已确认的执行计划]\n{plan_text}\n\n"
+                                "请严格按上述计划执行，完成后汇报结果与产物路径。"
+                            )
+                        agent_task = asyncio.ensure_future(_invoke(model_prompt))
+                        handle.feeder = asyncio.ensure_future(_feeder(agent_task))
+                        agent_result = await agent_task
                 except asyncio.CancelledError:
                     # 硬取消（服务关闭 / 删除兜底）：已流出文本回调层有账
                     failure = asyncio.CancelledError()
@@ -1406,7 +1640,13 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     handle.feeder = None
 
                 # ---- 全路径持久化：用户消息之后必有 assistant 条目 -------------
-                if failure is None:
+                # Plan 门拒绝路径：计划条目已在 _run_plan_gate 落盘，本轮到此
+                # 收场（cancelled），不再追加执行回复。
+                if plan_denied:
+                    if failure is None:
+                        failure = asyncio.CancelledError()
+                    reply, stop_reason = "", "cancelled"
+                elif failure is None:
                     reply = ((getattr(agent_result, "text_output", "") or "")
                              or handle.partial_text).strip()
                     stop_reason = str(getattr(agent_result, "stop_reason", "") or "")
@@ -1523,8 +1763,51 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             if already:
                 LOG.debug("重复 attach 同一回合 sid=%s after=%d", sid, after)
 
+        async def _handle_command(name: str, rest: str, raw: str) -> None:
+            """方案 4：slash 命令服务端分派（不进历史、不占回合）。
+
+            /plan 不在此处理——它要在主循环 user 分支里启动带确认门的回合
+            （用户消息需要先落盘）。命令回执用 ``command`` 帧（raw 原文 +
+            message 确认文案），前端渲染成 用户气泡 + 助手说明。
+            """
+            if name == "help":
+                await _send({"type": "command", "command": "help",
+                             "message": COMMAND_HELP_TEXT, "raw": raw})
+            elif name == "budget":
+                error = _apply_budget_override(budget, rest)
+                if error:
+                    await _send({"type": "error", "message": error})
+                else:
+                    await _send({"type": "command", "command": "budget",
+                                 "message": _budget_limits_summary(budget),
+                                 "raw": raw})
+            elif name == "model":
+                parts = rest.split()
+                if not parts:
+                    await _send({"type": "error", "message": "用法：/model <模型名>"})
+                else:
+                    value = parts[0]
+                    rt["model_override"] = value
+                    budget.set_model(value)  # 计价跟随，成本快照不失真
+                    await _send({"type": "command", "command": "model",
+                                 "message": f"本会话后续回合将使用模型 {value}。",
+                                 "raw": raw})
+            elif name in ("role", "skill"):
+                parts = rest.split()
+                if not parts:
+                    await _send({"type": "error",
+                                 "message": f"用法：/{name} <名称>（下一回合生效）"})
+                else:
+                    rt.setdefault("pending_context", []).append((name, parts[0]))
+                    await _send({"type": "command", "command": name,
+                                 "message": f"/{name} {parts[0]} 将在下一回合注入系统上下文。",
+                                 "raw": raw})
+            else:
+                await _send({"type": "error",
+                             "message": f"未知命令: /{name}（输入 /help 查看可用命令）"})
+
         async def _dispatch(msg: dict) -> None:
-            """处理非 user 动作：审批回执 / steer / stop / attach。"""
+            """处理非 user 动作：审批回执 / Plan 裁决 / steer / stop / attach / 命令。"""
             action = msg.get("action")
             handle = _ACTIVE.get(sid)
             if action == "approval":
@@ -1552,6 +1835,25 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             elif action == "stop":
                 if handle is not None:
                     handle.cancel_event.set()
+            elif action == "plan_decision":
+                # 方案 1：Plan 门裁决。id 必须匹配当前待决计划——迟到/未知
+                # id 的回执直接忽略（与工具审批同口径，防残留答案串道）。
+                if handle is not None:
+                    pid = str(msg.get("id") or "")
+                    if pid and pid == handle.ask_state.get("plan", ""):
+                        handle.ask_state["plan"] = ""
+                        handle.plans.put_nowait(
+                            "approve" if msg.get("approved") else "deny"
+                        )
+            elif action == "command":
+                # 方案 4：空闲期命令。运行中不会走到这里——运行期的 user/
+                # command 都在主循环按 steer 转交。
+                raw = str(msg.get("text") or "").strip()
+                if not raw.startswith("/"):
+                    await _send({"type": "error", "message": "命令必须以 / 开头"})
+                else:
+                    name, rest = _split_slash(raw)
+                    await _handle_command(name, rest, raw)
             elif action == "attach":
                 await _handle_attach(msg)
             else:
@@ -1598,6 +1900,22 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     checked = _validate_attachment_refs(cwd, sid, msg.get("attachments"))
                     if isinstance(checked, str):
                         await _send({"type": "error", "message": checked})
+                        continue
+                    # 方案 4：空闲期收到 slash 命令——/plan 启动带确认门的回合
+                    #（用户消息照常落盘），其余命令就地分派（不占回合）。
+                    if text.startswith("/"):
+                        name, rest = _split_slash(text)
+                        if name == "plan":
+                            if not rest:
+                                await _send({
+                                    "type": "error",
+                                    "message": ("用法：/plan <请求内容>——"
+                                                "助手先给出计划，确认后再执行"),
+                                })
+                            else:
+                                await _start_turn(text, checked, plan_query=rest)
+                        else:
+                            await _handle_command(name, rest, text)
                         continue
                     await _start_turn(text, checked)
             else:

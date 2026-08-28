@@ -65,6 +65,12 @@ EXTENDED_KEYS: dict[str, dict] = {
         "type": "number", "min": 1, "int": True,
         "error": "轮次上限必须是不小于 1 的整数",
     },
+    # 方案 5：RA_MAX_* 预算族最后一个缺口——墙钟时长上限（budget.py 从 env
+    # 读取但此前设置页无处可配）。<=0/留空 = 不限，与 BudgetLimits 语义一致。
+    "RA_MAX_WALL_SECONDS": {
+        "type": "number", "min_exclusive": 0,
+        "error": "墙钟时长上限必须大于 0（单位：秒；留空 = 不限制）",
+    },
     "LLM_REQUEST_INTERVAL": {
         "type": "number", "min": 0,
         "error": "请求间隔不能为负数（单位：秒）",
@@ -105,6 +111,7 @@ class SettingsPayload(BaseModel):
     ra_max_cost_usd: float | str | None = None
     ra_max_tokens: float | str | None = None
     ra_max_turns: float | str | None = None
+    ra_max_wall_seconds: float | str | None = None
     llm_request_interval: float | str | None = None
     ra_llm_first_byte_timeout: float | str | None = None
     ra_approval_mode: str | None = None

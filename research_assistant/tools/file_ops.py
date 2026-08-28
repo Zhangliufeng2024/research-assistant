@@ -221,6 +221,122 @@ async def edit_file(
         return f"Error writing file: {e}"
 
 
+def _resolve_edit_target(
+    file_path: str,
+    sandbox: str | None,
+    write_anchor: str | None,
+) -> tuple[Path | None, str | None]:
+    """Resolve an edit target path with the same dual-track anchor semantics as
+    :func:`edit_file` (修复 G 口径一致).
+
+    Returns ``(path, None)`` on success or ``(None, error)`` when resolution
+    fails / escapes the sandbox. Kept as a pure helper so ``apply_patch`` can
+    reuse the exact same resolution rule without disturbing the fully-tested
+    :func:`edit_file`.
+    """
+    raw = Path(file_path)
+    relative = not raw.is_absolute()
+    p: Path
+    if sandbox:
+        try:
+            sandbox_path = Path(sandbox)
+            if not relative:
+                p = safe_resolve(raw, sandbox_path)
+            else:
+                p = safe_resolve(sandbox_path / raw, sandbox_path)
+                if write_anchor is not None:
+                    anchor_candidate = safe_resolve(
+                        Path(write_anchor) / raw, sandbox_path)
+                    if anchor_candidate.exists():
+                        p = anchor_candidate
+        except ValueError as e:
+            return None, f"Error: {e}"
+    else:
+        p = raw.resolve()
+    return p, None
+
+
+async def apply_patch(
+    patches: list[dict],
+    sandbox: str | None = None,
+    write_anchor: str | None = None,
+) -> str:
+    """Apply a batch of exact-replacement edits across multiple files atomically.
+
+    ``patches`` is a list of ``{"file_path", "old_string", "new_string"}``.
+    Every ``old_string`` must match **exactly once** in its target file,
+    mirroring :func:`edit_file`'s uniqueness contract.
+
+    **Atomicity**: all targets are resolved and *validate-and-read* in a first
+    pass; only if every patch in every file is satisfiable are the new contents
+    actually written. If any patch fails validation the whole batch is reported
+    as failed and **no file is modified** (no partial application).
+
+    Multiple patches may target the same file; they are applied in order within
+    that file (sequence matters, mirroring a diff file's hunks).
+    """
+    if not isinstance(patches, list) or len(patches) == 0:
+        return "Error: apply_patch requires a non-empty list of patches"
+
+    # ---- Pass 1: validate structure + resolve + read with uniqueness check ----
+    # plan: list[(path, orig_bytes, new_text)] on success; (path, error) on failure
+    plan: list[tuple[Path, bytes, str]] = []
+    by_file: dict[str, list[dict]] = {}
+    for i, patch in enumerate(patches):
+        if not isinstance(patch, dict):
+            return f"Error: apply_patch patch #{i} is not an object"
+        file_path = patch.get("file_path")
+        old_string = patch.get("old_string")
+        new_string = patch.get("new_string")
+        if not isinstance(file_path, str) or not isinstance(old_string, str) \
+                or not isinstance(new_string, str):
+            return (
+                f"Error: apply_patch patch #{i} requires string fields "
+                f"'file_path', 'old_string', 'new_string'"
+            )
+        hazard = _reject_windows_hazard(file_path)
+        if hazard is not None:
+            return f"Error: apply_patch patch #{i}: {hazard}"
+        by_file.setdefault(file_path, []).append(
+            {"old": old_string, "new": new_string}
+        )
+
+    for file_path, file_patches in by_file.items():
+        target, err = _resolve_edit_target(file_path, sandbox, write_anchor)
+        if err is not None:
+            return f"Error: apply_patch {file_path}: {err}"
+        if target is None or not target.exists():
+            return f"Error: apply_patch File does not exist: {file_path}"
+        try:
+            text = target.read_text(encoding="utf-8", errors="replace")
+        except Exception as e:
+            return f"Error: apply_patch reading {file_path}: {e}"
+        new_text = text
+        for p in file_patches:
+            count = new_text.count(p["old"])
+            if count == 0:
+                return (
+                    f"Error: apply_patch {file_path}: old_string not found "
+                    f"(patch {p['old'][:40]!r})"
+                )
+            if count > 1:
+                return (
+                    f"Error: apply_patch {file_path}: old_string appears "
+                    f"{count} times; must be unique"
+                )
+            new_text = new_text.replace(p["old"], p["new"], 1)
+        plan.append((target, text.encode("utf-8", errors="replace"), new_text))
+
+    # ---- Pass 2: all validated — write them all ----
+    for target, _orig, new_text in plan:
+        try:
+            target.write_text(new_text, encoding="utf-8")
+        except Exception as e:
+            return f"Error: apply_patch writing {target}: {e}"
+
+    return f"Successfully applied {sum(len(v) for v in by_file.values())} edit(s) across {len(plan)} file(s)"
+
+
 async def glob_files(
     pattern: str,
     path: str = ".",

@@ -2,6 +2,7 @@
 
 import asyncio
 from collections.abc import Awaitable, Callable
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -9,7 +10,7 @@ from ..artifacts import ArtifactVersionStore
 from ..core import safe_resolve
 from .citation_verify import verify_citations
 from .exec_provider import ExecProvider, LocalExecProvider
-from .file_ops import edit_file, glob_files, grep_search, read_file, write_file
+from .file_ops import apply_patch, edit_file, glob_files, grep_search, read_file, write_file
 from .research_os import (
     list_research_ledger,
     record_research_claim,
@@ -112,6 +113,36 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
                 "timeout": {"type": "integer", "description": "Timeout in seconds. Default 120.", "default": 120},
             },
             "required": ["code"],
+        },
+    },
+    {
+        "name": "apply_patch",
+        "description": (
+            "Apply a batch of exact-replacement edits across one or more files "
+            "atomically. Each element of 'patches' is {file_path, old_string, "
+            "new_string}; old_string must appear exactly once in its file. "
+            "If ANY patch fails, no file is modified (all-or-nothing). Use this "
+            "instead of repeated edit_file calls when several targeted changes "
+            "must land together."
+        ),
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "patches": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "file_path": {"type": "string", "description": "Path to the file to edit."},
+                            "old_string": {"type": "string", "description": "Exact text to find (must be unique)."},
+                            "new_string": {"type": "string", "description": "Replacement text."},
+                        },
+                        "required": ["file_path", "old_string", "new_string"],
+                    },
+                    "description": "Non-empty list of edits to apply.",
+                },
+            },
+            "required": ["patches"],
         },
     },
     {
@@ -265,6 +296,7 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
     "read_file": read_file,
     "write_file": write_file,
     "edit_file": edit_file,
+    "apply_patch": apply_patch,
     "glob_files": glob_files,
     "grep_search": grep_search,
     "verify_citations": verify_citations,
@@ -274,6 +306,31 @@ _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
     "record_research_decision": record_research_decision,
     "list_research_ledger": list_research_ledger,
 }
+
+
+@dataclass(frozen=True)
+class ToolExtension:
+    """A process-local, declaratively registered extra tool.
+
+    Extensions let hosts (CLI, web, tests) attach new capabilities to the agent
+    loop without modifying the built-in hander table. They are resolved at
+    ``ToolRegistry.register_extension`` time and merged into the schema list
+    returned by :meth:`ToolRegistry.get_schemas`, so the LLM sees them as any
+    other tool. The handler may be sync or async and receives the raw
+    (model-supplied) arguments dict as keyword arguments.
+    """
+
+    name: str
+    description: str
+    schema: dict[str, Any] = field(default_factory=dict)
+    handler: Callable[..., Awaitable[str] | str] | None = None
+
+    def to_definition(self) -> dict[str, Any]:
+        return {
+            "name": self.name,
+            "description": self.description,
+            "parameters": self.schema or {"type": "object", "properties": {}},
+        }
 
 # 研究台账工具：workspace 不面向模型暴露，由 registry 注入（见 execute）。
 # sandbox 围栏 work_dir 即工作区根，<root>/.ra/platform.sqlite3 恒在其下，
@@ -366,20 +423,54 @@ class ToolRegistry:
         self.exec_cwd = exec_cwd or work_dir
         self.allowed_tools = frozenset(str(item) for item in allowed_tools) if allowed_tools else None
         self._handlers = dict(_TOOL_HANDLERS)
+        #: Declarative extra tools attached by hosts (see :class:`ToolExtension`).
+        self.extensions: dict[str, ToolExtension] = {}
         self.version_store = ArtifactVersionStore(work_dir)
         # Execution-world seam: defaults to the local provider. Swapping in a
         # container/remote provider moves bash/run_python wholesale.
         self.exec_provider: ExecProvider = exec_provider if exec_provider is not None else LocalExecProvider()
 
     def get_schemas(self) -> list[dict[str, Any]]:
+        base: list[dict[str, Any]]
         if self.allowed_tools is None:
-            return TOOL_DEFINITIONS
-        return [schema for schema in TOOL_DEFINITIONS if schema.get("name") in self.allowed_tools]
+            base = TOOL_DEFINITIONS
+        else:
+            base = [schema for schema in TOOL_DEFINITIONS if schema.get("name") in self.allowed_tools]
+        # Merge declarative extensions into the visible tool surface.
+        for ext in self.extensions.values():
+            if self.allowed_tools is not None and ext.name not in self.allowed_tools:
+                continue
+            base.append(ext.to_definition())
+        return base
+
+    def register_extension(self, ext: ToolExtension) -> None:
+        """Attach a declarative extra tool so the loop can call it.
+
+        The name must not collide with a built-in tool. The handler may be sync
+        or async; it receives the model-supplied arguments as keyword args.
+        """
+        if not ext.name:
+            raise ValueError("extension must have a non-empty name")
+        if ext.name in _TOOL_HANDLERS or ext.name == "bash" or ext.name == "run_python":
+            raise ValueError(f"extension name {ext.name!r} collides with a built-in tool")
+        if ext.handler is None:
+            raise ValueError(f"extension {ext.name!r} has no handler")
+        self.extensions[ext.name] = ext
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> str:
         """Execute a tool by name and return the result as a string."""
         if self.allowed_tools is not None and name not in self.allowed_tools:
             return f"Error: 工具 {name} 不在当前 Agent 的允许列表中"
+        # Declarative extensions dispatch first (they are not in _TOOL_HANDLERS).
+        if name in self.extensions:
+            ext = self.extensions[name]
+            try:
+                result = ext.handler(**arguments)
+                if asyncio.iscoroutine(result):
+                    result = await result
+                return str(result)
+            except Exception as e:  # noqa: BLE001 — untrusted handler; report and continue
+                return f"Error executing extension {name}: {e}"
         # Execution-provider tools are dispatched through the seam *before* the
         # handler lookup: bash/run_python no longer live in _TOOL_HANDLERS, so
         # swapping self.exec_provider moves the whole execution world (container,
@@ -433,6 +524,28 @@ class ToolRegistry:
                 return "Error executing run_python: working directory escapes workspace"
             except Exception as e:
                 return f"Error executing {name}: {e}"
+
+        handler = self._handlers.get(name)
+        if name == "apply_patch":
+            # Multi-file batch edit: inject sandbox/anchor (model never passes
+            # them) and use the same snapshot-based version recording as the
+            # exec tools so批量编辑同样可在「变更」页 diff/恢复。
+            arguments["sandbox"] = self.work_dir
+            if self.write_anchor is not None:
+                arguments["write_anchor"] = self.write_anchor
+            snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [Path(self.work_dir)]
+            before = await asyncio.to_thread(
+                _snapshot_exec_outputs, snapshot_roots, Path(self.work_dir),
+            )
+            try:
+                result = await apply_patch(
+                    patches=arguments.get("patches"),
+                    sandbox=arguments.get("sandbox", self.work_dir),
+                    write_anchor=arguments.get("write_anchor"),
+                )
+            except Exception as e:
+                return f"Error executing apply_patch: {e}"
+            return await self._record_exec_changes(before, snapshot_roots, name, result)
 
         handler = self._handlers.get(name)
         if handler is None:

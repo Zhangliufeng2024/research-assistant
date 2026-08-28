@@ -38,6 +38,7 @@ import {
   resolveRegenerateTarget,
   type MessageOpResult,
 } from "@/lib/messageOps";
+import { isCommand, parseCommand } from "@/lib/commands";
 import { wsClose, wsConnect, wsConnected, wsSend } from "@/lib/ws";
 
 const MAX_USER_LENGTH = 8_000;
@@ -98,6 +99,8 @@ interface ChatStore {
     newText: string,
   ): Promise<MessageOpResult>;
   respondApproval(ok: boolean): void;
+  /** Plan 门裁决（方案 1）：/plan 计划卡上的批准/拒绝。 */
+  respondPlan(ok: boolean): void;
   stop(): void;
   /** 新会话：清空本地流；真正建目录延迟到首条消息。 */
   newSession(): void;
@@ -329,10 +332,28 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     // R14-S：乐观上屏前先冲刷缓冲——否则缓冲中的助手文本会在这条用户气泡
     // 之后才落位（appendDelta 会另起新气泡），时间序错乱
     flushPendingDeltas();
+    // 方案 4：slash 命令路由（空闲期）。/plan 是真实请求——走正常 user 帧
+    // （服务端落盘并启动 Plan 确认门回合）；其余命令走 command 帧，不占
+    // 回合不落史；解析错误（未知命令/非法用法）直接本地渲染，不打网络。
+    const parsed = parseCommand(v);
+    const commandSend = !running && isCommand(v) && parsed.kind !== "plan";
+    if (commandSend && parsed.error) {
+      set((s) => ({
+        chat: {
+          ...s.chat,
+          items: [
+            ...s.chat.items,
+            { kind: "user" as const, text: v, t: Date.now() },
+            { kind: "text" as const, text: parsed.error ?? "", t: Date.now() },
+          ],
+        },
+      }));
+      return "ok";
+    }
     // R16：随消息发送的附件引用（steer 场景不消费，留待下一轮）。
     // 真替换重发显式传原消息的附件（含空数组＝明确不带）；普通发送取
     // 输入框暂存。?? 只对 nullish 生效——空数组不会被暂存 chips 顶替。
-    const atts = running
+    const atts = running || commandSend
       ? []
       : (opts?.attachments ?? get().pendingAttachments);
     // 乐观上屏（与旧版一致：本地先归约，不等服务端回显）
@@ -383,18 +404,17 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
         return "offline";
       }
     }
-    const frame: Record<string, unknown> = {
-      action: "user",
-      text: v.slice(0, MAX_USER_LENGTH),
-    };
-    if (atts.length) frame.attachments = atts;
+    const frame: Record<string, unknown> = commandSend
+      ? { action: "command", text: v }
+      : { action: "user", text: v.slice(0, MAX_USER_LENGTH) };
+    if (!commandSend && atts.length) frame.attachments = atts;
     if (!wsSend(frame, "chat")) {
       if (createdSid) discardJustCreated(createdSid);
       failOffline();
       return "offline";
     }
     // 发送成功才消费暂存 chips；真替换重发的附件是显式传入的，不动暂存
-    if (atts.length && opts?.attachments === undefined) {
+    if (atts.length && opts?.attachments === undefined && !commandSend) {
       set({ pendingAttachments: [] });
     }
     return "ok";
@@ -536,6 +556,18 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     set((s) => ({ chat: applyApprovalResponse(s.chat) }));
   },
 
+  /* Plan 门裁决（方案 1）：id 必须匹配当前待决计划（服务端同样校验，
+   * 迟到回执双向忽略）；本地立即收卡，计划文本已留在消息流里。 */
+  respondPlan: (ok) => {
+    const plan = get().chat.plan;
+    if (!plan) return;
+    if (Date.now() >= plan.deadline) return;
+    if (!wsSend({ action: "plan_decision", id: plan.id, approved: ok }, "chat")) {
+      return;
+    }
+    set((s) => ({ chat: { ...s.chat, plan: null } }));
+  },
+
   stop: () => {
     wsSend({ action: "stop" }, "chat");
   },
@@ -618,4 +650,23 @@ function nudgeReconnectAfterSteerFailure(): void {
 /** 当前连接附着的查询串（调试/视图判断用）。 */
 export function activeChatQuery() {
   return activeQuery;
+}
+
+/* 重连诊断钩子（常设）：把重连机器的模块级内部态暴露给页面外。
+ * 动机：E2E 曾出现「断连横幅可见但重连从未真正建连」的环境性静默失败，
+ * 三种可能（定时器被清 / wantConnected=false / sessionId=null→giveUp）
+ * 只有页面内地面真值能分辨——横幅和 SENT_FRAMES 都看不到这一层。
+ * 纯只读快照，无行为影响；E2E harness（e2e_smoke_r16.py 的 [dbg] 探针）
+ * 与人工调试（控制台 __chatDebug()）共用。 */
+if (typeof window !== "undefined") {
+  (window as unknown as Record<string, unknown>).__chatDebug = () => ({
+    conn: useChatStore.getState().conn,
+    phase: useChatStore.getState().chat.phase,
+    sid: useChatStore.getState().chat.sessionId,
+    wantConnected,
+    attempts: reconnectAttempts,
+    timerArmed: reconnectTimer !== null,
+    lastSeq,
+    activeQuery,
+  });
 }

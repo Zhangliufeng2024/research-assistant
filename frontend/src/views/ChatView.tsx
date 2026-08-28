@@ -13,6 +13,7 @@ import { useChatStore } from "@/stores/chatStore";
 import { toast } from "@/stores/toastStore";
 import { usePinnedScroll } from "@/hooks/usePinnedScroll";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
+import { PlanCard } from "@/components/chat/PlanCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
 import { Composer } from "@/components/chat/Composer";
@@ -41,6 +42,7 @@ export function ChatView() {
     attachFiles,
     removePendingAttachment,
     respondApproval,
+    respondPlan,
     stop,
     newSession,
     openSession,
@@ -344,7 +346,8 @@ export function ChatView() {
           </AnimatePresence>
         </div>
 
-        {/* 审批卡（悬浮于输入区上方） */}
+        {/* 审批卡 / Plan 确认卡（悬浮于输入区上方；二者互斥——
+            Plan 门 planner 阶段无工具，不会与工具审批并发） */}
         <AnimatePresence>
           {chat.approval && (
             <motion.div
@@ -354,6 +357,16 @@ export function ChatView() {
               className="mx-auto w-full max-w-3xl px-4 pb-2"
             >
               <ApprovalCard approval={chat.approval} onRespond={respondApproval} />
+            </motion.div>
+          )}
+          {!chat.approval && chat.plan && (
+            <motion.div
+              initial={{ opacity: 0, y: 12 }}
+              animate={{ opacity: 1, y: 0 }}
+              exit={{ opacity: 0, y: 12 }}
+              className="mx-auto w-full max-w-3xl px-4 pb-2"
+            >
+              <PlanCard plan={chat.plan} onRespond={respondPlan} />
             </motion.div>
           )}
         </AnimatePresence>

@@ -1,13 +1,80 @@
 import { useState } from "react";
+import { diffLines, diffStats, type DiffRow } from "@/lib/diff";
 import type { ToolCard as ToolCardData } from "@/lib/types";
 
 const TOOL_LABELS: Record<string, string> = {
   write_file: "写入文件",
   edit_file: "编辑文件",
+  apply_patch: "批量编辑",
   read_file: "读取文件",
   bash: "终端命令",
   run_python: "运行 Python",
 };
+
+/** 方案 2b：从工具卡参数中提取「旧文 → 新文」的 diff 输入。
+ * edit_file：old_string/new_string 单补丁；apply_patch：patches[] 多补丁。
+ * 其余工具（写入/执行类）没有可比对的旧文，返回空。 */
+function diffInputsFor(card: ToolCardData): { path: string; rows: DiffRow[] }[] {
+  const a = card.args;
+  if (
+    card.tool === "edit_file" &&
+    typeof a.old_string === "string" &&
+    typeof a.new_string === "string"
+  ) {
+    const path = typeof a.file_path === "string" ? a.file_path : "";
+    return [{ path, rows: diffLines(a.old_string, a.new_string) }];
+  }
+  if (card.tool === "apply_patch" && Array.isArray(a.patches)) {
+    return (a.patches as unknown[])
+      .filter(
+        (p): p is Record<string, unknown> =>
+          !!p &&
+          typeof p === "object" &&
+          typeof (p as Record<string, unknown>).old_string === "string" &&
+          typeof (p as Record<string, unknown>).new_string === "string",
+      )
+      .map((p) => ({
+        path: typeof p.file_path === "string" ? p.file_path : "",
+        rows: diffLines(p.old_string as string, p.new_string as string),
+      }));
+  }
+  return [];
+}
+
+/** 内联 diff 块：文件名 + 增删统计 + 行级着色预览（ 方案 2b）。 */
+function DiffBlock({ path, rows }: { path: string; rows: DiffRow[] }) {
+  const { added, removed } = diffStats(rows);
+  return (
+    <div>
+      <div className="mb-1 flex items-baseline gap-2">
+        <span className="min-w-0 truncate font-mono text-[11px] font-medium text-accent-hover dark:text-accent">
+          {path || "(未命名)"}
+        </span>
+        <span className="shrink-0 font-mono text-[10.5px] text-ok">+{added}</span>
+        <span className="shrink-0 font-mono text-[10.5px] text-danger">-{removed}</span>
+      </div>
+      <pre className="max-h-56 overflow-auto rounded-lg bg-surface-2 p-0 font-mono text-[11px] leading-5">
+        {rows.map((r, i) => (
+          <div
+            key={i}
+            className={`flex gap-0 ${
+              r.type === "add"
+                ? "bg-ok/10 text-ok"
+                : r.type === "del"
+                  ? "bg-danger/10 text-danger"
+                  : "text-ink-3"
+            }`}
+          >
+            <span className="w-5 shrink-0 select-none text-center opacity-70">
+              {r.type === "add" ? "+" : r.type === "del" ? "-" : " "}
+            </span>
+            <span className="whitespace-pre-wrap break-all pr-2">{r.text || " "}</span>
+          </div>
+        ))}
+      </pre>
+    </div>
+  );
+}
 
 function argsSummary(card: ToolCardData): string {
   const a = card.args;
@@ -109,6 +176,9 @@ export function ToolCardView({
 
       {open && (
         <div className="space-y-2 border-t border-edge px-3.5 py-3">
+          {diffInputsFor(card).map((d, i) => (
+            <DiffBlock key={`${d.path}-${i}`} path={d.path} rows={d.rows} />
+          ))}
           {Object.keys(card.args).length > 0 && (
             <div>
               <div className="mb-1 text-[11px] font-medium text-ink-3">参数</div>

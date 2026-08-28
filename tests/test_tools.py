@@ -7,6 +7,7 @@ import pytest
 
 from research_assistant.tools.bash import run_bash
 from research_assistant.tools.file_ops import (
+    apply_patch,
     edit_file,
     glob_files,
     grep_search,
@@ -752,3 +753,207 @@ class TestWriteFileWindowsHazards:
             str(tmp_path / "concrete.md"), "x", sandbox=str(tmp_path))
         assert "Successfully" in result
         assert (tmp_path / "concrete.md").read_text(encoding="utf-8") == "x"
+
+# ---------------------------------------------------------------------------
+# 进程内扩展工具注册（方案 3a）
+# ---------------------------------------------------------------------------
+
+class TestToolExtensions:
+    def test_register_and_schema_merge(self):
+        from research_assistant.tools.registry import ToolExtension
+
+        registry = ToolRegistry()
+        ext = ToolExtension(
+            name="greet",
+            description="Say hello.",
+            schema={"type": "object", "properties": {"who": {"type": "string"}}},
+            handler=lambda who="world": f"hello {who}",
+        )
+        registry.register_extension(ext)
+        names = [td["name"] for td in registry.get_schemas()]
+        assert "greet" in names
+        definition = next(td for td in registry.get_schemas() if td["name"] == "greet")
+        assert definition["parameters"]["properties"]["who"]["type"] == "string"
+
+    @pytest.mark.asyncio
+    async def test_execute_sync_extension(self):
+        from research_assistant.tools.registry import ToolExtension
+
+        registry = ToolRegistry()
+        registry.register_extension(ToolExtension(
+            name="greet",
+            description="Say hello.",
+            handler=lambda who="world": f"hello {who}",
+        ))
+        result = await registry.execute("greet", {"who": "researcher"})
+        assert result == "hello researcher"
+
+    @pytest.mark.asyncio
+    async def test_execute_async_extension(self):
+        from research_assistant.tools.registry import ToolExtension
+
+        async def handler(x: int = 0) -> str:
+            return f"x2={x * 2}"
+
+        registry = ToolRegistry()
+        registry.register_extension(ToolExtension(
+            name="double", description="Double a number.", handler=handler,
+        ))
+        result = await registry.execute("double", {"x": 21})
+        assert result == "x2=42"
+
+    @pytest.mark.asyncio
+    async def test_extension_error_is_reported_not_raised(self):
+        from research_assistant.tools.registry import ToolExtension
+
+        def boom():
+            raise RuntimeError("kaboom")
+
+        registry = ToolRegistry()
+        registry.register_extension(ToolExtension(
+            name="boom", description="Always fails.", handler=boom,
+        ))
+        result = await registry.execute("boom", {})
+        assert "Error executing extension boom" in result
+        assert "kaboom" in result
+
+    def test_extension_name_collision_rejected(self):
+        from research_assistant.tools.registry import ToolExtension
+
+        registry = ToolRegistry()
+        with pytest.raises(ValueError):
+            registry.register_extension(ToolExtension(
+                name="read_file", description="collision", handler=lambda: "x",
+            ))
+
+
+
+# ---------------------------------------------------------------------------
+# apply_patch：多文件批量原子编辑工具
+# ---------------------------------------------------------------------------
+
+class TestApplyPatch:
+    @pytest.mark.asyncio
+    async def test_single_file_single_patch(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("hello foo bar")
+        result = await apply_patch(
+            [{"file_path": str(f), "old_string": "foo", "new_string": "baz"}],
+        )
+        assert "Successfully applied 1 edit(s)" in result
+        assert f.read_text() == "hello baz bar"
+
+    @pytest.mark.asyncio
+    async def test_multi_file_batch(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("x=1")
+        b.write_text("y=2")
+        result = await apply_patch([
+            {"file_path": str(a), "old_string": "1", "new_string": "10"},
+            {"file_path": str(b), "old_string": "2", "new_string": "20"},
+        ])
+        assert "2 edit(s) across 2 file(s)" in result
+        assert a.read_text() == "x=10"
+        assert b.read_text() == "y=20"
+
+    @pytest.mark.asyncio
+    async def test_atomic_rollback_on_failure(self, tmp_path):
+        a = tmp_path / "a.txt"
+        b = tmp_path / "b.txt"
+        a.write_text("keep a")
+        b.write_text("keep b")
+        result = await apply_patch([
+            {"file_path": str(a), "old_string": "keep a", "new_string": "changed a"},
+            {"file_path": str(b), "old_string": "MISSING", "new_string": "x"},
+        ])
+        assert "old_string not found" in result
+        # a must NOT be changed despite being a valid patch
+        assert a.read_text() == "keep a"
+        assert b.read_text() == "keep b"
+
+    @pytest.mark.asyncio
+    async def test_same_file_multiple_patches_in_order(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("one two three")
+        result = await apply_patch([
+            {"file_path": str(f), "old_string": "one", "new_string": "1"},
+            {"file_path": str(f), "old_string": "three", "new_string": "3"},
+        ])
+        assert "2 edit(s) across 1 file(s)" in result
+        assert f.read_text() == "1 two 3"
+
+    @pytest.mark.asyncio
+    async def test_non_unique_old_string_fails(self, tmp_path):
+        f = tmp_path / "a.txt"
+        f.write_text("aa aa")
+        result = await apply_patch(
+            [{"file_path": str(f), "old_string": "aa", "new_string": "bb"}],
+        )
+        assert "appears 2 times" in result
+        assert f.read_text() == "aa aa"
+
+    @pytest.mark.asyncio
+    async def test_nonexistent_file_fails(self, tmp_path):
+        result = await apply_patch(
+            [{"file_path": str(tmp_path / "nope.txt"), "old_string": "a", "new_string": "b"}],
+        )
+        assert "File does not exist" in result
+
+    @pytest.mark.asyncio
+    async def test_empty_patches_fails(self, tmp_path):
+        result = await apply_patch([])
+        assert "non-empty" in result
+
+    @pytest.mark.asyncio
+    async def test_escapes_sandbox_rejected(self, tmp_path):
+        outside = tmp_path.parent / "outside-apply"
+        outside.mkdir()
+        (outside / "s.txt").write_text("secret")
+        result = await apply_patch(
+            [{"file_path": str(outside / "s.txt"), "old_string": "secret", "new_string": "x"}],
+            sandbox=str(tmp_path),
+        )
+        assert "escapes sandbox" in result or "Error" in result
+        assert (outside / "s.txt").read_text() == "secret"
+
+    @pytest.mark.asyncio
+    async def test_relative_path_anchor_semantics(self, tmp_path):
+        # 修复 G 口径：相对路径在 anchor 下存在时编辑 anchor 副本（与 edit_file 一致）
+        anchor = tmp_path / "anchor"
+        anchor.mkdir()
+        (anchor / "doc.txt").write_text("hello root")
+        (tmp_path / "doc.txt").write_text("hello base")
+        result = await apply_patch(
+            [{"file_path": "doc.txt", "old_string": "hello", "new_string": "hi"}],
+            sandbox=str(tmp_path),
+            write_anchor=str(anchor),
+        )
+        assert "Successfully applied" in result
+        # anchor 副本优先，root 下的同名文件不被改动
+        assert (anchor / "doc.txt").read_text() == "hi root"
+        assert (tmp_path / "doc.txt").read_text() == "hello base"
+
+
+class TestToolRegistryApplyPatch:
+    @pytest.mark.asyncio
+    async def test_registry_execute_apply_patch_versions_changes(self, tmp_path):
+        f = tmp_path / "code.py"
+        f.write_text("def main():\n    return 1\n")
+        registry = ToolRegistry(work_dir=str(tmp_path))
+        result = await registry.execute("apply_patch", {
+            "patches": [{
+                "file_path": "code.py",
+                "old_string": "return 1",
+                "new_string": "return 2",
+            }],
+        })
+        assert "Successfully applied" in result
+        assert f.read_text() == "def main():\n    return 2\n"
+        changes = registry.version_store.list()
+        assert changes[0]["path"] == "code.py"
+        assert changes[0]["tool"] == "apply_patch"
+
+    def test_apply_patch_in_definitions(self):
+        names = [td["name"] for td in TOOL_DEFINITIONS]
+        assert "apply_patch" in names

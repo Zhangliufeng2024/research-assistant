@@ -1086,3 +1086,318 @@ class TestChatSystemInstructions:
         text = self._build(tmp_path)
         assert "run_script" in text
         assert "sys.executable" in text
+
+
+# ---------------------------------------------------------------------------
+# 方案 4：slash 命令服务端分派
+# ---------------------------------------------------------------------------
+
+def _plain_behavior(kw) -> AgentResult:
+    """标准单轮：一段文本后正常结束（命令测试的执行兜底）。"""
+
+    async def behavior(k):
+        await k["on_text"]("好的")
+        return AgentResult(text_output="好的", turns=1,
+                           stop_reason="completed")
+
+    return behavior(kw)
+
+
+class TestSlashCommands:
+    """/help /budget /model /role /skill 走 command 帧分派，不占回合、不落史。"""
+
+    def test_help_returns_command_frame_and_skips_turn(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        captured = _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/help"})
+                frames = _collect_until(ws, ("command",))
+        cmd = frames[-1]
+        assert cmd["type"] == "command"
+        assert cmd["command"] == "help"
+        assert cmd["raw"] == "/help"
+        for token in ("/budget", "/model", "/role", "/skill", "/plan"):
+            assert token in cmd["message"]
+        assert captured == {}  # 命令不启动内核回合
+
+    def test_budget_overrides_session_guard(self, tmp_path, monkeypatch):
+        """会话 ID 按秒生成（跨测试可能撞车复用共享 guard），这里用唯一
+        命名的会话隔离，直接断言 guard 的 limits。"""
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            sid = client.post("/api/chat/sessions",
+                              json={"title": "预算覆盖唯一"}).json()["id"]
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command",
+                              "text": "/budget cost=5 tokens=1000 turns=7 wall_seconds=120"})
+                cmd = _collect_until(ws, ("command",))[-1]
+        assert cmd["command"] == "budget"
+        assert "已更新" in cmd["message"]
+        guard = chat_mod._SESSIONS[sid]["budget"]
+        assert guard.limits.max_cost_usd == 5
+        assert guard.limits.max_total_tokens == 1000
+        assert guard.limits.max_turns == 7
+        assert guard.limits.max_wall_seconds == 120
+
+    def test_budget_invalid_value_errors_without_touching_limits(
+            self, tmp_path, monkeypatch):
+        """非法值拒绝 + 部分合法部分非法整体拒绝（不半写）。唯一命名会话
+        隔离共享 guard（会话 ID 按秒生成，跨测试可能撞车）。"""
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            sid = client.post("/api/chat/sessions",
+                              json={"title": "预算非法唯一"}).json()["id"]
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/budget cost=abc"})
+                err = _collect_until(ws, ("error",))[-1]
+                assert "必须是正数" in err["message"]
+                # 部分合法部分非法：整体拒绝，不半写
+                ws.send_json({"action": "command", "text": "/budget turns=3 foo=1"})
+                err = _collect_until(ws, ("error",))[-1]
+                assert "foo" in err["message"]
+                ws.send_json({"action": "command", "text": "/budget"})
+                err = _collect_until(ws, ("error",))[-1]
+                assert "用法" in err["message"]
+                # 非法尝试后，合法覆盖仍正常工作
+                ws.send_json({"action": "command", "text": "/budget turns=9"})
+                ack = _collect_until(ws, ("command",))[-1]
+        assert "turns=9" in ack["message"]
+        guard = chat_mod._SESSIONS[sid]["budget"]
+        assert guard.limits.max_cost_usd is None  # cost=abc 未半写
+        assert guard.limits.max_turns == 9
+
+    def test_model_override_applies_to_next_turn(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        captured: dict = {}
+        models: list = []
+
+        def fake_run_agent(**kwargs):
+            captured.update(kwargs)
+
+            async def behavior(kw):
+                await kw["on_text"]("好")
+                return AgentResult(text_output="好", turns=1,
+                                   stop_reason="completed")
+
+            return behavior(kwargs)
+
+        def fake_build(model=None):
+            models.append(model)
+            return FakeLLMClient()
+
+        monkeypatch.setattr(chat_mod, "run_agent", fake_run_agent)
+        monkeypatch.setattr(chat_mod, "build_llm_client", fake_build)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/model gpt-x"})
+                cmd = _collect_until(ws, ("command",))[-1]
+                assert cmd["command"] == "model"
+                assert "gpt-x" in cmd["message"]
+                # 缺参数：用法错误
+                ws.send_json({"action": "command", "text": "/model"})
+                assert "用法" in _collect_until(ws, ("error",))[-1]["message"]
+                ws.send_json({"action": "user", "text": "跑一轮"})
+                _collect_until(ws, ("result",))
+        assert models == ["gpt-x"]
+
+    def test_role_and_skill_inject_into_next_turn_system(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        captured = _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/role planner"})
+                ack = _collect_until(ws, ("command",))[-1]
+                assert "下一回合" in ack["message"]
+                ws.send_json({"action": "command", "text": "/skill writing"})
+                _collect_until(ws, ("command",))
+                ws.send_json({"action": "user", "text": "开跑"})
+                _collect_until(ws, ("result",))
+        system_prompt = captured["system_prompt"]
+        assert "角色设定：planner" in system_prompt
+        assert "技能注入：writing" in system_prompt
+        # 命令本身不落史：历史里只有 user/assistant 一对
+        sid = _first_session_id(tmp_path)
+        hist = json.loads((tmp_path / ".ra" / "sessions" / sid
+                           / "history.json").read_text(encoding="utf-8"))
+        assert [m["role"] for m in hist["messages"]] == ["user", "assistant"]
+
+    def test_unknown_command_errors(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/frobnicate x"})
+                err = _collect_until(ws, ("error",))[-1]
+        assert "未知命令" in err["message"]
+        assert "/help" in err["message"]
+
+    def test_plan_without_query_gets_usage_error(self, tmp_path, monkeypatch):
+        app = _make_app(tmp_path)
+        captured = _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "user", "text": "/plan"})
+                err = _collect_until(ws, ("error",))[-1]
+        assert "用法" in err["message"]
+        assert captured == {}
+
+    def test_plan_as_command_action_is_rejected(self, tmp_path, monkeypatch):
+        """/plan 必须走 user 帧（要落盘 + 启动门回合），command 动作里给出
+        合理报错而非静默吞掉。"""
+        app = _make_app(tmp_path)
+        _install_fakes(monkeypatch, _plain_behavior)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "command", "text": "/plan 做研究"})
+                err = _collect_until(ws, ("error",))[-1]
+        assert "未知命令" in err["message"]
+
+
+def _first_session_id(tmp_path: Path) -> str:
+    return sorted(
+        p.name for p in (tmp_path / ".ra" / "sessions").iterdir() if p.is_dir()
+    )[-1]
+
+
+# ---------------------------------------------------------------------------
+# 方案 1：/plan 会话确认门
+# ---------------------------------------------------------------------------
+
+PLAN_TEXT = "## 计划\n1. 步骤A：读数据\n2. 步骤B：画图"
+EXEC_TEXT = "按计划执行完毕"
+
+
+def _install_plan_fakes(monkeypatch, plan_text=PLAN_TEXT, exec_text=EXEC_TEXT) -> dict:
+    """planner/执行双回合假内核：按 system_prompt 是否含「计划模式」分流。"""
+    captured: dict = {"calls": []}
+
+    def fake_run_agent(**kwargs):
+        captured["calls"].append(kwargs)
+        is_plan = "计划模式" in (kwargs.get("system_prompt") or "")
+
+        async def behavior(kw):
+            await kw["on_text"](plan_text if is_plan else exec_text)
+            return AgentResult(text_output=plan_text if is_plan else exec_text,
+                               turns=1, stop_reason="completed")
+
+        return behavior(kwargs)
+
+    monkeypatch.setattr(chat_mod, "run_agent", fake_run_agent)
+    monkeypatch.setattr(chat_mod, "build_llm_client",
+                        lambda model=None: FakeLLMClient())
+    return captured
+
+
+class TestChatPlanGate:
+    def test_approved_plan_runs_execution_and_persists_twice(
+            self, tmp_path, monkeypatch):
+        captured = _install_plan_fakes(monkeypatch)
+        app = _make_app(tmp_path)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                sid = ws.receive_json()["session_id"]
+                ws.send_json({"action": "user", "text": "/plan 分析数据"})
+                frames = _collect_until(ws, ("plan_proposal",))
+                # 计划文本先直播给用户
+                deltas = [f["delta"] for f in frames if f["type"] == "text"]
+                assert any("步骤A" in d for d in deltas)
+                proposal = frames[-1]
+                assert proposal["type"] == "plan_proposal"
+                assert proposal["plan"] == PLAN_TEXT
+                ws.send_json({"action": "plan_decision",
+                              "id": proposal["id"], "approved": True})
+                tail = _collect_until(ws, ("result",))
+        assert tail[-1]["stop_reason"] == "completed"
+        assert len(captured["calls"]) == 2
+        planner, real = captured["calls"]
+        # planner 只读：空工具面 + 计划模式提示词
+        assert planner["tools"].get_schemas() == []
+        assert "计划模式" in planner["system_prompt"]
+        assert planner["prompt"] == "分析数据"
+        # 执行回合提示词携带已确认的计划
+        assert "[已确认的执行计划]" in real["prompt"]
+        assert "步骤A" in real["prompt"]
+        # 落盘口径：user 原文 + 计划 + 执行回复
+        hist = json.loads((tmp_path / ".ra" / "sessions" / sid
+                           / "history.json").read_text(encoding="utf-8"))
+        assert [m["role"] for m in hist["messages"]] == [
+            "user", "assistant", "assistant"]
+        assert hist["messages"][0]["content"] == "/plan 分析数据"
+        assert "步骤A" in hist["messages"][1]["content"]
+        assert EXEC_TEXT in hist["messages"][2]["content"]
+
+    def test_denied_plan_skips_execution(self, tmp_path, monkeypatch):
+        captured = _install_plan_fakes(monkeypatch)
+        app = _make_app(tmp_path)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                sid = ws.receive_json()["session_id"]
+                ws.send_json({"action": "user", "text": "/plan 做事"})
+                proposal = _collect_until(ws, ("plan_proposal",))[-1]
+                ws.send_json({"action": "plan_decision",
+                              "id": proposal["id"], "approved": False})
+                tail = _collect_until(ws, ("result",))
+        assert tail[-1]["stop_reason"] == "cancelled"
+        # 只跑了 planner；拒绝说明随计划入史
+        assert len(captured["calls"]) == 1
+        hist = json.loads((tmp_path / ".ra" / "sessions" / sid
+                           / "history.json").read_text(encoding="utf-8"))
+        assert len(hist["messages"]) == 2
+        assert "本轮不执行" in hist["messages"][1]["content"]
+
+    def test_decision_timeout_denies(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(chat_mod, "PLAN_DECISION_TIMEOUT_S", 0.05)
+        captured = _install_plan_fakes(monkeypatch)
+        app = _make_app(tmp_path)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                sid = ws.receive_json()["session_id"]
+                ws.send_json({"action": "user", "text": "/plan 做事"})
+                _collect_until(ws, ("plan_proposal",))
+                tail = _collect_until(ws, ("result",), cap=50)
+        assert tail[-1]["stop_reason"] == "cancelled"
+        assert len(captured["calls"]) == 1
+        hist = json.loads((tmp_path / ".ra" / "sessions" / sid
+                           / "history.json").read_text(encoding="utf-8"))
+        assert "本轮不执行" in hist["messages"][1]["content"]
+
+    def test_stop_during_gate_ends_cancelled(self, tmp_path, monkeypatch):
+        captured = _install_plan_fakes(monkeypatch)
+        app = _make_app(tmp_path)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "user", "text": "/plan 做事"})
+                _collect_until(ws, ("plan_proposal",))
+                ws.send_json({"action": "stop"})
+                tail = _collect_until(ws, ("result",))
+        assert tail[-1]["stop_reason"] == "cancelled"
+        assert len(captured["calls"]) == 1
+
+    def test_stale_plan_decision_ignored(self, tmp_path, monkeypatch):
+        """id 不匹配的迟到回执不入队（防残留答案串道）。"""
+        captured = _install_plan_fakes(monkeypatch)
+        monkeypatch.setattr(chat_mod, "PLAN_DECISION_TIMEOUT_S", 0.3)
+        app = _make_app(tmp_path)
+        with TestClient(app) as client:
+            with client.websocket_connect("/ws/chat") as ws:
+                ws.receive_json()
+                ws.send_json({"action": "user", "text": "/plan 做事"})
+                _collect_until(ws, ("plan_proposal",))
+                ws.send_json({"action": "plan_decision",
+                              "id": "bogus", "approved": True})
+                tail = _collect_until(ws, ("result",), cap=50)
+        # 假 id 不消费裁决，超时按拒绝收场
+        assert tail[-1]["stop_reason"] == "cancelled"
+        assert len(captured["calls"]) == 1

@@ -24,6 +24,7 @@ type ExtendedSettings = SettingsData & {
   ra_max_cost_usd?: number | string | null;
   ra_max_tokens?: number | string | null;
   ra_max_turns?: number | string | null;
+  ra_max_wall_seconds?: number | string | null;
   llm_request_interval?: number | string | null;
   ra_llm_first_byte_timeout?: number | string | null;
   ra_approval_mode?: string;
@@ -43,6 +44,7 @@ type SavePayload = {
   ra_max_cost_usd: string;
   ra_max_tokens: string;
   ra_max_turns: string;
+  ra_max_wall_seconds: string;
   llm_request_interval: string;
   ra_llm_first_byte_timeout: string;
   ra_approval_mode: string;
@@ -142,6 +144,7 @@ export function SettingsView() {
   const [maxCost, setMaxCost] = useState("");
   const [maxTokens, setMaxTokens] = useState("");
   const [maxTurns, setMaxTurns] = useState("");
+  const [maxWallSeconds, setMaxWallSeconds] = useState("");
   const [reqInterval, setReqInterval] = useState("");
   const [firstByteTimeout, setFirstByteTimeout] = useState("");
   // —— 审批与权限 ——
@@ -176,6 +179,7 @@ export function SettingsView() {
           setMaxCost(fmt(c.ra_max_cost_usd));
           setMaxTokens(fmt(c.ra_max_tokens));
           setMaxTurns(fmt(c.ra_max_turns));
+          setMaxWallSeconds(fmt(c.ra_max_wall_seconds));
           setReqInterval(fmt(c.llm_request_interval));
           setFirstByteTimeout(fmt(c.ra_llm_first_byte_timeout));
           setApprovalMode(c.ra_approval_mode || "off");
@@ -220,6 +224,7 @@ export function SettingsView() {
     ra_max_cost_usd: maxCost.trim(), // 空 = 清除该上限（后端范围校验）
     ra_max_tokens: maxTokens.trim(),
     ra_max_turns: maxTurns.trim(),
+    ra_max_wall_seconds: maxWallSeconds.trim(),
     llm_request_interval: reqInterval.trim(),
     ra_llm_first_byte_timeout: firstByteTimeout.trim(),
     ra_approval_mode: approvalMode,
@@ -459,6 +464,14 @@ export function SettingsView() {
             value={maxTurns}
             onChange={setMaxTurns}
             min="1"
+            step="1"
+          />
+          <NumberField
+            label="墙钟时长上限（秒）· RA_MAX_WALL_SECONDS"
+            unit="秒，> 0；留空 = 不限制"
+            value={maxWallSeconds}
+            onChange={setMaxWallSeconds}
+            min="0"
             step="1"
           />
           <NumberField

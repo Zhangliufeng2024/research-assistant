@@ -76,3 +76,6 @@ ResearchAssistant_Trial.spec
 
 # 内部计划文档（防误入库）
 plan260824.md
+
+# pytest basetemp（避免误入 stash/提交）
+.pytest_tmp*/

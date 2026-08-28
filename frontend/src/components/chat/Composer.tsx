@@ -1,4 +1,5 @@
-import { useEffect, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
+import { commandSuggestions, type CommandDef } from "@/lib/commands";
 import type { AttachmentRef } from "@/lib/types";
 
 /** 发送结果串（与 chatStore.send 对齐）；undefined 视同成功。 */
@@ -35,10 +36,27 @@ export function Composer({
 }) {
   const [value, setValue] = useState("");
   const [dragOver, setDragOver] = useState(false);
+  // 方案 4：命令下拉。输入是「正在敲的命令 token」（/^\/\w*$/）时列出候选；
+  // menuOpen=false 表示用户已 Esc 关闭或刚选中，继续打字才重新弹出。
+  const [menuOpen, setMenuOpen] = useState(false);
+  const [menuIdx, setMenuIdx] = useState(0);
   const ref = useRef<HTMLTextAreaElement>(null);
   const fileRef = useRef<HTMLInputElement>(null);
   // 拖拽计数：子元素 dragenter/dragleave 成对触发，用计数抵消抖动
   const dragDepth = useRef(0);
+
+  const suggestions = useMemo(
+    () => (menuOpen ? commandSuggestions(value) : []),
+    [menuOpen, value],
+  );
+  const menuActive = suggestions.length > 0;
+  const activeIdx = menuIdx < suggestions.length ? menuIdx : 0;
+
+  function applySuggestion(c: CommandDef) {
+    setValue(`/${c.name} `);
+    setMenuOpen(false);
+    requestAnimationFrame(() => ref.current?.focus());
+  }
 
   useEffect(() => {
     if (focusSignal > 0) ref.current?.focus();
@@ -53,6 +71,7 @@ export function Composer({
       if (r !== undefined && r !== "ok") setValue(v);
     });
     setValue("");
+    setMenuOpen(false);
     // 清空后恢复高度
     requestAnimationFrame(() => {
       if (ref.current) ref.current.style.height = "auto";
@@ -70,7 +89,7 @@ export function Composer({
     <div className="px-4 pb-4">
       <div className="mx-auto max-w-3xl">
         <div
-          className={`flex items-end gap-2 rounded-2xl border bg-surface p-2 shadow-card transition-colors focus-within:border-accent/50 ${
+          className={`relative flex items-end gap-2 rounded-2xl border bg-surface p-2 shadow-card transition-colors focus-within:border-accent/50 ${
             dragOver ? "border-accent bg-accent-tint" : "border-edge"
           }`}
           onDragEnter={(e) => {
@@ -94,6 +113,42 @@ export function Composer({
             addFiles(e.dataTransfer?.files ?? null);
           }}
         >
+          {/* 命令下拉（方案 4）：悬浮于输入框上方；↑↓ 选择、Enter/Tab 补全、
+              Esc 关闭、点击直接补全。onMouseDown 抢在 textarea 失焦前执行。 */}
+          {menuActive && (
+            <div
+              role="listbox"
+              aria-label="可用命令"
+              className="absolute bottom-full left-0 right-0 z-30 mb-2 overflow-hidden rounded-xl border border-edge bg-surface shadow-card"
+            >
+              {suggestions.map((c, i) => (
+                <button
+                  key={c.name}
+                  type="button"
+                  role="option"
+                  aria-selected={i === activeIdx}
+                  onMouseDown={(e) => {
+                    e.preventDefault();
+                    applySuggestion(c);
+                  }}
+                  onMouseEnter={() => setMenuIdx(i)}
+                  className={`flex w-full items-baseline gap-2.5 px-3.5 py-2 text-left transition-colors ${
+                    i === activeIdx ? "bg-surface-2" : ""
+                  }`}
+                >
+                  <span className="shrink-0 font-mono text-[12.5px] font-medium text-accent-hover dark:text-accent">
+                    /{c.name}
+                  </span>
+                  <span className="min-w-0 flex-1 truncate text-[12px] text-ink-2">
+                    {c.description}
+                  </span>
+                  <span className="shrink-0 font-mono text-[10.5px] text-ink-3">
+                    {c.usage}
+                  </span>
+                </button>
+              ))}
+            </div>
+          )}
           {/* 待发附件 chips：上传完成即显示，✕ 移除 */}
           {(pendingAttachments.length > 0 || attaching) && (
             <div className="flex w-full flex-wrap gap-1.5 px-1 pb-1.5">
@@ -156,10 +211,34 @@ export function Composer({
             className="max-h-44 min-h-[38px] flex-1 resize-none bg-transparent px-2.5 py-2 text-[14px] leading-6 outline-none placeholder:text-ink-3"
             onChange={(e) => {
               setValue(e.target.value);
+              setMenuOpen(true);
+              setMenuIdx(0);
               e.target.style.height = "auto";
               e.target.style.height = `${Math.min(e.target.scrollHeight, 176)}px`;
             }}
             onKeyDown={(e) => {
+              if (menuActive) {
+                if (e.key === "ArrowDown") {
+                  e.preventDefault();
+                  setMenuIdx((i) => (i + 1) % suggestions.length);
+                  return;
+                }
+                if (e.key === "ArrowUp") {
+                  e.preventDefault();
+                  setMenuIdx((i) => (i - 1 + suggestions.length) % suggestions.length);
+                  return;
+                }
+                if (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing)) {
+                  e.preventDefault();
+                  applySuggestion(suggestions[activeIdx]!);
+                  return;
+                }
+                if (e.key === "Escape") {
+                  e.preventDefault();
+                  setMenuOpen(false);
+                  return;
+                }
+              }
               if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
                 e.preventDefault();
                 submit();
@@ -193,7 +272,7 @@ export function Composer({
           </button>
         </div>
         <div className="mt-1.5 text-center text-[11px] text-ink-3">
-          Enter 发送 · Shift+Enter 换行{running ? " · 运行中的消息将作为引导注入下一步" : " · 可拖拽/粘贴附件"}
+          Enter 发送 · Shift+Enter 换行{running ? " · 运行中的消息将作为引导注入下一步" : " · 输入 / 唤起命令 · 可拖拽/粘贴附件"}
         </div>
       </div>
     </div>

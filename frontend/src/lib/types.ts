@@ -61,6 +61,16 @@ export interface ApprovalInfo {
   deadline: number;
 }
 
+/** Plan 确认门（方案 1）：/plan 回合的待决计划卡。
+ * 服务端超时 600s 按 deny 收场，本地到点只置灰按钮。 */
+export interface PlanProposal {
+  id: string;
+  /** planner 产出的计划全文（已在消息流中直播过，卡内再完整呈现） */
+  plan: string;
+  /** 绝对截止时间（ms） */
+  deadline: number;
+}
+
 /** BudgetGuard.snapshot() 帧（含 cost_cap_enforceable 标记）。 */
 export type BudgetSnapshot = Record<string, any>;
 
@@ -73,6 +83,8 @@ export interface ChatState {
   items: ChatItem[];
   cards: Record<string, ToolCard>;
   approval: ApprovalInfo | null;
+  /** Plan 确认门待决计划（/plan 回合中间态，result 帧清除） */
+  plan: PlanProposal | null;
   budget: BudgetSnapshot | null;
   phase: ChatPhase;
   error: string | null;

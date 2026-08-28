@@ -272,9 +272,19 @@ def main() -> None:
             # 必须以直播形式路由到重连后的新 socket——发射路径绑死旧 socket
             # 的缺陷（attach 只补快照、尾流进尸体连接）只有这个顺序能抓出。
             deadline = time.time() + 25
+            next_probe = time.time()  # 每 2s 打一份页面内重连机器快照
             while time.time() < deadline:
                 if any('"action":"attach"' in f for f in SENT_FRAMES):
                     break
+                if time.time() >= next_probe:
+                    try:
+                        snap = page.evaluate(
+                            "window.__chatDebug ? window.__chatDebug() : 'no-debug-hook'"
+                        )
+                    except Exception as exc:  # noqa: BLE001
+                        snap = f"evaluate 失败：{exc}"
+                    print(f"[dbg] {json.dumps(snap, ensure_ascii=False)}")
+                    next_probe = time.time() + 2
                 time.sleep(0.1)
             else:
                 # 诊断三连：浏览器帧、服务端日志、以及旁路探针——用第二个

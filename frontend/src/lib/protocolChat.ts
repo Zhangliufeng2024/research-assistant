@@ -19,6 +19,10 @@ import type {
 
 export const APPROVAL_TIMEOUT_S = 120;
 
+/** Plan 门（方案 1）本地倒计时口径；与后端 PLAN_DECISION_TIMEOUT_S 对齐。
+ * 到点只置灰按钮——真正的超时裁决由服务端做出（按 deny 收场）。 */
+export const PLAN_DECISION_TIMEOUT_S = 600;
+
 export function emptyChat(): ChatState {
   return {
     sessionId: null,
@@ -26,6 +30,7 @@ export function emptyChat(): ChatState {
     items: [],
     cards: {},
     approval: null,
+    plan: null,
     budget: null,
     phase: "idle",
     error: null,
@@ -192,6 +197,33 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
       return c;
     }
 
+    case "command": {
+      // 方案 4：slash 命令回执（不占回合、不落史）。raw=用户原文渲染成
+      // 普通用户气泡，message=服务端确认文案渲染成助手文本；chatStore 在
+      // 发送命令时不做乐观上屏，两端在这里汇合。
+      const raw = typeof msg.raw === "string" ? msg.raw : "";
+      const message = typeof msg.message === "string" ? msg.message : "";
+      if (!raw && !message) return prev;
+      const c = clone(prev);
+      if (raw) c.items.push({ kind: "user", text: raw, t: Date.now() });
+      if (message) c.items.push({ kind: "text", text: message, t: Date.now() });
+      return c;
+    }
+
+    case "plan_proposal": {
+      // 方案 1：/plan 回合的待决计划。计划全文已在 text 帧里直播过，
+      // 卡片再完整呈现一次供确认；deadline 只用于本地置灰，超时裁决
+      // 由服务端做出（按 deny 收场并发 result 帧）。
+      if (!msg.id) return prev;
+      const c = clone(prev);
+      c.plan = {
+        id: msg.id,
+        plan: typeof msg.plan === "string" ? msg.plan : "",
+        deadline: Date.now() + PLAN_DECISION_TIMEOUT_S * 1000,
+      };
+      return c;
+    }
+
     case "result": {
       const c = clone(prev);
       // 后端口径：result 是唯一收尾帧。stop_reason=error 时终态就是出错——
@@ -216,6 +248,7 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
         }
       }
       c.approval = null;
+      c.plan = null; // Plan 门随回合终态一并收场（拒绝/超时/批准执行完）
       return c;
     }
 
