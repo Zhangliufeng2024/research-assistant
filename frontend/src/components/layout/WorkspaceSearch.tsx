@@ -11,10 +11,12 @@ import { IconBell } from "@/components/icons";
 import { api } from "@/lib/api";
 import { usePendingApprovalCount } from "@/stores/approvalSignal";
 import {
+  mergeArtifactHits,
   moveHighlight,
   pickEnterIndex,
   SEARCH_KIND_LABELS,
   searchHitPath,
+  type ArtifactRow,
   type SearchHit,
 } from "./workspaceSearchModel";
 
@@ -68,14 +70,19 @@ export function WorkspaceSearch() {
       setHits([]);
       return;
     }
-    const timer = window.setTimeout(
-      () =>
-        void api
-          .get<SearchHit[]>(`/api/project/search?q=${encodeURIComponent(query.trim())}&limit=20`)
-          .then(setHits)
-          .catch(() => setHits([])),
-      180,
-    );
+    const timer = window.setTimeout(() => {
+      // 迭代2：项目对象检索 + 产物文件检索并行；产物命中置前（可直达会话）
+      const q = encodeURIComponent(query.trim());
+      void Promise.all([
+        api.get<SearchHit[]>(`/api/project/search?q=${q}&limit=20`).catch(() => []),
+        api
+          .get<{ artifacts?: ArtifactRow[] }>(`/api/search?scope=artifacts&q=${q}&limit=8`)
+          .then((r) => r.artifacts ?? [])
+          .catch(() => [] as ArtifactRow[]),
+      ]).then(([base, artifacts]) => {
+        setHits(mergeArtifactHits(base, artifacts));
+      });
+    }, 180);
     return () => window.clearTimeout(timer);
   }, [open, query]);
 

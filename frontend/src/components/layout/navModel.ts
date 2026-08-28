@@ -37,7 +37,8 @@ export const NAV_ITEMS: readonly NavItemDef[] = [
     to: "/tasks",
     label: "任务中心",
     icon: IconTasks,
-    match: ["/tasks", "/scheduler", "/analysis"],
+    // 迭代2：通知中心并入任务中心组（5 分区：进行中/看板/计划/历史/通知）
+    match: ["/tasks", "/scheduler", "/analysis", "/notifications"],
   },
   {
     to: "/research",
@@ -93,15 +94,20 @@ interface GroupLayoutRule {
   layout: GroupLayoutDef;
 }
 
-/** 三个聚合组的共享 tab 条定义；顺序即展示顺序。 */
+/** 三个聚合组的共享 tab 条定义；顺序即展示顺序。
+ * 迭代2：任务中心按 5 分区 IA 重组（进行中/看板/计划/历史/通知），
+ * 分析运行保留为第六 tab（既有功能不缩水）。 */
 const GROUP_LAYOUT_RULES: readonly GroupLayoutRule[] = [
   {
-    match: ["/tasks", "/scheduler", "/analysis"],
+    match: ["/tasks", "/scheduler", "/analysis", "/notifications"],
     layout: {
       key: "task-center",
       tabs: [
-        { to: "/tasks", label: "任务" },
-        { to: "/scheduler", label: "运行队列" },
+        { to: "/tasks", label: "进行中" },
+        { to: "/tasks/board", label: "看板" },
+        { to: "/scheduler", label: "计划" },
+        { to: "/tasks/history", label: "历史" },
+        { to: "/notifications", label: "通知" },
         { to: "/analysis", label: "分析运行" },
       ],
     },

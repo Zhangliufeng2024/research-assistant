@@ -9,6 +9,8 @@ export interface SearchHit {
   id: string;
   title?: string;
   detail?: string;
+  /** 迭代2：产物文件命中携带所属会话（深链直达该会话）。 */
+  sessionId?: string;
 }
 
 export const SEARCH_KIND_LABELS: Record<string, string> = {
@@ -19,15 +21,53 @@ export const SEARCH_KIND_LABELS: Record<string, string> = {
   claim: "主张",
   decision: "决策",
   artifact: "产物",
+  artifact_file: "产物文件",
 };
 
-/** 命中 → 深链：线程直达详情，其余落对应成员页（R15 收敛后仍全量保留路由）。 */
+/** 命中 → 深链：线程直达详情，产物文件直达所属会话，其余落对应成员页。 */
 export function searchHitPath(hit: SearchHit): string {
   if (hit.kind === "thread") return `/threads/${hit.id}`;
+  if (hit.kind === "artifact_file" && hit.sessionId) {
+    return `/chat/${encodeURIComponent(hit.sessionId)}`;
+  }
   if (hit.kind === "artifact") return "/artifacts";
   if (hit.kind === "source") return "/sources";
   if (hit.kind === "task") return "/tasks";
   return "/research";
+}
+
+/** /api/search?scope=artifacts 的行结构。 */
+export interface ArtifactRow {
+  session_id: string;
+  path: string;
+  name: string;
+  ext: string;
+  size: number;
+}
+
+/** 迭代2：把产物文件行并入命中列表（去重、artifact_file 在前便于直达）。
+ * 纯函数，node 可测。 */
+export function mergeArtifactHits(
+  base: SearchHit[],
+  artifacts: ArtifactRow[],
+  cap = 8,
+): SearchHit[] {
+  const seen = new Set(base.map((h) => `${h.kind}:${h.id}`));
+  const extra: SearchHit[] = [];
+  for (const row of artifacts) {
+    const key = `artifact_file:${row.session_id}/${row.path}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    extra.push({
+      kind: "artifact_file",
+      id: key,
+      title: row.name,
+      detail: row.path,
+      sessionId: row.session_id,
+    });
+    if (extra.length >= cap) break;
+  }
+  return [...extra, ...base];
 }
 
 /**

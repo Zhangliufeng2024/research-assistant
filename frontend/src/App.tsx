@@ -21,6 +21,12 @@ const ProjectHomeView = lazy(() =>
 );
 const ChatView = lazy(() => import("@/views/ChatView").then((m) => ({ default: m.ChatView })));
 const TasksView = lazy(() => import("@/views/TasksView").then((m) => ({ default: m.TasksView })));
+const TaskBoardView = lazy(() =>
+  import("@/views/TaskBoardView").then((m) => ({ default: m.TaskBoardView })),
+);
+const TaskHistoryView = lazy(() =>
+  import("@/views/TaskHistoryView").then((m) => ({ default: m.TaskHistoryView })),
+);
 const SchedulerView = lazy(() =>
   import("@/views/SchedulerView").then((m) => ({ default: m.SchedulerView })),
 );
@@ -70,6 +76,8 @@ export default function App() {
                     读取 :sessionId 并触发 openSession。 */}
                 <Route path="/chat/:sessionId" element={<ChatView />} />
                 <Route path="/tasks" element={<TasksView />} />
+                <Route path="/tasks/board" element={<TaskBoardView />} />
+                <Route path="/tasks/history" element={<TaskHistoryView />} />
                 <Route path="/scheduler" element={<SchedulerView />} />
                 <Route path="/papers" element={<PapersView />} />
                 <Route path="/sources" element={<SourcesView />} />

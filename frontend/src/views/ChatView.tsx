@@ -21,6 +21,13 @@ import { Composer } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
 import { MessageList } from "@/components/chat/MessageList";
 import { SessionList } from "@/components/chat/SessionList";
+import {
+  PeerSessionPanel,
+  loadPeerSessionId,
+  loadSplitOpen,
+  savePeerSessionId,
+  saveSplitOpen,
+} from "@/components/chat/PeerSessionPanel";
 import { WorkspaceModal } from "@/components/chat/WorkspaceModal";
 
 const PHASE_DOT: Record<string, string> = {
@@ -246,6 +253,32 @@ export function ChatView() {
           }
         : null;
 
+  // 迭代2：分屏对照——主区交互 + 右侧只读对照会话（纯 UI 偏好入 localStorage）
+  const [splitOpen, setSplitOpen] = useState<boolean>(loadSplitOpen);
+  const [peerSessionId, setPeerSessionId] = useState<string | null>(
+    loadPeerSessionId,
+  );
+  const toggleSplit = useCallback(() => {
+    setSplitOpen((prev) => {
+      const next = !prev;
+      saveSplitOpen(next);
+      return next;
+    });
+  }, []);
+  const pickPeer = useCallback((id: string) => {
+    setPeerSessionId(id);
+    savePeerSessionId(id);
+  }, []);
+  // 打开分屏且尚未选对照会话 → 默认取最近一个非当前会话
+  useEffect(() => {
+    if (!splitOpen || peerSessionId || sessions.length === 0) return;
+    const candidate =
+      sessions.find((s) => s.id !== chat.sessionId && !s.archived) ??
+      sessions.find((s) => s.id !== chat.sessionId);
+    if (candidate) pickPeer(candidate.id);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [splitOpen, peerSessionId, sessions]);
+
   return (
     <div className="flex h-full min-h-0">
       {/* 会话列表二级栏 */}
@@ -284,6 +317,19 @@ export function ChatView() {
                 <BudgetBar budget={chat.budget} />
               </div>
             )}
+            <button
+              type="button"
+              title={splitOpen ? "关闭分屏对照" : "分屏对照——右侧只读展示另一会话"}
+              aria-pressed={splitOpen}
+              onClick={toggleSplit}
+              className={`hidden rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors lg:block ${
+                splitOpen
+                  ? "border-accent/50 bg-accent-tint text-accent-hover dark:text-accent"
+                  : "border-edge bg-surface text-ink-3 hover:border-accent/40 hover:text-accent-hover dark:hover:text-accent"
+              }`}
+            >
+              分屏
+            </button>
             <button
               type="button"
               title={`过程显示档位：${VERBOSITY_LABEL[verbosity]}（点击切换）——简洁=过程全折叠；标准=运行中自动展开；调试=全展开含堆栈/全参数`}
@@ -482,6 +528,19 @@ export function ChatView() {
           · 点击更换
         </button>
       </div>
+
+      {/* 迭代2：分屏对照栏——只读第二会话（REST 快照 + 20s 轮询） */}
+      {splitOpen && (
+        <div className="hidden w-[360px] shrink-0 border-l border-edge xl:block">
+          <PeerSessionPanel
+            sessionId={peerSessionId}
+            sessions={sessions}
+            excludeId={chat.sessionId}
+            onPick={pickPeer}
+            onClose={toggleSplit}
+          />
+        </div>
+      )}
 
       {/* 右侧产出 dock（R12 P3）：常驻可折叠；折叠为细条，展开为文件树+预览 */}
       <div className="hidden shrink-0 border-l border-edge bg-canvas md:block">

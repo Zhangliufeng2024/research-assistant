@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 11
+SCHEMA_VERSION = 12
 PROJECT_OS_VERSION = 1
 
 
@@ -409,6 +409,18 @@ class PlatformStore:
                     archived INTEGER NOT NULL DEFAULT 0,
                     updated_at REAL NOT NULL
                 );
+                -- 迭代2：产物清单索引（manifest 端点回填，artifacts 检索 scope 用）。
+                CREATE TABLE IF NOT EXISTS artifacts (
+                    session_id TEXT NOT NULL,
+                    path TEXT NOT NULL,
+                    name TEXT NOT NULL,
+                    ext TEXT NOT NULL DEFAULT '',
+                    size INTEGER NOT NULL DEFAULT 0,
+                    mtime REAL NOT NULL DEFAULT 0,
+                    PRIMARY KEY(session_id, path)
+                );
+                CREATE INDEX IF NOT EXISTS idx_artifacts_name
+                    ON artifacts(name);
                 """
             )
             # ``CREATE TABLE IF NOT EXISTS`` does not evolve an existing
@@ -905,6 +917,50 @@ class PlatformStore:
                 "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
                 (f"setting.{key}", str(value)),
             )
+
+    # ------------------------------------------------------------------
+    # 迭代2：产物清单索引（会话 manifest 端点回填 → artifacts scope 检索）
+    # ------------------------------------------------------------------
+
+    def replace_artifacts(
+        self, session_id: str, entries: list[dict[str, Any]],
+    ) -> int:
+        """整会话替换产物索引（manifest 重建时调用；幂等）。"""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM artifacts WHERE session_id = ?", (session_id,))
+            conn.executemany(
+                "INSERT OR REPLACE INTO artifacts(session_id, path, name, ext, size, mtime) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                [
+                    (
+                        session_id,
+                        str(e.get("path") or ""),
+                        str(e.get("name") or ""),
+                        str(e.get("ext") or ""),
+                        int(e.get("size") or 0),
+                        float(e.get("mtime") or 0.0),
+                    )
+                    for e in entries
+                ],
+            )
+            return len(entries)
+
+    def drop_artifacts(self, session_id: str) -> None:
+        """会话删除时同步清索引（防幽灵命中）。"""
+        with self._lock, self._connect() as conn:
+            conn.execute("DELETE FROM artifacts WHERE session_id = ?", (session_id,))
+
+    def search_artifacts(self, query: str, limit: int = 20) -> list[dict[str, Any]]:
+        """产物文件名/路径子串检索（前端 Ctrl+K 与 /api/search 的 artifacts scope）。"""
+        needle = f"%{query.strip()}%"
+        limit = max(1, min(int(limit), 100))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT session_id, path, name, ext, size, mtime FROM artifacts "
+                "WHERE name LIKE ? OR path LIKE ? ORDER BY mtime DESC LIMIT ?",
+                (needle, needle, limit),
+            ).fetchall()
+        return [dict(r) for r in rows]
 
     def set_session_flags(
         self,

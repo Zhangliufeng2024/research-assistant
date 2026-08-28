@@ -361,7 +361,8 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 | POST | `/api/chat/sessions/{id}/promote`（R17） | body 可选 `{"prompt"?: str, "workflow_id"?: str=single}` | `{ok:true, job_id, workflow_id}`；把最近 ≤20 条对话（总量 ≤6000 字符）打包进任务 query 并入队 scheduler 队列，payload 携 `source_session_id`——任务落库带来源锚点（列表徽标/详情回链的支点）；会话不存在 404、非法 ID 403、无平台库 503 |
 | GET | `/api/runs/search`（R17） | query: `q?`, `status?`, `limit?≤200=50`, `offset?=0` | `{total, items:[task...], limit, offset}`；历史运行的标题子串+状态过滤+分页检索（替换前端 slice(0,20) 硬截断）；task 对象含 R17 新增 `source_session_id` 字段（旧任务为 null） |
 | GET/PUT | `/api/settings/{key}`（R17） | PUT body `{"value": str}`（缺失 422） | `{key, value}` / `{ok, key, value}`；跨端 UI 设置（如 `ui.verbosity` 显示档位），存 platform.sqlite3 meta 表（`setting.` 前缀） |
-| GET | `/api/search`（R17） | query: `q`(必填非空), `scope?=all\|sessions\|tasks`, `limit?=20` | `{sessions:[{id,title,updated_at}], tasks:[task...]}`；统一检索入口（Ctrl+K 与历史页共用），产物文件检索待 artifacts 索引落地后并入 |
+| GET | `/api/search`（R17；迭代2 扩展） | query: `q`(必填非空), `scope?=all\|sessions\|tasks\|artifacts`, `limit?=20` | `{sessions:[{id,title,updated_at}], tasks:[task...], artifacts:[{session_id,path,name,ext,size,mtime}]}`；统一检索入口（Ctrl+K 与历史页共用）；artifacts scope 读 platform.sqlite3 artifacts 索引（由 manifest 端点回填） |
+| GET | `/api/chat/sessions/{id}/manifest`（迭代2） | — | `{session_id, count, files:[{path,name,ext,size,mtime}]}`；懒重建会话产物清单（mtime 倒序，截 500 条），落盘 `outputs/<sid>/manifest.json` 并整表回填 artifacts 索引（`replace_artifacts`）；删除会话时索引同步清除（`drop_artifacts`，防检索幽灵命中）；会话不存在 404、非法 ID 403 |
 | PATCH/DELETE | `/api/scheduler/triggers/{id}`（R17） | PATCH body `{"enabled": bool}`（缺失 422） | PATCH 回触发器对象、DELETE 回 `{ok:true}`；触发器启停与删除（此前 enabled 只读、无删除入口）；跨项目操作一律 404（不存在口径） |
 
 历史治理端点共用一套口径：非法 ID 403、未知/墓碑会话 404；改历史的两个端点（truncate /

@@ -579,6 +579,78 @@ async def promote_session_to_task(session_id: str, request: Request):
     return {"ok": True, "job_id": job.get("id"), "workflow_id": workflow_id}
 
 
+#: 迭代2：会话产物清单（manifest）扫描上限——超出按 mtime 取最近 N 个，
+#: 防超大会话把索引/响应体撑爆。
+MANIFEST_MAX_FILES = 500
+MANIFEST_NAME = "manifest.json"
+
+
+def _scan_outputs_for_manifest(outputs_dir: Path) -> list[dict[str, Any]]:
+    """递归扫描会话产物目录，返回清单条目（mtime 倒序，截 MANIFEST_MAX_FILES）。"""
+    entries: list[dict[str, Any]] = []
+    for p in outputs_dir.rglob("*"):
+        if not p.is_file() or p.name == MANIFEST_NAME:
+            continue
+        try:
+            st = p.stat()
+        except OSError:
+            continue
+        rel = p.relative_to(outputs_dir).as_posix()
+        entries.append({
+            "path": rel,
+            "name": p.name,
+            "ext": p.suffix.lower(),
+            "size": st.st_size,
+            "mtime": st.st_mtime,
+        })
+    entries.sort(key=lambda e: e["mtime"], reverse=True)
+    return entries[:MANIFEST_MAX_FILES]
+
+
+@router.get("/chat/sessions/{session_id}/manifest")
+async def get_session_manifest(session_id: str, request: Request):
+    """迭代2：会话产物清单（懒生成 + 落盘 manifest.json + 回填 artifacts 索引）。
+
+    清单是产物级检索（/api/search?scope=artifacts）的数据源；每次调用都
+    重建（产物是运行期持续变化的），manifest.json 仅供人读/调试。
+    """
+    try:
+        run_dir = _resolve_session_dir(_cwd_of(request), session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+
+    cwd = _cwd_of(request)
+    state = _load_run_state(run_dir) or {}
+    outputs_rel = state.get("outputs_dir")
+    outputs_dir = (cwd / outputs_rel) if outputs_rel else (_outputs_root(cwd) / session_id)
+    if not outputs_dir.is_dir():
+        return {"session_id": session_id, "count": 0, "files": []}
+
+    files = await asyncio.to_thread(_scan_outputs_for_manifest, outputs_dir)
+
+    def _write_manifest() -> None:
+        # manifest.json 落盘失败不阻断响应（artifacts 索引回填才是权威路径）
+        try:
+            atomic_write_text(
+                outputs_dir / MANIFEST_NAME,
+                json.dumps(
+                    {"session_id": session_id, "generated_at": time.time(), "files": files},
+                    ensure_ascii=False, indent=2,
+                ),
+            )
+        except OSError:
+            pass
+
+    await asyncio.to_thread(_write_manifest)
+
+    store = getattr(request.app.state, "platform_store", None)
+    if store is not None:
+        await asyncio.to_thread(store.replace_artifacts, session_id, files)
+    return {"session_id": session_id, "count": len(files), "files": files}
+
+
 @router.get("/chat/sessions/{session_id}")
 async def get_session(session_id: str, request: Request):
     """取单个会话的全量归约历史（前端恢复聊天流用）。"""
@@ -651,6 +723,13 @@ async def delete_session(session_id: str, request: Request):
     shutil.rmtree(run_dir, ignore_errors=True)
     # R12 P2 双轨制：产物目录 1:1 归会话所有，显式删除时一并清掉
     shutil.rmtree(_outputs_root(_cwd_of(request)) / session_id, ignore_errors=True)
+    # 迭代2：产物索引同步清除（防 /api/search artifacts scope 幽灵命中）
+    _store = getattr(request.app.state, "platform_store", None)
+    if _store is not None:
+        try:
+            await asyncio.to_thread(_store.drop_artifacts, session_id)
+        except Exception:  # noqa: BLE001 —— 清索引失败不影响删除主流程
+            pass
     return {"ok": True}
 
 

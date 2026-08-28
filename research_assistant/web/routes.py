@@ -1393,12 +1393,13 @@ async def unified_search(request: Request, q: str = "", scope: str = "all", limi
     """R17：统一检索入口（Ctrl+K 与历史页共用）。
 
     scope: ``tasks``（标题，走 search_runs）| ``sessions``（会话目录标题）
-    | ``all``。产物文件检索待 manifest 全量落地后并入 artifacts scope。
+    | ``artifacts``（产物文件名/路径，读 artifacts 索引——由会话 manifest
+    端点回填，迭代2）| ``all``。
     """
     q = q.strip()
     if not q:
-        return {"sessions": [], "tasks": []}
-    result: dict[str, Any] = {"sessions": [], "tasks": []}
+        return {"sessions": [], "tasks": [], "artifacts": []}
+    result: dict[str, Any] = {"sessions": [], "tasks": [], "artifacts": []}
     cwd = getattr(request.app.state, "cwd", None) or Path.cwd()
     if scope in {"all", "sessions"}:
         sessions_root = cwd / ".ra" / "sessions"
@@ -1430,6 +1431,12 @@ async def unified_search(request: Request, q: str = "", scope: str = "all", limi
                 store.search_runs, project_id, query=q, limit=limit,
             )
             result["tasks"] = found["items"]
+    if scope in {"all", "artifacts"}:
+        store = getattr(request.app.state, "platform_store", None)
+        if store is not None:
+            result["artifacts"] = await asyncio.to_thread(
+                store.search_artifacts, q, limit,
+            )
     return result
 
 

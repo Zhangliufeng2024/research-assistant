@@ -37,10 +37,15 @@ describe("NAV_ITEMS（六项侧栏）", () => {
     expect(tos).toEqual(["/", "/chat", "/tasks", "/research", "/papers", "/settings"]);
   });
 
-  it("聚合组覆盖全部 9 个成员路由；独立项只认自己", () => {
+  it("聚合组覆盖全部成员路由；独立项只认自己", () => {
     const byTo = new Map(NAV_ITEMS.map((n) => [n.to, n]));
-    // 任务中心 = tasks + scheduler + analysis
-    expect(byTo.get("/tasks")!.match).toEqual(["/tasks", "/scheduler", "/analysis"]);
+    // 迭代2：任务中心 = tasks(+board/history) + scheduler + analysis + notifications
+    expect(byTo.get("/tasks")!.match).toEqual([
+      "/tasks",
+      "/scheduler",
+      "/analysis",
+      "/notifications",
+    ]);
     // 研究工作台 = research + threads + changes
     expect(byTo.get("/research")!.match).toEqual(["/research", "/threads", "/changes"]);
     // 资料库 = papers + sources + artifacts
@@ -96,11 +101,31 @@ describe("isNavActive（聚合组激活态）", () => {
 });
 
 describe("findGroupLayout（聚合组二级 tab）", () => {
-  it("任务中心组：三 tab 且顺序稳定", () => {
+  it("任务中心组：5 分区 + 分析运行，顺序稳定（迭代2）", () => {
     const layout = findGroupLayout("/scheduler");
     expect(layout?.key).toBe("task-center");
-    expect(layout?.tabs.map((t) => t.to)).toEqual(["/tasks", "/scheduler", "/analysis"]);
-    expect(layout?.tabs.map((t) => t.label)).toEqual(["任务", "运行队列", "分析运行"]);
+    expect(layout?.tabs.map((t) => t.to)).toEqual([
+      "/tasks",
+      "/tasks/board",
+      "/scheduler",
+      "/tasks/history",
+      "/notifications",
+      "/analysis",
+    ]);
+    expect(layout?.tabs.map((t) => t.label)).toEqual([
+      "进行中",
+      "看板",
+      "计划",
+      "历史",
+      "通知",
+      "分析运行",
+    ]);
+  });
+
+  it("任务中心新分区路由命中同一组", () => {
+    expect(findGroupLayout("/tasks/board")?.key).toBe("task-center");
+    expect(findGroupLayout("/tasks/history")?.key).toBe("task-center");
+    expect(findGroupLayout("/notifications")?.key).toBe("task-center");
   });
 
   it("研究工作台组含线程深链页", () => {
@@ -117,8 +142,8 @@ describe("findGroupLayout（聚合组二级 tab）", () => {
     expect(findGroupLayout("/artifacts")?.tabs).toHaveLength(3);
   });
 
-  it("非聚合页返回 null（总览/会话/通知/设置不挂 tab 条）", () => {
-    for (const p of ["/", "/chat", "/notifications", "/settings"]) {
+  it("非聚合页返回 null（总览/会话/设置不挂 tab 条）", () => {
+    for (const p of ["/", "/chat", "/settings"]) {
       expect(findGroupLayout(p)).toBeNull();
     }
   });
