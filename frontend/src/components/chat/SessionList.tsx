@@ -5,11 +5,10 @@ import type { SessionSummary } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
 import { toast } from "@/stores/toastStore";
 import {
-  archiveId,
+  ARCHIVED_SESSIONS_KEY,
   loadArchivedIds,
-  saveArchivedIds,
-  unarchiveId,
 } from "@/components/chat/sessionArchive";
+import { groupSessions } from "@/components/chat/sessionGroups";
 import {
   filterSessions,
   sessionDisplayTitle,
@@ -66,16 +65,16 @@ export function SessionList({
     {},
   );
 
-  // ---- C 归档（localStorage 持久化 + 列表内临时撤销条）--------------------
-  const [archivedIds, setArchivedIds] = useState<string[]>(() =>
-    loadArchivedIds(),
-  );
+  // ---- C 归档/置顶（R17：服务端持久化 platform.sqlite3，跨端可见）--------
+  // 归档集合直接派生自服务端下发的 archived 标志；localStorage 旧方案
+  // 仅在首次挂载时做一次性迁移（见下方 useEffect）。
   const [showArchived, setShowArchived] = useState(false);
   const [pendingArchive, setPendingArchive] = useState<{
     id: string;
     title: string;
   } | null>(null);
   const undoTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const migratedRef = useRef(false);
 
   // ---- D 两段式删除确认 ---------------------------------------------------
   const [confirmDeleteId, setConfirmDeleteId] = useState<string | null>(null);
@@ -94,6 +93,39 @@ export function SessionList({
     [],
   );
 
+  // R17 一次性迁移：localStorage 旧归档 id 上报服务端后清除本地 key。
+  // 标记键防重复执行；失败静默（下次挂载重试），绝不影响列表渲染。
+  useEffect(() => {
+    if (migratedRef.current || sessions.length === 0) return;
+    migratedRef.current = true;
+    try {
+      const MARK = "ra.flags-migrated.v1";
+      if (localStorage.getItem(MARK)) return;
+      const legacyIds = loadArchivedIds();
+      localStorage.setItem(MARK, "1");
+      if (legacyIds.length === 0) return;
+      const known = new Set(sessions.map((s) => s.id));
+      const pending = legacyIds.filter((id) => known.has(id));
+      if (pending.length === 0) {
+        localStorage.removeItem(ARCHIVED_SESSIONS_KEY);
+        return;
+      }
+      void Promise.allSettled(
+        pending.map((id) =>
+          api.post(`/api/chat/sessions/${encodeURIComponent(id)}/flags`, {
+            archived: true,
+          }),
+        ),
+      ).then(() => {
+        localStorage.removeItem(ARCHIVED_SESSIONS_KEY);
+        useChatStore.getState().refreshSessions().catch(() => {});
+      });
+    } catch {
+      /* 隐私模式等：放弃迁移，不影响使用 */
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [sessions]);
+
   // 重命名覆盖层并入摘要：渲染 / 过滤 / 撤销条共用同一标题口径
   const decorated = useMemo(
     () =>
@@ -104,7 +136,10 @@ export function SessionList({
       ),
     [sessions, titleOverrides],
   );
-  const archivedSet = useMemo(() => new Set(archivedIds), [archivedIds]);
+  const archivedSet = useMemo(
+    () => new Set(decorated.filter((s) => s.archived).map((s) => s.id)),
+    [decorated],
+  );
   const visible = useMemo(
     () => filterSessions(decorated.filter((s) => !archivedSet.has(s.id)), query),
     [decorated, archivedSet, query],
@@ -113,7 +148,13 @@ export function SessionList({
     () => decorated.filter((s) => archivedSet.has(s.id)),
     [decorated, archivedSet],
   );
+  // R17 时间分组：置顶/今天/本周/更早（仅渲染分段；visible 保持扁平供键盘导航）
+  const groups = useMemo(() => groupSessions(visible), [visible]);
   const archivedShown = showArchived ? filterSessions(archivedList, query) : [];
+  const indexOfId = useMemo(
+    () => new Map(visible.map((s, i) => [s.id, i])),
+    [visible],
+  );
   const hi =
     visible.length > 0 ? Math.min(highlight, visible.length - 1) : -1;
 
@@ -208,9 +249,24 @@ export function SessionList({
     );
   };
 
-  const persistArchived = (ids: string[]) => {
-    setArchivedIds(ids);
-    saveArchivedIds(ids); // 写失败静默降级：本次内存态仍生效，仅不跨刷新
+  /** R17：标志位写服务端，随后经 refreshSessions 对齐列表（失败提示并回滚靠刷新）。 */
+  const postFlags = async (
+    id: string,
+    flags: { pinned?: boolean; archived?: boolean },
+  ) => {
+    try {
+      await api.post(
+        `/api/chat/sessions/${encodeURIComponent(id)}/flags`,
+        flags,
+      );
+      useChatStore.getState().refreshSessions().catch(() => {});
+      return true;
+    } catch (exc) {
+      toast.error(
+        `操作失败：${exc instanceof Error ? exc.message : "未知错误"}`,
+      );
+      return false;
+    }
   };
 
   const handleArchive = (s: SessionSummary) => {
@@ -218,7 +274,7 @@ export function SessionList({
       toast.info("生成中的会话不能归档——请等回合结束后再试");
       return;
     }
-    persistArchived(archiveId(archivedIds, s.id));
+    void postFlags(s.id, { archived: true });
     if (renaming?.id === s.id) setRenaming(null);
     setPendingArchive({ id: s.id, title: sessionDisplayTitle(s) });
     if (undoTimer.current) clearTimeout(undoTimer.current);
@@ -226,11 +282,15 @@ export function SessionList({
   };
 
   const handleUnarchive = (id: string) => {
-    persistArchived(unarchiveId(archivedIds, id));
+    void postFlags(id, { archived: false });
     if (pendingArchive?.id === id) {
       if (undoTimer.current) clearTimeout(undoTimer.current);
       setPendingArchive(null);
     }
+  };
+
+  const handleTogglePin = (s: SessionSummary) => {
+    void postFlags(s.id, { pinned: !s.pinned });
   };
 
   const refFor = (id: string) => (el: HTMLDivElement | null) => {
@@ -347,28 +407,36 @@ export function SessionList({
             </div>
           )}
 
-        {visible.map((s, i) => (
-          <SessionItem
-            key={s.id}
-            session={s}
-            title={sessionDisplayTitle(s)}
-            active={s.id === activeId}
-            highlighted={i === hi}
-            running={busySessionId === s.id}
-            editingValue={renaming?.id === s.id ? renaming.value : null}
-            confirmingDelete={confirmDeleteId === s.id}
-            archived={false}
-            onRenameInput={(value) =>
-              setRenaming((r) => (r ? { ...r, value } : r))
-            }
-            onSubmitRename={() => void submitRename()}
-            onCancelRename={() => setRenaming(null)}
-            onStartRename={startRename}
-            onOpen={onOpen}
-            onToggleArchive={handleArchive}
-            onDeleteClick={handleDeleteClick}
-            refFn={refFor(s.id)}
-          />
+        {groups.map((g) => (
+          <div key={g.key}>
+            <div className="px-3 pb-0.5 pt-2 text-[10.5px] font-medium uppercase tracking-wide text-ink-3">
+              {g.label}
+            </div>
+            {g.items.map((s) => (
+              <SessionItem
+                key={s.id}
+                session={s}
+                title={sessionDisplayTitle(s)}
+                active={s.id === activeId}
+                highlighted={indexOfId.get(s.id) === hi}
+                running={busySessionId === s.id}
+                editingValue={renaming?.id === s.id ? renaming.value : null}
+                confirmingDelete={confirmDeleteId === s.id}
+                archived={false}
+                onRenameInput={(value) =>
+                  setRenaming((r) => (r ? { ...r, value } : r))
+                }
+                onSubmitRename={() => void submitRename()}
+                onCancelRename={() => setRenaming(null)}
+                onStartRename={startRename}
+                onOpen={onOpen}
+                onToggleArchive={handleArchive}
+                onTogglePin={handleTogglePin}
+                onDeleteClick={handleDeleteClick}
+                refFn={refFor(s.id)}
+              />
+            ))}
+          </div>
         ))}
 
         {/* 归档撤销条（C）：toast 不支持携带按钮，用列表内临时条实现「已归档 + 撤销」 */}
@@ -428,6 +496,7 @@ export function SessionList({
                     onStartRename={startRename}
                     onOpen={onOpen}
                     onToggleArchive={(target) => handleUnarchive(target.id)}
+                    onTogglePin={handleTogglePin}
                     onDeleteClick={handleDeleteClick}
                     refFn={refFor(`archived-${s.id}`)}
                   />
@@ -496,6 +565,7 @@ function SessionItem({
   onStartRename,
   onOpen,
   onToggleArchive,
+  onTogglePin,
   onDeleteClick,
   refFn,
 }: {
@@ -517,6 +587,8 @@ function SessionItem({
   onOpen: (id: string) => void;
   /** 主列表传归档、归档区传取消归档（同一位置的互逆操作）。 */
   onToggleArchive: (s: SessionSummary) => void;
+  /** R17：置顶切换（服务端持久化）。 */
+  onTogglePin: (s: SessionSummary) => void;
   onDeleteClick: (s: SessionSummary) => void;
   refFn: (el: HTMLDivElement | null) => void;
 }) {
@@ -575,6 +647,13 @@ function SessionItem({
             title={title}
           >
             {title}
+            {session.pinned && (
+              <svg viewBox="0 0 24 24" fill="currentColor" stroke="none"
+                className="ml-1.5 inline-block h-3 w-3 align-middle text-accent"
+                aria-label="已置顶" role="img">
+                <path d="M16 3a1 1 0 0 1 .8.4l3 4A1 1 0 0 1 19 9h-2v6l2 5a1 1 0 0 1-1 1H6a1 1 0 0 1-1-1l2-5V9H5a1 1 0 0 1-.8-1.6l3-4A1 1 0 0 1 8 3Z" transform="rotate(45 12 12)" />
+              </svg>
+            )}
             {running && (
               <span
                 className="ml-1.5 inline-block h-1.5 w-1.5 animate-pulse rounded-full bg-warn align-middle"
@@ -586,6 +665,23 @@ function SessionItem({
             <span>{formatRelative(session.updated_at)}</span>
             <span>·</span>
             <span>{session.turns} 轮</span>
+            {(session.derived_run_count ?? 0) > 0 && (
+              <>
+                <span>·</span>
+                <span
+                  className="inline-flex items-center gap-0.5 rounded-md bg-accent-tint px-1 py-px text-[10px] font-medium text-accent-hover dark:text-accent"
+                  title={`本会话派生了 ${session.derived_run_count} 个后台任务（见任务中心）`}
+                >
+                  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor"
+                    strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"
+                    className="h-2.5 w-2.5" aria-hidden>
+                    <path d="M12 2v4m0 12v4M2 12h4m12 0h4" />
+                    <circle cx="12" cy="12" r="3" />
+                  </svg>
+                  任务 {session.derived_run_count}
+                </span>
+              </>
+            )}
           </div>
         </button>
       )}
@@ -607,6 +703,21 @@ function SessionItem({
             </button>
           ) : (
             <>
+              <IconButton
+                title={session.pinned ? "取消置顶" : "置顶"}
+                onClick={() => onTogglePin(session)}
+              >
+                <svg viewBox="0 0 24 24"
+                  fill={session.pinned ? "currentColor" : "none"}
+                  stroke="currentColor"
+                  strokeWidth="1.75" strokeLinecap="round" strokeLinejoin="round"
+                  className={`h-3.5 w-3.5 ${session.pinned ? "text-accent" : ""}`}
+                  aria-hidden>
+                  <path d="M12 17v5" />
+                  <path d="M9 10.7a2 2 0 0 1-1-1.7V5h8v4a2 2 0 0 1-1 1.7L12 13Z" />
+                  <path d="M7 3h10" />
+                </svg>
+              </IconButton>
               <IconButton
                 title="重命名"
                 onClick={() => onStartRename(session)}

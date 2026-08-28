@@ -12,6 +12,7 @@ import asyncio
 import os
 import uuid
 from collections.abc import Awaitable, Callable
+from pathlib import Path
 from typing import Any
 
 from .platform_store import PlatformStore
@@ -31,10 +32,19 @@ def _prune_detached() -> None:
 
 class DurableScheduler:
     def __init__(self, store: PlatformStore, *, worker_id: str | None = None,
-                 poll_seconds: float = 2.0, max_concurrency: int | None = None) -> None:
+                 poll_seconds: float = 2.0, max_concurrency: int | None = None,
+                 janitor_cwd: Path | None = None) -> None:
         self.store = store
         self.worker_id = worker_id or f"worker-{uuid.uuid4().hex[:8]}"
         self.poll_seconds = max(0.25, float(poll_seconds))
+        # R17 Janitor：分层生命周期清理，挂调度器周期触发（默认每小时，
+        # RA_JANITOR_INTERVAL_SECONDS 可调，0 = 关闭）。
+        self.janitor_cwd = janitor_cwd
+        try:
+            self.janitor_interval = float(os.getenv("RA_JANITOR_INTERVAL_SECONDS", "3600"))
+        except ValueError:
+            self.janitor_interval = 3600.0
+        self._janitor_last = 0.0
         configured = max_concurrency
         if configured is None:
             try:
@@ -101,6 +111,7 @@ class DurableScheduler:
             await asyncio.to_thread(self.store.release_due_triggers)
             await asyncio.to_thread(self.store.recover_expired_jobs)
             await asyncio.to_thread(self.store.recover_expired_resource_leases)
+            await self._maybe_run_janitor()
             while len(self._active) < self.max_concurrency:
                 job = await asyncio.to_thread(self.store.claim_job, worker_id=self.worker_id)
                 if job is None:
@@ -119,6 +130,23 @@ class DurableScheduler:
             self._active.clear()
         else:
             self._park_active()
+
+    async def _maybe_run_janitor(self) -> None:
+        """按间隔触发 Janitor（独立 try：清理失败绝不影响调度主循环）。"""
+        if self.janitor_cwd is None or self.janitor_interval <= 0:
+            return
+        now = asyncio.get_running_loop().time()
+        if now - self._janitor_last < self.janitor_interval:
+            return
+        self._janitor_last = now
+        try:
+            from .janitor import run_janitor
+
+            await asyncio.to_thread(run_janitor, self.janitor_cwd, self.store)
+        except Exception:  # noqa: BLE001
+            import logging
+
+            logging.getLogger("ra.runtime.scheduler").exception("janitor 执行失败")
 
     async def tick(self) -> bool:
         await asyncio.to_thread(self.store.release_due_triggers)

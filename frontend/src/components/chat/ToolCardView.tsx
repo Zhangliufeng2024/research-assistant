@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { diffLines, diffStats, type DiffRow } from "@/lib/diff";
 import type { ToolCard as ToolCardData } from "@/lib/types";
+import { selectDebug, usePrefsStore } from "@/stores/prefsStore";
 
 const TOOL_LABELS: Record<string, string> = {
   write_file: "写入文件",
@@ -141,7 +142,9 @@ function StatusBadge({ status }: { status: string }) {
   return <span className="text-[11px] font-medium text-ok">✓ 完成</span>;
 }
 
-/** 工具调用卡：状态徽标 + 参数摘要；点击展开完整参数与结果预览。 */
+/** 工具调用卡：状态徽标 + 参数摘要；点击展开 diff 与结果预览。
+ * R17 思考链分级：完整参数 JSON 属 L2——仅「调试」档展示（此前展开即全文
+ * JSON.stringify，信噪比过低）；简洁/标准档展开区保留 diff + 结果预览。 */
 export function ToolCardView({
   card,
   onOpenFile,
@@ -150,6 +153,7 @@ export function ToolCardView({
   onOpenFile?: (path: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const debug = usePrefsStore(selectDebug);
   const summary = argsSummary(card);
 
   return (
@@ -179,7 +183,7 @@ export function ToolCardView({
           {diffInputsFor(card).map((d, i) => (
             <DiffBlock key={`${d.path}-${i}`} path={d.path} rows={d.rows} />
           ))}
-          {Object.keys(card.args).length > 0 && (
+          {debug && Object.keys(card.args).length > 0 && (
             <div>
               <div className="mb-1 text-[11px] font-medium text-ink-3">参数</div>
               <pre className="overflow-x-auto rounded-lg bg-surface-2 p-2.5 font-mono text-[11.5px] leading-5">

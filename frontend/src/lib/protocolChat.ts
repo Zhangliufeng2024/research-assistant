@@ -34,6 +34,7 @@ export function emptyChat(): ChatState {
     budget: null,
     phase: "idle",
     error: null,
+    errorTrace: null,
     stopReason: null,
     turns: 0,
     startedAt: null,
@@ -67,6 +68,7 @@ export function applyUserMessage(
   if (prev.phase !== "running") {
     c.phase = "running";
     c.error = null;
+    c.errorTrace = null;
     c.stopReason = null;
     c.turns = 0;
     c.startedAt = Date.now();
@@ -97,13 +99,19 @@ export function applySendFailure(prev: ChatState, message: string): ChatState {
 
 /* ---- 服务端消息归约 ---- */
 
-/** 文本增量：接续最后一个 text 气泡；被工具卡/用户消息打断后另起新气泡。 */
-function appendDelta(items: ChatItem[], delta: string): ChatItem[] {
+/** 文本增量：接续最后一个同 channel 的 text 气泡；被工具卡/用户消息/
+ * channel 切换打断后另起新气泡。R17：thought/plan channel 的气泡与正文
+ * 气泡互不合并（否则思考会拼接进正文 Markdown）。 */
+function appendDelta(
+  items: ChatItem[],
+  delta: string,
+  channel?: "thought" | "plan",
+): ChatItem[] {
   const last = items[items.length - 1];
-  if (last && last.kind === "text") {
-    return [...items.slice(0, -1), { kind: "text", text: last.text + delta, t: last.t }];
+  if (last && last.kind === "text" && last.channel === channel) {
+    return [...items.slice(0, -1), { kind: "text", text: last.text + delta, t: last.t, ...(channel ? { channel } : {}) }];
   }
-  return [...items, { kind: "text", text: delta, t: Date.now() }];
+  return [...items, { kind: "text", text: delta, t: Date.now(), ...(channel ? { channel } : {}) }];
 }
 
 function mergeFiles(oldFiles: FileRef[], incoming: unknown): FileRef[] {
@@ -144,8 +152,12 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
 
     case "text": {
       if (!msg.delta) return prev;
+      const channel =
+        msg.channel === "thought" || msg.channel === "plan"
+          ? (msg.channel as "thought" | "plan")
+          : undefined;
       const c = clone(prev);
-      c.items = appendDelta(c.items, msg.delta);
+      c.items = appendDelta(c.items, msg.delta, channel);
       return c;
     }
 
@@ -272,6 +284,8 @@ export function reduceChat(prev: ChatState, msg: ServerFrame): ChatState {
       // 的 result 又改写成 done，重放同一帧序同样复现。
       const c = clone(prev);
       c.error = msg.message || "未知错误";
+      // R17：可选 traceback 字段（L2 调试档展示堆栈；旧服务端无此字段归 null）
+      c.errorTrace = typeof msg.traceback === "string" ? msg.traceback : null;
       c.approval = null;
       return c;
     }

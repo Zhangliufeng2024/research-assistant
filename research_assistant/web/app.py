@@ -152,7 +152,7 @@ async def lifespan(app: FastAPI):
     app.state.platform_store = platform_store
     app.state.project = platform_store.ensure_project(cwd)
     app.state.task_hub = BackgroundTaskHub(platform_store)
-    app.state.scheduler = DurableScheduler(platform_store)
+    app.state.scheduler = DurableScheduler(platform_store, janitor_cwd=cwd)
     app.state.source_store = SourceStore(cwd / ".ra" / "sources.sqlite3")
     dispatchers, _dispatch = build_scheduler_dispatcher(
         store=platform_store,

@@ -165,6 +165,7 @@ class AnthropicClient(LLMClient):
         max_tokens: int = 16384,
         on_chunk: OnChunkCallback | None = None,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         base = self.base_url
         if not base.endswith("/v1"):
@@ -195,7 +196,7 @@ class AnthropicClient(LLMClient):
 
         if on_chunk is not None:
             body["stream"] = True
-            return await self._chat_streaming(url, headers, body, on_chunk, on_activity)
+            return await self._chat_streaming(url, headers, body, on_chunk, on_activity, on_thought)
 
         resp = await self._client.post(url, headers=headers, json=body)
 
@@ -212,6 +213,7 @@ class AnthropicClient(LLMClient):
         body: dict,
         on_chunk: OnChunkCallback,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         """Stream the Anthropic response via SSE, calling on_chunk for text deltas."""
         content_text = ""
@@ -290,6 +292,14 @@ class AnthropicClient(LLMClient):
                                 await result
                     elif delta.get("type") == "input_json_delta":
                         current_tool_json += delta.get("partial_json", "")
+                    elif delta.get("type") == "thinking_delta" and on_thought is not None:
+                        # R17 思考链（阶段4）：此前 thinking block 被静默丢弃。
+                        # 思考增量走独立回调——绝不混入 content_text（正文权威）。
+                        thinking = delta.get("thinking", "")
+                        if thinking:
+                            result = on_thought(thinking)
+                            if asyncio.iscoroutine(result):
+                                await result
 
                 elif etype == "content_block_stop":
                     if in_tool_block:

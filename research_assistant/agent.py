@@ -287,6 +287,7 @@ async def run_agent(
     temperature: float = 0.5,
     max_tokens: int = 16384,
     on_text: OnTextCallback | None = None,
+    on_thought: OnTextCallback | None = None,
     on_tool_use: OnToolCallback | None = None,
     on_tool_start: OnToolStartCallback | None = None,
     on_turn_start: OnTurnStartCallback | None = None,
@@ -308,6 +309,8 @@ async def run_agent(
         temperature: LLM temperature.
         max_tokens: Max tokens per LLM response.
         on_text: Callback for streaming text output.
+        on_thought: Callback for streaming reasoning/thinking deltas (R17).
+            Delivered on a separate channel; never part of the reply text.
         on_tool_use: Callback(tool_name, arguments, result) after tool execution.
         on_tool_start: Callback(tool_name, arguments) before tool execution.
         on_turn_start: Callback(turn, elapsed, usage) at start of each LLM call.
@@ -520,6 +523,11 @@ async def run_agent(
                 call_first_chunk_at = time.monotonic()
             await _maybe_await(on_text, chunk)
 
+        async def _stream_thought(chunk: str) -> None:
+            # R17：思考增量直通，不进重试发布追踪（thought 无需重发标注，
+            # 也绝不混入 reply 正文）。
+            await _maybe_await(on_thought, chunk)
+
         async def _do_call(
             watchdog=watchdog,
             messages=messages,
@@ -528,6 +536,8 @@ async def run_agent(
             kwargs: dict[str, Any] = {}
             if use_activity:
                 kwargs["on_activity"] = watchdog.beat
+            if on_thought is not None:
+                kwargs["on_thought"] = _stream_thought
             # watchdog 传入重试循环内部：监督每次尝试（R9，见函数 docstring）
             return await _llm_call_with_retry(
                 llm_client, messages, system_prompt, tool_schemas,

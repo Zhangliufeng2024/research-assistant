@@ -44,6 +44,7 @@ import os
 import re
 import shutil
 import time
+import traceback
 import uuid
 from collections import deque
 from dataclasses import dataclass, field
@@ -265,7 +266,15 @@ def _sessions_root(cwd: Path) -> Path:
 
 
 def _outputs_root(cwd: Path) -> Path:
-    """会话产物根（双轨制）：``<工作区>/outputs``。"""
+    """会话产物根（双轨制）。
+
+    R17 迁移期兼容：``.ra/outputs/`` 已存在（迁移脚本搬迁完成）则优先
+    使用新位置，否则回退旧的 ``<工作区>/outputs``——一个版本过渡期后
+    旧路径可下线。新会话产物始终写返回的根。
+    """
+    migrated = Path(cwd) / ".ra" / "outputs"
+    if migrated.is_dir():
+        return migrated
     return Path(cwd) / OUTPUTS_SUBDIR
 
 
@@ -426,6 +435,8 @@ async def list_sessions(request: Request):
     """全部会话摘要，按 updated_at 倒序（最近活跃在前）。
 
     零轮次且超过 ZERO_TURN_TTL_S 的残骸目录先被清退（§6.4）。
+    R17：合并 platform_store 的 pinned/archived 标志与派生任务计数——
+    置顶会话排在最前（组内仍按 updated_at 倒序），归档标志由前端分组。
     """
     root = _sessions_root(_cwd_of(request))
     _sweep_zero_turn_sessions(root, _outputs_root(_cwd_of(request)))
@@ -440,8 +451,132 @@ async def list_sessions(request: Request):
                 items.append(_session_summary(child))
             except OSError:
                 continue  # 并发删除等竞态：跳过即可
-    items.sort(key=lambda item: item.get("updated_at") or 0, reverse=True)
+    store = getattr(request.app.state, "platform_store", None)
+    if store is not None and items:
+        ids = [str(item["id"]) for item in items]
+        flags = await asyncio.to_thread(store.get_session_flags_map, ids)
+        counts = await asyncio.to_thread(store.count_tasks_for_sessions, ids)
+        for item in items:
+            meta = flags.get(str(item["id"])) or {}
+            item["pinned"] = bool(meta.get("pinned"))
+            item["archived"] = bool(meta.get("archived"))
+            item["derived_run_count"] = int(counts.get(str(item["id"])) or 0)
+    else:
+        for item in items:
+            item.setdefault("pinned", False)
+            item.setdefault("archived", False)
+            item.setdefault("derived_run_count", 0)
+    items.sort(
+        key=lambda item: (not item.get("pinned"), -(item.get("updated_at") or 0)),
+    )
     return items
+
+
+def _platform_of(request: Request):
+    """platform_store + project_id（无库降级 None，与 routes.py 口径一致）。"""
+    store = getattr(request.app.state, "platform_store", None)
+    project = getattr(request.app.state, "project", None) or {}
+    return store, project.get("id")
+
+
+@router.post("/chat/sessions/{session_id}/flags")
+async def set_session_flags(session_id: str, request: Request):
+    """R17：设置会话置顶/归档标志（持久在 platform.sqlite3，跨端可见）。
+
+    归档此前只写 localStorage（ra.archived-sessions.v1），换浏览器即丢；
+    本端点是唯一权威写入口。会话目录本身必须存在（防给杂散 id 立档）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or (
+        body.get("pinned") is None and body.get("archived") is None
+    ):
+        raise HTTPException(status_code=422, detail="需要 pinned 或 archived 字段")
+    try:
+        _resolve_session_dir(_cwd_of(request), session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    store, _ = _platform_of(request)
+    if store is None:
+        raise HTTPException(status_code=503, detail="平台存储不可用")
+    pinned = body.get("pinned")
+    archived = body.get("archived")
+    result = await asyncio.to_thread(
+        store.set_session_flags,
+        session_id,
+        pinned=None if pinned is None else bool(pinned),
+        archived=None if archived is None else bool(archived),
+    )
+    return {"ok": True, **result}
+
+
+#: 「转为任务」带入的对话上下文条数/总量上限：足够还原讨论主线，
+#: 又不至于把整段长对话塞进后台任务 prompt 烧预算。
+PROMOTE_CONTEXT_MESSAGES = 20
+PROMOTE_CONTEXT_CHARS = 6000
+
+
+@router.post("/chat/sessions/{session_id}/promote")
+async def promote_session_to_task(session_id: str, request: Request):
+    """R17：把当前对话转为后台任务（对话→任务互链的核心入口）。
+
+    打包最近对话上下文进任务 query，任务携 source_session_id 落库——
+    任务详情可回链本会话，会话列表显示派生任务徽标。执行走既有
+    scheduler 队列（workflow 默认 single，与后台任务同一条耐久链路）。
+    """
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    body = body if isinstance(body, dict) else {}
+    try:
+        run_dir = _resolve_session_dir(_cwd_of(request), session_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=403, detail="会话 ID 不合法") from exc
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail="会话不存在") from exc
+    store, project_id = _platform_of(request)
+    if store is None or not project_id:
+        raise HTTPException(status_code=503, detail="平台存储不可用")
+
+    state = _load_run_state(run_dir) or {}
+    title = str(state.get("query") or session_id).strip()
+    messages = _read_history(run_dir)
+    tail = messages[-PROMOTE_CONTEXT_MESSAGES:]
+    context_parts: list[str] = []
+    budget = PROMOTE_CONTEXT_CHARS
+    for msg in reversed(tail):  # 从最近往回装，预算用尽即止
+        role = "用户" if msg["role"] == "user" else "助手"
+        chunk = f"{role}: {msg['content'].strip()[:500]}"
+        if budget - len(chunk) < 0:
+            break
+        context_parts.append(chunk)
+        budget -= len(chunk)
+    context_parts.reverse()
+    context_block = "\n".join(context_parts)
+
+    goal = str(body.get("prompt") or "").strip()[:MAX_USER_LENGTH]
+    workflow_id = str(body.get("workflow_id") or "single").strip() or "single"
+    if goal:
+        query = goal
+    else:
+        query = f"继续完成会话「{title[:60]}」中的工作"
+    if context_block:
+        query += (
+            "\n\n[来源对话上下文（节选，仅供参考，勿逐条回复）]\n"
+            f"{context_block}"
+        )
+    job = await asyncio.to_thread(
+        store.enqueue_job,
+        project_id=project_id,
+        workflow_id=workflow_id,
+        payload={"query": query, "source_session_id": session_id},
+    )
+    return {"ok": True, "job_id": job.get("id"), "workflow_id": workflow_id}
 
 
 @router.get("/chat/sessions/{session_id}")
@@ -1372,6 +1507,25 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 handle.partial_text += delta
                 await _emit(handle, {"type": "text", "delta": delta})
 
+        async def _on_thought(handle: _TurnHandle, delta: str) -> None:
+            # R17 思考链（阶段4）：思考增量走 channel="thought" 的 text 帧——
+            # 不加新帧型（旧客户端忽略 channel 字段，语义等同正文前行为：
+            # 此前思考根本不显示）；绝不入账 partial_text（正文权威不含思考）。
+            if delta:
+                await _emit(
+                    handle, {"type": "text", "delta": delta, "channel": "thought"},
+                )
+
+        async def _on_plan_text(handle: _TurnHandle, delta: str) -> None:
+            # R17 思考链分级（阶段3）：planner 直播打 channel="plan" 标记，
+            # 前端据此折叠进 L1 过程区而非正文气泡；文本仍入账 partial_text
+            #（plan_proposal 的兜底来源，与 _on_text 口径一致）。
+            if delta:
+                handle.partial_text += delta
+                await _emit(
+                    handle, {"type": "text", "delta": delta, "channel": "plan"},
+                )
+
         async def _start_turn(
             text: str,
             attachments: list[dict],
@@ -1504,6 +1658,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                             initial_messages=history_prefix,
                         ),
                         on_text=lambda delta: _on_text(handle, delta),
+                        on_thought=lambda delta: _on_thought(handle, delta),
                         on_tool_start=_on_tool_start,
                         on_tool_use=_on_tool_use,
                         steer_queue=steers,
@@ -1551,7 +1706,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                             session_log=store,
                             initial_messages=history_prefix,
                         ),
-                        on_text=lambda delta: _on_text(handle, delta),
+                        on_text=lambda delta: _on_plan_text(handle, delta),
                     )
                     plan_text = (
                         (getattr(result, "text_output", "") or "")
@@ -1682,7 +1837,13 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     )
                     LOG.warning("回合失败 sid=%s 用时=%.1fs：%s",
                                 sid, time.monotonic() - turn_t0, str(failure)[:300])
-                    await _emit(handle, {"type": "error", "message": message})
+                    # R17 思考链分级：L0 给人性化摘要，traceback 作可选字段
+                    # 供「调试」档展示堆栈（协议新增可选字段，旧客户端忽略）。
+                    error_frame: dict[str, Any] = {"type": "error", "message": message}
+                    error_frame["traceback"] = "".join(
+                        traceback.format_exception(failure)
+                    )[-4000:]
+                    await _emit(handle, error_frame)
                 await _emit(
                     handle,
                     {

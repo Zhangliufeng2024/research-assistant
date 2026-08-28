@@ -1,6 +1,7 @@
 import { Fragment, type RefObject } from "react";
 import { LogoMark } from "@/components/icons";
 import { AssistantBubble, ToolCardRow, UserBubble } from "@/components/chat/MessageBubbles";
+import { ThinkingBlock } from "@/components/chat/ThinkingBlock";
 import type { MessageOpResult } from "@/lib/messageOps";
 import type { ChatState } from "@/lib/types";
 
@@ -94,6 +95,17 @@ export function MessageList({
                   key={`${item.t}-${i}`}
                   card={card}
                   onOpenFile={onOpenFile}
+                />
+              );
+            }
+            // R17 思考链分级：thought/plan channel 走 L1 折叠容器，不进正文气泡
+            if (item.kind === "text" && (item.channel === "thought" || item.channel === "plan")) {
+              return (
+                <ThinkingBlock
+                  key={`${item.t}-${i}`}
+                  text={item.text}
+                  running={chat.phase === "running" && i === lastIdx}
+                  variant={item.channel}
                 />
               );
             }

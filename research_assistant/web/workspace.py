@@ -273,7 +273,7 @@ async def switch_workspace_root(payload: SwitchRootPayload, request: Request):
     request.app.state.task_hub = BackgroundTaskHub(platform_store)
     from ..context import SourceStore
     request.app.state.source_store = SourceStore(target / ".ra" / "sources.sqlite3")
-    request.app.state.scheduler = DurableScheduler(platform_store)
+    request.app.state.scheduler = DurableScheduler(platform_store, janitor_cwd=target)
     dispatchers, _dispatch = build_scheduler_dispatcher(
         store=platform_store, hub=request.app.state.task_hub, cwd=target,
         project=request.app.state.project, source_store=request.app.state.source_store,

@@ -46,7 +46,16 @@ export type ChatItem =
       steer?: boolean;
       attachments?: AttachmentRef[];
     }
-  | { kind: "text"; text: string; t: number; /** 被打断/失败的残缺回答 */ partial?: boolean }
+  | {
+      kind: "text";
+      text: string;
+      t: number;
+      /** 被打断/失败的残缺回答 */
+      partial?: boolean;
+      /** R17 思考链分级：undefined=正文（L0 始终显示）；
+       * "thought"=模型思考（L1 默认折叠）；"plan"=planner 直播（L1 折叠区） */
+      channel?: "thought" | "plan";
+    }
   | { kind: "tool"; ref: string; t: number };
 
 export type ChatPhase = "idle" | "running" | "done" | "error";
@@ -88,6 +97,8 @@ export interface ChatState {
   budget: BudgetSnapshot | null;
   phase: ChatPhase;
   error: string | null;
+  /** R17：错误堆栈（L2 调试档展示；error 帧的可选 traceback 字段） */
+  errorTrace?: string | null;
   stopReason: string | null;
   turns: number;
   startedAt: number | null;
@@ -111,6 +122,12 @@ export interface SessionSummary {
   updated_at: number | string;
   /** 会话产物目录（相对 POSIX 路径）；B4 之前的旧会话为 null。 */
   outputs_dir?: string | null;
+  /** R17：置顶（持久在 platform.sqlite3，跨端可见；服务端已按 pinned 优先排序）。 */
+  pinned?: boolean;
+  /** R17：归档（替代旧 localStorage 方案，换浏览器不再丢失）。 */
+  archived?: boolean;
+  /** R17：本会话派生的后台任务数（对话↔任务互链徽标）。 */
+  derived_run_count?: number;
 }
 
 /* ---------- 任务（generate 流水线）状态 ---------- */

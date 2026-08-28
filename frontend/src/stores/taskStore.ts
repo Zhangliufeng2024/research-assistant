@@ -49,6 +49,8 @@ export interface DurableTask {
   status: string;
   created_at: number | string;
   updated_at: number | string;
+  /** R17：来源会话 id（对话→任务互链锚点；旧任务为 null/undefined）。 */
+  source_session_id?: string | null;
 }
 
 export interface WorkflowSummary {

@@ -27,7 +27,7 @@
 > `docs/protocol.md §5.4`。旧论文 pipeline、citation/doc gates、ArtifactStore 和
 > 产物变更恢复保持不变。
 
-> **统一 Agent 工作空间增量（2026-08-24）**：按 `plan260824.md` 完成第一轮可运行
+> **统一 Agent 工作空间增量（2026-08-24）**：按 `docs/plans/2026-08-24-plan.md` 完成第一轮可运行
 > 重构。数据库 schema v10 新增 Thread/Turn/AgentItem/AgentRun、QualityItem、ArtifactReview、通知、资源租约字段和持久化 Agent 审批收件箱；
 > 默认首页改为 Project Home，新增研究线程、证据矩阵和产物审阅入口。旧 chat/task/ws
 > 协议继续兼容，durable task 会自动映射到统一线程时间线。
@@ -344,7 +344,7 @@ source_integrity 风险回写，以及 Citation/Doc/复现门禁失败时禁止�
 后续路线（见 docs/protocol.md 与本文件历史）：用户可配置工作流持久化、真正的模型向量服务与
 跨项目知识图谱、增量质量门，以及多任务共享连接池与限流策略。
 
-## 当前闭环状态（plan260824.md 后续实施）
+## 当前闭环状态（docs/plans/2026-08-24-plan.md 后续实施）
 
 - `ArtifactReviewView` 已提供文件真实预览、版本 diff、provenance/质量门禁和审阅回写；
   `/api/artifacts/reviews/{id}/request-changes` 会写线程 Agent Item 与通知。

@@ -6,6 +6,7 @@ No SDK dependencies — uses the custom llm/ abstraction.
 
 import os
 import re
+import secrets
 from datetime import datetime
 from pathlib import Path
 
@@ -18,10 +19,19 @@ from .llm.factory import create_llm_client
 
 
 def generate_session_dir_name(query: str) -> str:
-    """Generate a timestamped directory name from a query string."""
+    """Generate a timestamped directory name from a query string.
+
+    R17：加 6 位随机后缀根治秒级并发撞名（生日界：同秒千级创建才有个位数
+    碰撞概率）；slug 保留 CJK 字符（中文查询不再退化为纯时间戳目录）。
+    """
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    slug = re.sub(r"[^a-zA-Z0-9]", "_", query.strip()[:40].lower()).strip("_")
-    return f"{timestamp}_{slug}"
+    slug = re.sub(
+        r"[^a-zA-Z0-9一-鿿]", "_", query.strip()[:40].lower(),
+    ).strip("_")
+    rand6 = f"{secrets.randbelow(16**6):06x}"
+    if slug:
+        return f"{timestamp}_{slug}_{rand6}"
+    return f"{timestamp}_{rand6}"
 
 
 def build_system_instructions(work_dir: Path, target_dir_name: str) -> str:
@@ -169,6 +179,19 @@ def resolve_model(model: str | None = None) -> str:
     if model:
         return model
     return os.getenv("LLM_MODEL") or DEFAULT_ANTHROPIC_MODEL
+
+
+def feature_flag(name: str, default: bool = False) -> bool:
+    """统一 feature flag 读取（R17 重构灰度用）。
+
+    环境变量命名 ``RA_FF_<NAME>``（name 传大写短名即可，如 ``"CHAT_TASK_LINK"``
+    → ``RA_FF_CHAT_TASK_LINK``）。值 ``1/true/yes/on`` 视为开启；未设置时
+    返回 ``default``。所有破坏性/行为变化型重构都必须挂 flag，先灰度后默认。
+    """
+    raw = os.getenv(f"RA_FF_{name.upper()}")
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
 def research_os_enabled() -> bool:

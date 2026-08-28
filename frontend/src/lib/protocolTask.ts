@@ -238,10 +238,29 @@ export function reduceTask(prev: TaskState, msg: ServerFrame): TaskState {
   }
 }
 
+/** R17 状态枚举收敛（3.2）：任务状态文案唯一来源。
+ * 队列/运行/三终态 + interrupted（进程中断，可恢复）。
+ * 「legacy/早期文档」不再作为状态出现——它不是状态而是数据来源标记，
+ * 需要时由列表行自行附加，不得占用状态徽标。 */
 export const RUN_STATUS_LABEL: Record<string, string> = {
+  queued: "排队中",
   running: "运行中",
-  complete: "完成",
+  stopping: "停止中",
+  complete: "已完成",
   failed: "失败",
-  cancelled: "已停止",
-  legacy: "早期文档",
+  cancelled: "已取消",
+  interrupted: "进程中断",
 };
+
+/** 终态集合：看板/状态带据此判断流转终点。 */
+export const TERMINAL_STATUSES: ReadonlySet<string> = new Set([
+  "complete",
+  "failed",
+  "cancelled",
+  "interrupted",
+]);
+
+/** 需要用户行动的状态（全局红点/看板独立列）。 */
+export const ACTIONABLE_STATUSES: ReadonlySet<string> = new Set([
+  "awaiting_approval",
+]);

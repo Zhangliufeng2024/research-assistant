@@ -205,6 +205,7 @@ def build_scheduler_dispatcher(*, store: PlatformStore, hub: BackgroundTaskHub,
             runner_factory=runner, output_dir=str(output_dir),
             metadata={"workflow_id": workflow_id, "scheduler_job_id": job.get("id"), "background": True},
             steps=[step.to_task_step() for step in workflow.steps] if workflow is not None else [],
+            source_session_id=str(payload.get("source_session_id") or "") or None,
         )
         await asyncio.to_thread(store.attach_job_task, str(job["id"]), handle.task_id)
         if handle.task is not None:

@@ -108,6 +108,8 @@ interface ChatStore {
   openSession(id: string): Promise<void>;
   refreshSessions(): Promise<void>;
   deleteSession(id: string): Promise<void>;
+  /** R17：把会话转为后台任务（对话→任务互链）；返回 job_id。 */
+  promoteSession(id: string, prompt?: string): Promise<string | null>;
   /** 手动重连（R16）：自动重连放弃后的恢复入口，从 lastSeq 续播。 */
   reconnectNow(): void;
 }
@@ -622,6 +624,15 @@ export const useChatStore = create<ChatStore>()((set, get) => ({
     await api.del(`/api/chat/sessions/${encodeURIComponent(id)}`);
     if (get().chat.sessionId === id) get().newSession();
     await get().refreshSessions();
+  },
+
+  promoteSession: async (id, prompt) => {
+    const res = await api.post<{ job_id?: string }>(
+      `/api/chat/sessions/${encodeURIComponent(id)}/promote`,
+      prompt ? { prompt } : {},
+    );
+    await get().refreshSessions(); // derived_run_count 徽标刷新
+    return res.job_id ?? null;
   },
 
   reconnectNow: () => {

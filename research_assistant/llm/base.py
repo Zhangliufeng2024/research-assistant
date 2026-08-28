@@ -74,6 +74,7 @@ class LLMClient(ABC):
         max_tokens: int = 16384,
         on_chunk: OnChunkCallback | None = None,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         """Send a chat request and return the full response.
 
@@ -85,6 +86,11 @@ class LLMClient(ABC):
         When *on_activity* is provided, the implementation should call it
         (no arguments) on every protocol-level sign of life (each SSE line)
         so callers can distinguish "slow but alive" from "stuck".
+
+        When *on_thought* is provided (R17), reasoning/thinking deltas are
+        delivered through it on a separate channel — they must NEVER be
+        folded into the accumulated ``content`` (thought 不是正文).
+        Implementations without a reasoning channel simply never call it.
         """
 
     @abstractmethod

@@ -307,6 +307,11 @@ R12 加性扩展：`run_python` 的 `workspace_root=None` 关键字参数由 reg
 | `RA_MAX_RETRIES` / `RA_RETRY_BASE_DELAY` | `3` / `5.0`s | 瞬态错误重试参数 |
 | `RA_LLM_FIRST_BYTE_TIMEOUT` | `60`s | 模型端点首字节等待；网络偏慢时可调小（前端等待提示文案引用此变量） |
 | `RA_ALLOW_SHELL_OPEN` | 关闭 | `"1"` 时 `/api/workspace/open` 才允许调系统文件管理器，否则 403。**桌面壳 main() 自动置 1**（受信本地进程）；纯 web 部署保持默认关闭——前端 dock 按钮 403 时 toast 提示而非隐藏 |
+| `RA_FF_<NAME>`（R17） | 各 flag 默认 | 统一 feature flag（`config.feature_flag`）：`1/true/yes/on` 开启；重构灰度专用，新行为先挂 flag 后转默认 |
+| `RA_JANITOR_INTERVAL_SECONDS`（R17） | `3600` | Janitor 分层清理的触发间隔（挂 DurableScheduler 主循环）；`0`=关闭 |
+| `RA_JANITOR_WARM_DAYS` / `RA_JANITOR_COLD_DAYS`（R17） | `30` / `90` | 温层（超龄标记 archived）/ 冷层（已归档超龄：events.jsonl gzip + 产物 drafts/ 删除）阈值 |
+| `RA_JANITOR_CHANGES_CAP_MB` / `RA_JANITOR_EVENTS_ROTATE_MB` / `RA_JANITOR_EVENTS_KEEP` / `RA_JANITOR_TMP_DAYS`（R17） | `500` / `10` / `3` / `7` | .ra/changes LRU 总量上限 / 单会话日志轮转阈值与代数 / tmp 清扫龄期 |
+| `RA_PERSIST_THOUGHTS`（R17，预留） | 关闭 | 思考内容是否落盘 events.jsonl；默认不落盘（思考只走 WS 流，历史体积与隐私考虑） |
 
 ## 9. 版本化承诺
 
@@ -352,6 +357,12 @@ slug 由可选标题派生（保留 CJK）；同秒重名追加 `_n` 序号。
 | POST | `/api/chat/sessions/{id}/truncate` | body `{"keep": N}` | `{ok:true, kept, removed}` 把 history.json 截断为前 keep 条（「重新生成 / 编辑重发」的服务端支点：截断后原文重发，重开会被历史回灌的不再是旧答案）；keep 非法/负数 422；**回合运行中 409**（历史正被追加）；未知/墓碑 404、非法 ID 403 |
 | PATCH | `/api/chat/sessions/{id}/messages/{index}` | body `{"text": str}` | `{ok:true, index}` 就地改写一条 user 消息（编辑重发第一步；assistant 条目不可改）；非空且 ≤8000 字符（MAX_USER_LENGTH）否则 422、角色非 user 422、序号不存在 404；运行中 409 |
 | POST | `/api/chat/sessions/{id}/attachments` | multipart 表单（≥1 个文件字段） | `{"files":[{name,path,size}]}`；文件落 `outputs/<sid>/uploads/`（`<时分秒>_<序号>_` 前缀防撞名 + 文件名消毒：取 basename 剥盘符目录成分、剔除非法字符、Windows 保留设备名降级加前缀）；1MB 流式写盘，单次请求总量超 50MB（UPLOAD_TOTAL_LIMIT）报 413 并清掉半截文件；运行中的回合也允许上传（本轮用不上，下一条消息即可引用） |
+| POST | `/api/chat/sessions/{id}/flags`（R17） | body 至少含 `pinned` 或 `archived`（bool；双缺 422） | `{ok:true, session_id, pinned, archived}`；会话标志位持久在 platform.sqlite3 `session_meta` 表（替代旧 localStorage 归档，跨端可见）；部分更新保留另一标志；会话不存在 404、非法 ID 403、无平台库 503 |
+| POST | `/api/chat/sessions/{id}/promote`（R17） | body 可选 `{"prompt"?: str, "workflow_id"?: str=single}` | `{ok:true, job_id, workflow_id}`；把最近 ≤20 条对话（总量 ≤6000 字符）打包进任务 query 并入队 scheduler 队列，payload 携 `source_session_id`——任务落库带来源锚点（列表徽标/详情回链的支点）；会话不存在 404、非法 ID 403、无平台库 503 |
+| GET | `/api/runs/search`（R17） | query: `q?`, `status?`, `limit?≤200=50`, `offset?=0` | `{total, items:[task...], limit, offset}`；历史运行的标题子串+状态过滤+分页检索（替换前端 slice(0,20) 硬截断）；task 对象含 R17 新增 `source_session_id` 字段（旧任务为 null） |
+| GET/PUT | `/api/settings/{key}`（R17） | PUT body `{"value": str}`（缺失 422） | `{key, value}` / `{ok, key, value}`；跨端 UI 设置（如 `ui.verbosity` 显示档位），存 platform.sqlite3 meta 表（`setting.` 前缀） |
+| GET | `/api/search`（R17） | query: `q`(必填非空), `scope?=all\|sessions\|tasks`, `limit?=20` | `{sessions:[{id,title,updated_at}], tasks:[task...]}`；统一检索入口（Ctrl+K 与历史页共用），产物文件检索待 artifacts 索引落地后并入 |
+| PATCH/DELETE | `/api/scheduler/triggers/{id}`（R17） | PATCH body `{"enabled": bool}`（缺失 422） | PATCH 回触发器对象、DELETE 回 `{ok:true}`；触发器启停与删除（此前 enabled 只读、无删除入口）；跨项目操作一律 404（不存在口径） |
 
 历史治理端点共用一套口径：非法 ID 403、未知/墓碑会话 404；改历史的两个端点（truncate /
 messages PATCH）在回合运行中一律 409——附件上传不受此限。
@@ -375,12 +386,12 @@ messages PATCH）在回合运行中一律 409——附件上传不受此限。
 | type | 字段 | 说明 |
 |---|---|---|
 | `connected` | `session_id`, `outputs_dir` | 握手完成（无 seq），可发消息。带 `outputs_dir`（相对工作区根的产物目录，如 `"outputs/<sid>"`）——**前端产出 dock 的权威源**（REST 列表在工作区切换后会错接到另一工作区的同名目录）；旧会话为 null |
-| `text` | `delta`, `seq` | 流式正文增量；接续最后一个 text 气泡（前端合并） |
+| `text` | `delta`, `seq`[, `channel`] | 流式正文增量；接续最后一个 text 气泡（前端合并）。**R17 起可选 `channel` 字段**：缺省=正文；`"thought"`=模型思考增量（provider 的 thinking/reasoning 流，绝不混入正文与落盘历史）；`"plan"`=planner 直播（/plan 门过程，前端折叠进 L1 过程区）。旧客户端忽略该字段即回落旧语义 |
 | `tool_card` | `id`, `tool`, `arguments`, `status: running\|done\|error`, `result_preview`(≤400字), `files:[{path}]`, `seq` | 同 `id` 多次推送按卡合并；`files` 从 write_file/edit_file 的 `file_path` 与 bash/run_python 结果文本的扩展名启发式提取（去重保序，≤8 条） |
 | `usage` | `budget`: BudgetGuard.snapshot(), `seq` | 运行期约每 1s 一帧，结束至少一帧（复用 B5 usage_ticks） |
 | `approval_request` | `id`, `tool`, `summary`, `agent_id`, `role`, `seq` | PRE_TOOL_USE ask 升级时推送；`id` 为本次问询唯一标识（回执按 id 去重）；`agent_id`/`role` 为多 agent 场景标识（单 agent 空串） |
 | `result` | `stop_reason`, `turns`, `seq` | 一轮结束。stop_reason 枚举同 AgentResult（completed/cancelled/budget_exceeded/max_turns/max_continuations）；回合异常收场时为合成的 `"error"`。stop_reason=cancelled/error 时流式文本是残缺回答（与落盘 partial 标记同口径） |
-| `error` | `message`[, `seq`] | 校验失败/配置错误（如缺 API key）为连接级即时帧、无 seq；回合失败的错误帧经发射路径带 seq，网络类错误自动附排查指引文案 |
+| `error` | `message`[, `seq`][, `traceback`] | 校验失败/配置错误（如缺 API key）为连接级即时帧、无 seq；回合失败的错误帧经发射路径带 seq，网络类错误自动附排查指引文案。**R17 起回合失败帧附可选 `traceback`（截尾 4000 字符）**：L0 只展示 message，堆栈供「调试」档（L2）渲染 |
 | `replay_begin` | `last_seq`, `status` | attach 应答头（无 seq）：缓冲内最新 seq 与目标回合当前状态（running\|complete\|failed\|cancelled） |
 | （原帧原样补发） | 各回合帧 | 缓冲中 `seq > after` 的帧逐帧补发（快照迭代，边回放边新增安全） |
 | `replay_end` | `status`, `last_seq` | 回放结束（无 seq）；status=running 时客户端恢复「思考中」态 |

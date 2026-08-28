@@ -18,7 +18,7 @@ from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
-SCHEMA_VERSION = 10
+SCHEMA_VERSION = 11
 PROJECT_OS_VERSION = 1
 
 
@@ -400,6 +400,15 @@ class PlatformStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_analysis_runs_project_started
                     ON analysis_runs(project_id, started_at DESC);
+                -- R17：会话级 UI 状态（置顶/归档）。会话事实源仍是
+                -- .ra/sessions/<id>/ 目录，本表只存跨端持久的标志位——
+                -- 替代原先 localStorage 归档（换浏览器即丢）。
+                CREATE TABLE IF NOT EXISTS session_meta (
+                    session_id TEXT PRIMARY KEY,
+                    pinned INTEGER NOT NULL DEFAULT 0,
+                    archived INTEGER NOT NULL DEFAULT 0,
+                    updated_at REAL NOT NULL
+                );
                 """
             )
             # ``CREATE TABLE IF NOT EXISTS`` does not evolve an existing
@@ -424,6 +433,10 @@ class PlatformStore:
             ):
                 if name not in job_columns:
                     conn.execute(f"ALTER TABLE job_queue ADD COLUMN {name} {definition}")
+            # R17 v11：任务记录来源会话（对话↔任务互链的锚点）。
+            task_columns = {str(row[1]) for row in conn.execute("PRAGMA table_info(tasks)")}
+            if "source_session_id" not in task_columns:
+                conn.execute("ALTER TABLE tasks ADD COLUMN source_session_id TEXT")
             conn.execute(
                 "INSERT OR REPLACE INTO meta(key, value) VALUES('schema_version', ?)",
                 (str(SCHEMA_VERSION),),
@@ -469,16 +482,18 @@ class PlatformStore:
         mode: str,
         output_dir: str | None = None,
         metadata: dict[str, Any] | None = None,
+        source_session_id: str | None = None,
     ) -> dict[str, Any]:
         now = time.time()
         with self._lock, self._connect() as conn:
             conn.execute(
                 "INSERT INTO tasks(id, project_id, query, mode, status, output_dir, "
-                "metadata_json, created_at, updated_at, started_at) "
-                "VALUES(?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?)",
+                "metadata_json, created_at, updated_at, started_at, source_session_id) "
+                "VALUES(?, ?, ?, ?, 'queued', ?, ?, ?, ?, ?, ?)",
                 (
                     task_id, project_id, query, mode, output_dir,
                     json.dumps(metadata or {}, ensure_ascii=False), now, now, now,
+                    source_session_id,
                 ),
             )
         return self.get_task(task_id) or {}
@@ -871,6 +886,121 @@ class PlatformStore:
                 (now, now),
             )
             return int(cursor.rowcount)
+
+    # ------------------------------------------------------------------
+    # R17：会话标志位 + 对话↔任务互链 + 历史检索
+    # ------------------------------------------------------------------
+
+    def get_setting(self, key: str, default: str | None = None) -> str | None:
+        """R17：跨端 UI 设置（verbosity 等），存 meta 表，key 带 ``setting.`` 前缀。"""
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT value FROM meta WHERE key = ?", (f"setting.{key}",),
+            ).fetchone()
+        return str(row["value"]) if row else default
+
+    def set_setting(self, key: str, value: str) -> None:
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO meta(key, value) VALUES(?, ?)",
+                (f"setting.{key}", str(value)),
+            )
+
+    def set_session_flags(
+        self,
+        session_id: str,
+        *,
+        pinned: bool | None = None,
+        archived: bool | None = None,
+    ) -> dict[str, Any]:
+        """设置/清除会话的置顶、归档标志（跨端持久，替代 localStorage 归档）。"""
+        now = time.time()
+        with self._lock, self._connect() as conn:
+            row = conn.execute(
+                "SELECT pinned, archived FROM session_meta WHERE session_id = ?",
+                (session_id,),
+            ).fetchone()
+            cur_pinned = bool(row["pinned"]) if row else False
+            cur_archived = bool(row["archived"]) if row else False
+            new_pinned = cur_pinned if pinned is None else bool(pinned)
+            new_archived = cur_archived if archived is None else bool(archived)
+            conn.execute(
+                "INSERT OR REPLACE INTO session_meta(session_id, pinned, archived, updated_at) "
+                "VALUES(?, ?, ?, ?)",
+                (session_id, int(new_pinned), int(new_archived), now),
+            )
+            return {"session_id": session_id, "pinned": new_pinned, "archived": new_archived}
+
+    def get_session_flags_map(self, session_ids: list[str]) -> dict[str, dict[str, bool]]:
+        """批量取会话标志；无记录的会话不出现（调用方按默认 False 处理）。"""
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT session_id, pinned, archived FROM session_meta "
+                f"WHERE session_id IN ({placeholders})",
+                session_ids,
+            ).fetchall()
+        return {
+            str(r["session_id"]): {
+                "pinned": bool(r["pinned"]),
+                "archived": bool(r["archived"]),
+            }
+            for r in rows
+        }
+
+    def count_tasks_for_sessions(self, session_ids: list[str]) -> dict[str, int]:
+        """每个会话派生的任务数（会话列表徽标用）。"""
+        if not session_ids:
+            return {}
+        placeholders = ",".join("?" for _ in session_ids)
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                f"SELECT source_session_id, COUNT(*) AS n FROM tasks "
+                f"WHERE source_session_id IN ({placeholders}) GROUP BY source_session_id",
+                session_ids,
+            ).fetchall()
+        return {str(r["source_session_id"]): int(r["n"]) for r in rows}
+
+    def search_runs(
+        self,
+        project_id: str | None = None,
+        *,
+        query: str | None = None,
+        status: str | None = None,
+        limit: int = 50,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """历史运行检索：标题子串 + 状态过滤 + 分页（替换前端 slice(0,20) 硬截断）。"""
+        limit = max(1, min(int(limit), 200))
+        offset = max(0, int(offset))
+        where: list[str] = []
+        args: list[Any] = []
+        if project_id:
+            where.append("project_id = ?")
+            args.append(project_id)
+        if query:
+            where.append("query LIKE ?")
+            args.append(f"%{query}%")
+        if status:
+            where.append("status = ?")
+            args.append(status)
+        clause = f"WHERE {' AND '.join(where)}" if where else ""
+        with self._lock, self._connect() as conn:
+            total = int(
+                conn.execute(f"SELECT COUNT(*) AS n FROM tasks {clause}", args).fetchone()["n"]
+            )
+            rows = conn.execute(
+                f"SELECT * FROM tasks {clause} ORDER BY updated_at DESC LIMIT ? OFFSET ?",
+                (*args, limit, offset),
+            ).fetchall()
+        return {
+            "total": total,
+            "items": [self._decode_task(row) or {} for row in rows],
+            "limit": limit,
+            "offset": offset,
+        }
 
     # ------------------------------------------------------------------
     # Research operating-system objects
@@ -2024,6 +2154,36 @@ class PlatformStore:
             item["enabled"] = bool(item.get("enabled"))
             result.append(item)
         return result
+
+    def set_workflow_trigger_enabled(
+        self, trigger_id: str, project_id: str, *, enabled: bool,
+    ) -> dict[str, Any] | None:
+        """R17：触发器启停开关（此前 enabled 字段只读、UI 不可管理）。"""
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "UPDATE workflow_triggers SET enabled = ?, updated_at = ? "
+                "WHERE id = ? AND project_id = ?",
+                (int(bool(enabled)), time.time(), trigger_id, project_id),
+            )
+            row = conn.execute(
+                "SELECT * FROM workflow_triggers WHERE id = ? AND project_id = ?",
+                (trigger_id, project_id),
+            ).fetchone()
+        if row is None:
+            return None
+        item = dict(row)
+        item["payload"] = self._json_value(item.pop("payload_json"))
+        item["enabled"] = bool(item.get("enabled"))
+        return item
+
+    def delete_workflow_trigger(self, trigger_id: str, project_id: str) -> bool:
+        """R17：删除触发器（此前 UI 无删除入口）。"""
+        with self._lock, self._connect() as conn:
+            cursor = conn.execute(
+                "DELETE FROM workflow_triggers WHERE id = ? AND project_id = ?",
+                (trigger_id, project_id),
+            )
+            return cursor.rowcount > 0
 
     def release_due_triggers(self, *, limit: int = 50) -> int:
         """Materialize due interval triggers into queue jobs atomically."""

@@ -1312,6 +1312,127 @@ async def create_scheduler_trigger(request: Request):
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 
 
+@router.patch("/scheduler/triggers/{trigger_id}")
+async def set_scheduler_trigger_enabled(trigger_id: str, request: Request):
+    """R17：触发器启停（此前 enabled 只读、UI 无开关）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or body.get("enabled") is None:
+        raise HTTPException(status_code=422, detail="需要 enabled 字段")
+    store, project_id = _research_store(request)
+    item = await asyncio.to_thread(
+        store.set_workflow_trigger_enabled, trigger_id, project_id,
+        enabled=bool(body.get("enabled")),
+    )
+    if item is None:
+        raise HTTPException(status_code=404, detail="触发器不存在")
+    return item
+
+
+@router.delete("/scheduler/triggers/{trigger_id}")
+async def delete_scheduler_trigger(trigger_id: str, request: Request):
+    """R17：删除触发器（此前 UI 无删除入口）。"""
+    store, project_id = _research_store(request)
+    ok = await asyncio.to_thread(store.delete_workflow_trigger, trigger_id, project_id)
+    if not ok:
+        raise HTTPException(status_code=404, detail="触发器不存在")
+    return {"ok": True}
+
+
+@router.get("/runs/search")
+async def search_runs(
+    request: Request,
+    q: str | None = None,
+    status: str | None = None,
+    limit: int = 50,
+    offset: int = 0,
+):
+    """R17：历史运行检索（标题子串 + 状态过滤 + 分页）。
+
+    替换前端运行历史 slice(0,20) 硬截断——total 随响应返回，
+    前端据此渲染分页器。
+    """
+    store = request.app.state.platform_store
+    project_id = (getattr(request.app.state, "project", None) or {}).get("id")
+    return await asyncio.to_thread(
+        store.search_runs, project_id, query=q, status=status,
+        limit=limit, offset=offset,
+    )
+
+
+@router.get("/settings/{key}")
+async def get_ui_setting(key: str, request: Request):
+    """R17：跨端 UI 设置读取（如 verbosity）。"""
+    store = getattr(request.app.state, "platform_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="平台存储不可用")
+    value = await asyncio.to_thread(store.get_setting, key)
+    return {"key": key, "value": value}
+
+
+@router.put("/settings/{key}")
+async def put_ui_setting(key: str, request: Request):
+    """R17：跨端 UI 设置写入（替代纯 localStorage，换浏览器不丢）。"""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or body.get("value") is None:
+        raise HTTPException(status_code=422, detail="需要 value 字段")
+    store = getattr(request.app.state, "platform_store", None)
+    if store is None:
+        raise HTTPException(status_code=503, detail="平台存储不可用")
+    await asyncio.to_thread(store.set_setting, key, str(body["value"]))
+    return {"ok": True, "key": key, "value": str(body["value"])}
+
+
+@router.get("/search")
+async def unified_search(request: Request, q: str = "", scope: str = "all", limit: int = 20):
+    """R17：统一检索入口（Ctrl+K 与历史页共用）。
+
+    scope: ``tasks``（标题，走 search_runs）| ``sessions``（会话目录标题）
+    | ``all``。产物文件检索待 manifest 全量落地后并入 artifacts scope。
+    """
+    q = q.strip()
+    if not q:
+        return {"sessions": [], "tasks": []}
+    result: dict[str, Any] = {"sessions": [], "tasks": []}
+    cwd = getattr(request.app.state, "cwd", None) or Path.cwd()
+    if scope in {"all", "sessions"}:
+        sessions_root = cwd / ".ra" / "sessions"
+        hits: list[dict[str, Any]] = []
+        if sessions_root.is_dir():
+            needle = q.lower()
+            for child in sorted(sessions_root.iterdir()):
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                state_file = child / "run.json"
+                try:
+                    state = json.loads(state_file.read_text(encoding="utf-8"))
+                except (OSError, json.JSONDecodeError):
+                    continue
+                title = str(state.get("query") or "")
+                if needle in title.lower() or needle in child.name.lower():
+                    hits.append({
+                        "id": child.name, "title": title or None,
+                        "updated_at": state.get("updated_at"),
+                    })
+                if len(hits) >= limit:
+                    break
+        result["sessions"] = hits
+    if scope in {"all", "tasks"}:
+        store = getattr(request.app.state, "platform_store", None)
+        project_id = (getattr(request.app.state, "project", None) or {}).get("id")
+        if store is not None:
+            found = await asyncio.to_thread(
+                store.search_runs, project_id, query=q, limit=limit,
+            )
+            result["tasks"] = found["items"]
+    return result
+
+
 @router.post("/scheduler/jobs")
 async def enqueue_scheduler_job(request: Request):
     body = await request.json()

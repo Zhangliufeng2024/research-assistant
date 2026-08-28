@@ -66,6 +66,9 @@ export default function App() {
               <Routes>
                 <Route path="/" element={<ProjectHomeView />} />
                 <Route path="/chat" element={<ChatView />} />
+                {/* R17：会话深链——深链/通知跳转/任务回链共用；ChatView 内部
+                    读取 :sessionId 并触发 openSession。 */}
+                <Route path="/chat/:sessionId" element={<ChatView />} />
                 <Route path="/tasks" element={<TasksView />} />
                 <Route path="/scheduler" element={<SchedulerView />} />
                 <Route path="/papers" element={<PapersView />} />

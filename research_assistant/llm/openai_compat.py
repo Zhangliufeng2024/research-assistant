@@ -104,6 +104,7 @@ class OpenAICompatClient(LLMClient):
         max_tokens: int = 16384,
         on_chunk: OnChunkCallback | None = None,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         base = self.base_url
         if not base.endswith("/v1"):
@@ -136,7 +137,7 @@ class OpenAICompatClient(LLMClient):
             # 缺陷 D：流式默认拿不到 usage——显式要求端点回传计量 chunk
             #（OpenAI 规范字段；不认识的兼容端点由降级逻辑兜底，见下）。
             body["stream_options"] = {"include_usage": True}
-            return await self._chat_streaming(url, headers, body, on_chunk, on_activity)
+            return await self._chat_streaming(url, headers, body, on_chunk, on_activity, on_thought)
 
         resp = await self._client.post(url, headers=headers, json=body)
 
@@ -153,6 +154,7 @@ class OpenAICompatClient(LLMClient):
         body: dict,
         on_chunk: OnChunkCallback,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         """Stream the OpenAI-compatible response via SSE, calling on_chunk for text deltas.
 
@@ -163,7 +165,7 @@ class OpenAICompatClient(LLMClient):
         for _ in range(2):  # 首发最多 + 一次去 stream_options 的降级重发
             try:
                 return await self._chat_stream_once(
-                    url, headers, current_body, on_chunk, on_activity,
+                    url, headers, current_body, on_chunk, on_activity, on_thought,
                 )
             except LLMError as exc:
                 already_degraded = current_body is not body
@@ -186,6 +188,7 @@ class OpenAICompatClient(LLMClient):
         body: dict,
         on_chunk: OnChunkCallback,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         """Issue one streaming request and consume its SSE frames."""
         content_text = ""
@@ -229,6 +232,16 @@ class OpenAICompatClient(LLMClient):
                     result = on_chunk(text)
                     if asyncio.iscoroutine(result):
                         await result
+
+                # R17 思考链（阶段4）：reasoning 模型的思考增量此前未读取。
+                # 兼容两类字段名（deepseek 系 reasoning_content / 部分端点
+                # reason_content）；走独立回调，绝不混入正文 content_text。
+                if on_thought is not None:
+                    thought = delta.get("reasoning_content") or delta.get("reason_content")
+                    if thought:
+                        result = on_thought(str(thought))
+                        if asyncio.iscoroutine(result):
+                            await result
 
                 for tc_delta in delta.get("tool_calls", []):
                     idx = tc_delta.get("index", 0)

@@ -83,6 +83,7 @@ class BackgroundTaskHub:
         output_dir: str | None = None,
         metadata: dict[str, Any] | None = None,
         steps: list[dict[str, Any]] | None = None,
+        source_session_id: str | None = None,
     ) -> TaskHandle:
         task_id = uuid.uuid4().hex[:12]
         handle = TaskHandle(task_id=task_id, query=query, project_id=project_id)
@@ -91,6 +92,7 @@ class BackgroundTaskHub:
         self.store.create_task(
             task_id=task_id, project_id=project_id, query=query, mode=mode,
             output_dir=output_dir, metadata=task_metadata,
+            source_session_id=source_session_id,
         )
         # Every durable task is also a reproducibility run.  Keeping the run id
         # in task metadata makes task → artifact → evidence navigation possible

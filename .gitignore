@@ -4,7 +4,9 @@ __pycache__/
 *.pyc
 *$py.class
 *.egg-info/
-dist/
+# 构建产物默认忽略；安装包 exe（<100MB）显式放行入库（R17：随仓库分发测试版）
+dist/*
+!dist/ResearchAssistant_setup_*.exe
 build/
 *.egg
 
@@ -71,11 +73,12 @@ eval_results/
 _ra_exec_*.py
 
 # build.py --restricted 的 PyInstaller 产物 spec（每次构建重新生成）
+# R17 修正：原先 *.spec 全排与已入库的 ResearchAssistant.spec 自相矛盾——
+# 只排除构建产物，主 spec 显式保留追踪。
 ResearchAssistant_Trial.spec
-*.spec
+!ResearchAssistant.spec
 
-# 内部计划文档（防误入库）
-plan260824.md
+# 内部计划文档统一收 docs/plans/（R17 起 plan260824.md 已迁入，此条退役）
 
 # pytest basetemp（避免误入 stash/提交）
 .pytest_tmp*/

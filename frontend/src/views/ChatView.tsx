@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link } from "react-router-dom";
+import { Link, useNavigate, useParams } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
@@ -10,6 +10,7 @@ import type { MessageOpResult } from "@/lib/messageOps";
 import { shouldShowWaitHint } from "@/lib/waitHint";
 import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
+import { usePrefsStore, type Verbosity } from "@/stores/prefsStore";
 import { toast } from "@/stores/toastStore";
 import { usePinnedScroll } from "@/hooks/usePinnedScroll";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
@@ -48,10 +49,28 @@ export function ChatView() {
     openSession,
     refreshSessions,
     deleteSession,
+    promoteSession,
     regenerateMessage,
     editAndResend,
     reconnectNow,
   } = useChatStore();
+
+  // R17 思考链显示分级：verbosity 档位（简洁/标准/调试），挂载时同步服务端
+  const verbosity = usePrefsStore((s) => s.verbosity);
+  const setVerbosity = usePrefsStore((s) => s.setVerbosity);
+  useEffect(() => {
+    void usePrefsStore.getState().hydrate();
+  }, []);
+  const VERBOSITY_NEXT: Record<Verbosity, Verbosity> = {
+    minimal: "standard",
+    standard: "debug",
+    debug: "minimal",
+  };
+  const VERBOSITY_LABEL: Record<Verbosity, string> = {
+    minimal: "简洁",
+    standard: "标准",
+    debug: "调试",
+  };
 
   const [configured, setConfigured] = useState<boolean | null>(null);
   const [previewPaths, setPreviewPaths] = useState<string[] | null>(null);
@@ -59,6 +78,26 @@ export function ChatView() {
   const [wsOpen, setWsOpen] = useState(false);
   // 与全局 toast（stores/toastStore）并存的历史遗留轻提示：仅承载发送失败等旧文案
   const [legacyToast, setLegacyToast] = useState("");
+
+  // R17 会话路由化：/chat/:sessionId 深链 → 打开对应会话；列表打开会话时
+  // 同步写回 URL（浏览器前进后退/复制链接/通知跳转由此成立）。
+  const { sessionId: routeSessionId } = useParams<{ sessionId: string }>();
+  const navigate = useNavigate();
+  useEffect(() => {
+    if (routeSessionId && routeSessionId !== chat.sessionId) {
+      void openSession(routeSessionId)
+        .then(() => refreshSessions())
+        .catch(() => setLegacyToast("会话不存在或已被删除"));
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [routeSessionId]);
+  useEffect(() => {
+    if (!routeSessionId && chat.sessionId) {
+      // 列表内打开/新建后补写 URL（replace：不产生多余历史项）
+      navigate(`/chat/${encodeURIComponent(chat.sessionId)}`, { replace: true });
+    }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [chat.sessionId]);
 
   // ---- 产出 dock（C5）：折叠态记忆（与任务页共享）；xl(1280px) 以下默认收起 ----
   const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
@@ -245,6 +284,36 @@ export function ChatView() {
                 <BudgetBar budget={chat.budget} />
               </div>
             )}
+            <button
+              type="button"
+              title={`过程显示档位：${VERBOSITY_LABEL[verbosity]}（点击切换）——简洁=过程全折叠；标准=运行中自动展开；调试=全展开含堆栈/全参数`}
+              onClick={() => setVerbosity(VERBOSITY_NEXT[verbosity])}
+              className="rounded-lg border border-edge bg-surface px-2 py-1 text-[11px] font-medium text-ink-3 transition-colors hover:border-accent/40 hover:text-accent-hover dark:hover:text-accent"
+            >
+              {VERBOSITY_LABEL[verbosity]}
+            </button>
+            {chat.sessionId && chat.phase !== "running" && (
+              <button
+                type="button"
+                title="把当前对话上下文打包为后台任务（任务中心可追踪，任务会回链本会话）"
+                onClick={() => {
+                  const sid = chat.sessionId;
+                  if (!sid) return;
+                  void promoteSession(sid)
+                    .then((jobId) =>
+                      setLegacyToast(
+                        jobId
+                          ? "已转为后台任务——进展见「任务中心」，任务与本会话已互链"
+                          : "转为任务失败",
+                      ),
+                    )
+                    .catch(() => setLegacyToast("转为任务失败"));
+                }}
+                className="rounded-lg border border-edge bg-surface px-2.5 py-1 text-[12px] font-medium text-ink-2 transition-colors hover:border-accent/40 hover:text-accent-hover dark:hover:text-accent"
+              >
+                转为任务
+              </button>
+            )}
             {chat.phase === "running" && (
               <button
                 type="button"
@@ -271,6 +340,16 @@ export function ChatView() {
             {chat.error && (
               <div className="bg-danger/10 px-5 py-2 text-center text-[12.5px] text-danger">
                 出错：{chat.error}（重新发送即可重试）
+                {verbosity === "debug" && chat.errorTrace && (
+                  <details className="mx-auto mt-1.5 max-w-3xl text-left">
+                    <summary className="cursor-pointer text-[11px] text-danger/80">
+                      堆栈详情（调试档）
+                    </summary>
+                    <pre className="mt-1 max-h-48 overflow-auto whitespace-pre-wrap rounded-lg bg-canvas/60 p-2 font-mono text-[10.5px] leading-4 text-danger/90">
+                      {chat.errorTrace}
+                    </pre>
+                  </details>
+                )}
               </div>
             )}
             {reconnectBanner && (
