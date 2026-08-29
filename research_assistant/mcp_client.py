@@ -17,6 +17,7 @@ import os
 from collections.abc import Awaitable, Callable
 from typing import Any
 
+from . import __version__
 from .tools.registry import ToolExtension, ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -106,7 +107,8 @@ class McpServerConnection:
                 {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
                     "capabilities": {},
-                    "clientInfo": {"name": "research-assistant", "version": "3.5.0"},
+                    # 随包版本动态走（曾因硬编码 3.5.0 在 3.6.0 发布时漏改）
+                    "clientInfo": {"name": "research-assistant", "version": __version__},
                 },
             ),
             timeout=self.startup_timeout,
