@@ -23,7 +23,7 @@ If your document does not already contain schematics or diagrams:
 
 **How to generate schematics:**
 ```bash
-python scripts/generate_schematic.py "your diagram description" -o figures/output.png
+python .claude/skills/scientific-schematics/scripts/generate_schematic.py "your diagram description" -o figures/output.png
 ```
 
 The AI will automatically:
@@ -229,3 +229,14 @@ Required dependencies (install if not available):
 - **LibreOffice**: `sudo apt-get install libreoffice` (for PDF conversion)
 - **Poppler**: `sudo apt-get install poppler-utils` (for pdftoppm to convert PDF to images)
 - **defusedxml**: `pip install defusedxml` (for secure XML parsing)
+## Additional Local Scripts
+
+`scripts/` 下除 ooxml 工作流外还提供以下本地增强脚本（自旧版 docx 技能迁移）：
+
+- **`scripts/comment.py`** — 向指定段落添加 Word 批注（comment），保留原有格式。
+- **`scripts/accept_changes.py`** — 接受文档中全部修订（tracked changes），
+  依赖 `scripts/office/soffice.py` 提供 LibreOffice 环境。
+- **`scripts/office/soffice.py`** — LibreOffice 无头转换的环境封装
+  （PDF 导出等场景使用，避免 PATH 差异导致的静默失败）。
+
+调用方式（在技能根目录执行）：`python scripts/<脚本名> --help` 查看参数。

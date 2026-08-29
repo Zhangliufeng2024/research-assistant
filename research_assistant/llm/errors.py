@@ -162,7 +162,7 @@ def parse_retry_after(value: str | None) -> float | None:
     try:
         return min(float(value), 300.0)
     except ValueError:
-        pass
+        pass  # 控制流：非 delay-seconds 格式，继续尝试 HTTP-date 解析
     try:
         dt = email.utils.parsedate_to_datetime(value)
         if dt is None:

@@ -49,12 +49,40 @@ packages = ["research_assistant"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
+# 覆盖率测量**刻意不放进 addopts**：未安装 pytest-cov 的环境会因
+# "unrecognized arguments: --cov" 直接跑不起来，属于对本地工作流的破坏性变更。
+# 需要覆盖率时显式加旗：
+#   PYTHONPATH= python -m pytest -p no:cacheprovider --basetemp=.pytest_tmpX \
+#       --cov=research_assistant --cov-report=term-missing --cov-report=xml
+# CI 见 .github/workflows/ci.yml。
+
+[tool.coverage.run]
+branch = true
+source = ["research_assistant"]
+# 排除：打包/入口脚本、只被 PyInstaller 用的一次性 launcher、类型桩。
+omit = [
+    "*/launcher_desktop.py",
+    "*/launcher_restricted.py",
+    "*/__main__.py",
+]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = false
+# A+ 验收：整体 ≥75%，关键模块 ≥85%（关键模块列表见 CI 的分步 cov 命令）。
+# 阈值不在本文件强制，由 CI 用 --cov-fail-under 分档施加。
+exclude_also = [
+    "if TYPE_CHECKING:",
+    "raise NotImplementedError",
+    "@(abc\\.)?abstractmethod",
+]
 
 [tool.uv]
 # TODO: 待生成 uv.lock 锁定依赖（需联网执行 uv lock，本次离线不做）。
 dev-dependencies = [
     "pytest>=8.0",
     "pytest-asyncio>=0.23",
+    "pytest-cov>=5.0",
     "pyinstaller>=6.0",
 ]
 
@@ -73,3 +101,18 @@ ignore = ["E501"]
 "__init__.py" = ["F401"]
 # importorskip must run before eval imports (yaml is optional at test time).
 "tests/test_eval.py" = ["E402"]
+
+[tool.mypy]
+# 计划项 3.4：渐进式 mypy。宽松起步——先让 kernel/ 与 llm/ 两个核心包
+# 通过（见下方 overrides 的 strict 约定），其余包后续按包逐步纳入。
+python_version = "3.10"
+ignore_missing_imports = true
+check_untyped_defs = false
+exclude = ["build", "dist"]
+
+[[tool.mypy.overrides]]
+module = ["research_assistant.kernel.*", "research_assistant.llm.*"]
+# 核心两包：已注解的公开面按完整规则检查（未注解函数体暂不深入）。
+check_untyped_defs = false
+disallow_untyped_defs = false
+warn_unused_ignores = true

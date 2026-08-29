@@ -356,7 +356,7 @@ async def ws_generate(websocket: WebSocket):
         try:
             await websocket.send_json({"type": "error", "message": str(exc)})
         except Exception:
-            pass
+            pass  # 尽力而为：socket 已坏时错误帧发不出去，不掩盖原始异常
     finally:
         legacy_task = None
         if legacy_mode and task_id:

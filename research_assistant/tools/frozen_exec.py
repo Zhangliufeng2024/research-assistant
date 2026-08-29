@@ -23,7 +23,8 @@ import tempfile
 import traceback
 from pathlib import Path
 
-from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
+from ..constants import truncate_tool_output
+from .exec_provider import sanitized_exec_env
 
 #: 子进程 join 的额外宽限（秒）：join 自带超时，这里只是防御性余量。
 _JOIN_GRACE_S = 10
@@ -72,7 +73,23 @@ def _make_script_runner():
 
 
 def _child_main(code: str, cwd: str, out_path: str, workspace_root: str = "") -> None:
-    """子进程入口：执行用户代码，stdout/stderr 全量写入 out_path。"""
+    """子进程入口：执行用户代码，stdout/stderr 全量写入 out_path。
+
+    A+ 阶段 5 / G-4（frozen_exec 收口）：spawn 子进程**继承父进程完整环境**，
+    而 ``multiprocessing.Process`` 不暴露 env 参数，无法像 ``_run_process``
+    那样在启动前换掉。因此在执行模型代码**之前**由子进程自净——
+    ``_run_script_in_process`` 走的也是这条路（它同样继承完整环境）。
+
+    注意必须在 ``exec`` 之前完成：一旦模型代码开始跑，任何净化都太晚了。
+
+    ⚠️ 顺序陷阱：**必须先取净化快照，再 clear**。``sanitized_exec_env()``
+    缺省读的就是 ``os.environ``——若先 ``clear()`` 再调它，拿到的是空表，
+    子进程只剩一个变量，matplotlib 等库会因找不到 HOME/USERPROFILE 直接崩
+    （本轮实现时就踩了：实测 N=1）。
+    """
+    cleaned = sanitized_exec_env()
+    os.environ.clear()
+    os.environ.update(cleaned)
     os.environ.setdefault("MPLBACKEND", "Agg")  # 无头：savefig 可用，show 不阻塞
     os.chdir(cwd)
     with open(out_path, "w", encoding="utf-8") as fh:
@@ -98,7 +115,7 @@ def _child_main(code: str, cwd: str, out_path: str, workspace_root: str = "") ->
             try:
                 fh.flush()
             except Exception:
-                pass
+                pass  # 尽力而为：输出重定向恢复前的最后一次冲刷，失败不掩盖用户脚本结果
             sys.stdout, sys.stderr = old_out, old_err
 
 
@@ -166,10 +183,5 @@ async def run_python_inprocess(
         # 非 0 只可能是子进程级故障（os._exit / native 崩溃 / 内存耗尽），
         # 此时输出可能为空或不完整，必须显式回报而不是静默成功。
         result = f"{result}\n\n[执行器] 子进程异常退出，exitcode={proc.exitcode}".strip()
-    if len(result) > OUTPUT_TRUNCATION_LIMIT:
-        result = (
-            result[:OUTPUT_TRUNCATION_HALF]
-            + "\n\n... (output truncated) ...\n\n"
-            + result[-OUTPUT_TRUNCATION_HALF:]
-        )
+    result = truncate_tool_output(result)
     return result or "(no output)"

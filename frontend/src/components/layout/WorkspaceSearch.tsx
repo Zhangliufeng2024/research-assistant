@@ -1,27 +1,17 @@
-/* 顶栏全局搜索（Ctrl+K）（R15：自 App.tsx 抽出 + 键盘层）。
+/* 顶栏（R15 引入，阶段 4 改造）。
  *
- * 交互：Ctrl/Cmd+K 开、Esc 关、180ms 防抖搜 /api/project/search；
- * 键盘层新增——↑↓ 循环移动高亮（scrollIntoView nearest）、Enter 打开
- * 高亮项；空结果 / 输入中 Enter 不误触。高亮项同时支持悬停同步与
- * bg-surface-2 视觉态。
+ * 原「全局搜索（Ctrl+K）」对话框迁入命令面板（CommandPalette）：数据源
+ * （/api/project/search + 产物检索）与 180ms 防抖逻辑原样搬移，命令注册表
+ * 统一接管 Ctrl+K 分发（设计文档 §3/§4：命令面板与快捷键共享同一注册表）。
+ * 本组件只保留顶栏壳：搜索入口按钮（打开命令面板）+ 通知中心 + 状态语。
  */
-import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { IconBell } from "@/components/icons";
-import { api } from "@/lib/api";
 import { usePendingApprovalCount } from "@/stores/approvalSignal";
-import {
-  mergeArtifactHits,
-  moveHighlight,
-  pickEnterIndex,
-  SEARCH_KIND_LABELS,
-  searchHitPath,
-  type ArtifactRow,
-  type SearchHit,
-} from "./workspaceSearchModel";
+import { useUiStore } from "@/stores/uiStore";
 
 /** 顶栏右侧通知中心入口（R15 自侧栏撤出后的替代路径）。 */
-function NotificationsButton() {
+export function NotificationsButton() {
   const navigate = useNavigate();
   const pending = usePendingApprovalCount();
   return (
@@ -46,152 +36,23 @@ function NotificationsButton() {
 }
 
 export function WorkspaceSearch() {
-  const navigate = useNavigate();
-  const [open, setOpen] = useState(false);
-  const [query, setQuery] = useState("");
-  const [hits, setHits] = useState<SearchHit[]>([]);
-  const [highlight, setHighlight] = useState(0);
-  const listRef = useRef<HTMLDivElement | null>(null);
-
-  useEffect(() => {
-    const onKey = (event: KeyboardEvent) => {
-      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === "k") {
-        event.preventDefault();
-        setOpen(true);
-      }
-      if (event.key === "Escape") setOpen(false);
-    };
-    window.addEventListener("keydown", onKey);
-    return () => window.removeEventListener("keydown", onKey);
-  }, []);
-
-  useEffect(() => {
-    if (!open || query.trim().length < 2) {
-      setHits([]);
-      return;
-    }
-    const timer = window.setTimeout(() => {
-      // 迭代2：项目对象检索 + 产物文件检索并行；产物命中置前（可直达会话）
-      const q = encodeURIComponent(query.trim());
-      void Promise.all([
-        api.get<SearchHit[]>(`/api/project/search?q=${q}&limit=20`).catch(() => []),
-        api
-          .get<{ artifacts?: ArtifactRow[] }>(`/api/search?scope=artifacts&q=${q}&limit=8`)
-          .then((r) => r.artifacts ?? [])
-          .catch(() => [] as ArtifactRow[]),
-      ]).then(([base, artifacts]) => {
-        setHits(mergeArtifactHits(base, artifacts));
-      });
-    }, 180);
-    return () => window.clearTimeout(timer);
-  }, [open, query]);
-
-  // 候选集或关键词变化后高亮回到首条，避免残留越界索引
-  useEffect(() => {
-    setHighlight(0);
-  }, [query, hits]);
-
-  // 高亮项滚入可视区（block:nearest 不打扰当前滚动位置）
-  useEffect(() => {
-    listRef.current
-      ?.querySelector<HTMLElement>(`[data-hit-index="${highlight}"]`)
-      ?.scrollIntoView({ block: "nearest" });
-  }, [highlight]);
-
-  const choose = (hit: SearchHit) => {
-    navigate(searchHitPath(hit));
-    setOpen(false);
-    setQuery("");
-  };
-
-  const hasQuery = query.trim().length >= 2;
-
-  const onKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
-    if (event.key === "ArrowDown" || event.key === "ArrowUp") {
-      event.preventDefault();
-      const delta = event.key === "ArrowDown" ? 1 : -1;
-      setHighlight((cur) => moveHighlight(cur, delta, hits.length));
-      return;
-    }
-    if (event.key === "Enter") {
-      // 空结果 / 输入中：只吞掉默认行为，不关闭不导航
-      const idx = pickEnterIndex(highlight, hits.length);
-      if (idx === null) {
-        event.preventDefault();
-        return;
-      }
-      const hit = hits[idx];
-      if (hit) choose(hit);
-    }
-  };
+  const setPaletteOpen = useUiStore((s) => s.setPaletteOpen);
 
   return (
-    <>
-      <div className="sticky top-0 z-20 flex h-12 items-center justify-between border-b border-edge bg-canvas/95 px-5 backdrop-blur">
-        <button
-          type="button"
-          onClick={() => setOpen(true)}
-          className="flex w-full max-w-md items-center gap-2 rounded-lg border border-edge bg-surface px-3 py-1.5 text-left text-xs text-ink-3 hover:border-accent/40"
-        >
-          <span className="text-sm">⌕</span>
-          <span>搜索项目中的线程、资料、主张和产物…</span>
-          <kbd className="ml-auto rounded border border-edge px-1.5 py-0.5 font-mono text-[10px]">Ctrl K</kbd>
-        </button>
-        <div className="ml-4 flex shrink-0 items-center gap-2">
-          <NotificationsButton />
-          <span className="hidden text-[11px] text-ink-3 md:block">统一科研工作空间</span>
-        </div>
+    <div className="sticky top-0 z-20 flex h-12 items-center justify-between border-b border-edge bg-canvas/95 px-5 backdrop-blur">
+      <button
+        type="button"
+        onClick={() => setPaletteOpen(true)}
+        className="flex w-full max-w-md items-center gap-2 rounded-lg border border-edge bg-surface px-3 py-1.5 text-left text-xs text-ink-3 hover:border-accent/40"
+      >
+        <span className="text-sm">⌕</span>
+        <span>搜索命令、会话与项目对象…</span>
+        <kbd className="ml-auto rounded border border-edge px-1.5 py-0.5 font-mono text-[10px]">Ctrl K</kbd>
+      </button>
+      <div className="ml-4 flex shrink-0 items-center gap-2">
+        <NotificationsButton />
+        <span className="hidden text-[11px] text-ink-3 md:block">统一科研工作空间</span>
       </div>
-
-      {open && (
-        <div className="fixed inset-0 z-40 bg-black/20 p-4" onMouseDown={() => setOpen(false)}>
-          <div
-            className="mx-auto mt-[8vh] w-full max-w-2xl overflow-hidden rounded-2xl border border-edge bg-surface shadow-2xl"
-            onMouseDown={(event) => event.stopPropagation()}
-          >
-            <input
-              autoFocus
-              value={query}
-              onChange={(event) => setQuery(event.target.value)}
-              onKeyDown={onKeyDown}
-              placeholder="搜索项目对象…（↑↓ 选择，Enter 打开）"
-              className="w-full border-b border-edge bg-transparent px-4 py-3 text-sm outline-none"
-            />
-            <div ref={listRef} className="max-h-96 overflow-y-auto p-2">
-              {!hasQuery ? (
-                <div className="p-5 text-center text-xs text-ink-3">
-                  输入至少两个字符开始搜索 · Esc 关闭
-                </div>
-              ) : hits.length === 0 ? (
-                <div className="p-5 text-center text-xs text-ink-3">没有匹配的项目对象</div>
-              ) : (
-                hits.map((hit, i) => (
-                  <button
-                    type="button"
-                    key={`${hit.kind}-${hit.id}`}
-                    data-hit-index={i}
-                    onClick={() => choose(hit)}
-                    onMouseEnter={() => setHighlight(i)}
-                    className={`flex w-full items-start gap-3 rounded-lg px-3 py-2 text-left transition-colors ${
-                      i === highlight ? "bg-surface-2" : ""
-                    }`}
-                  >
-                    <span className="mt-0.5 rounded bg-accent-tint px-1.5 py-0.5 text-[10px] text-accent">
-                      {SEARCH_KIND_LABELS[hit.kind] || hit.kind}
-                    </span>
-                    <span className="min-w-0 flex-1">
-                      <span className="block truncate text-xs font-medium">{hit.title || hit.id}</span>
-                      <span className="mt-0.5 block truncate text-[11px] text-ink-3">
-                        {hit.detail || hit.id}
-                      </span>
-                    </span>
-                  </button>
-                ))
-              )}
-            </div>
-          </div>
-        </div>
-      )}
-    </>
+    </div>
   );
 }

@@ -44,6 +44,25 @@ DEFAULT_LLM_ATTEMPT_WALL_TIMEOUT: float = 1800.0  # env RA_LLM_ATTEMPT_WALL_TIME
 # ---------------------------------------------------------------------------
 OUTPUT_TRUNCATION_LIMIT: int = 30_000
 OUTPUT_TRUNCATION_HALF: int = 15_000
+#: 超限截断时插入的省略标记。此前这段 3 行拼接在 bash.py / python_exec.py /
+#: frozen_exec.py 各复制一份（一字不差），改阈值或文案要改三处——正是那种
+#: 漏改一处就静默分叉的典型。统一走 truncate_tool_output()。
+OUTPUT_TRUNCATION_MARKER: str = "\n\n... (output truncated) ...\n\n"
+
+
+def truncate_tool_output(result: str) -> str:
+    """超长工具输出做**保头保尾**截断，中间替换为省略标记。
+
+    三处执行工具（bash / run_python / frozen_exec）共用。放在 constants 是
+    刻意的：它们只依赖这一个常量模块，不形成对 tools 包内部的相互依赖。
+    """
+    if len(result) <= OUTPUT_TRUNCATION_LIMIT:
+        return result
+    return (
+        result[:OUTPUT_TRUNCATION_HALF]
+        + OUTPUT_TRUNCATION_MARKER
+        + result[-OUTPUT_TRUNCATION_HALF:]
+    )
 
 GREP_MAX_RESULTS: int = 200
 GLOB_MAX_RESULTS: int = 500
@@ -84,3 +103,11 @@ DEFAULT_MAX_PARALLEL_FIGURES: int = 4
 OUTPUT_SUBDIRS: tuple[str, ...] = (
     "drafts", "final", "references", "figures", "data", "sources",
 )
+
+
+# ---------------------------------------------------------------------------
+# Mid-execution steering（用户在回合进行中插入的实时纠正）
+# ---------------------------------------------------------------------------
+#: 引导消息前缀。agent.py 用它构造消息、cli.py 用它向模型解释协议——
+#: 两处必须严格一致，提取常量防止漂移。
+STEER_PREFIX: str = "[USER STEER]:"

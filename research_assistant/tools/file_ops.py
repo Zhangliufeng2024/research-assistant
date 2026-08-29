@@ -8,6 +8,21 @@ from ..constants import BINARY_EXTENSIONS, GLOB_MAX_RESULTS, GREP_MAX_RESULTS
 from ..core import safe_resolve
 
 
+def _unquote_path(file_path: str) -> str:
+    """剥掉模型传入路径两端可能自带的包裹引号。
+
+    A+ 修复（路径含空格工作区）：外置产物指针、dir 输出等都可能让模型以
+    `"D:\\vscode files\\...\\x.txt"` 的带引号形态回传路径——Windows 工作区
+    路径含空格极其常见，引号原样进 ``safe_resolve`` 会被当成文件名的一部分，
+    于是「读得到却写不进」这类幽灵故障。只剥**成对**的包裹引号，路径中间
+    的引号（合法文件名字符）不受影响。
+    """
+    text = str(file_path).strip()
+    if len(text) >= 2 and text[0] == text[-1] and text[0] in {'"', "'"}:
+        return text[1:-1]
+    return text
+
+
 async def read_file(
     file_path: str,
     offset: int = 0,
@@ -25,7 +40,7 @@ async def read_file(
         write_anchor: 双轨回退（修复 G）：相对路径在 sandbox 根下不存在而
             anchor 下存在时读 anchor 副本；绝对路径行为完全不变。
     """
-    raw = Path(file_path)
+    raw = Path(_unquote_path(file_path))
     relative = not raw.is_absolute()
     p: Path
     if sandbox:
@@ -86,7 +101,7 @@ def _reject_windows_hazard(file_path: str) -> str | None:
     - 盘符之外的冒号：NTFS 备用数据流（ADS）形态（file:stream），不属于
       普通文件语义，拒绝以防绕过版本跟踪与审阅。
     """
-    raw = Path(file_path)
+    raw = Path(_unquote_path(file_path))
     name = raw.name
     if _WINDOWS_RESERVED_RE.fullmatch(name):
         return (
@@ -142,12 +157,19 @@ async def write_file(
         try:
             # Resolve against sandbox — parent must also be inside sandbox
             sandbox_path = Path(sandbox)
-            raw = Path(file_path)
+            raw = Path(_unquote_path(file_path))
             if not raw.is_absolute():
                 base = Path(write_anchor) if write_anchor is not None else sandbox_path
                 raw = base / raw
-            resolved_parent = safe_resolve(raw.parent, sandbox_path)
-            p = resolved_parent / raw.name
+            # A+ 阶段 1 / F-5：对**完整路径** resolve，与 read_file /
+            # edit_file / glob / grep 保持同一口径。
+            #
+            # 修复前只 resolve 了父目录，再把原始文件名裸拼回去
+            # （`resolved_parent / raw.name`）。若工作区内存在指向沙箱外
+            # 的符号链接（用户自己的软链、或 bash 工具先建一个），
+            # resolved_parent 的校验会通过，随后 write_text 沿链接写出去
+            # ——路径围栏被绕过。读写口径不一致本身即证明这是遗漏而非设计。
+            p = safe_resolve(raw, sandbox_path)
         except ValueError as e:
             return f"Error: {e}"
     else:
@@ -178,7 +200,7 @@ async def edit_file(
             时编辑 anchor 副本（与 write_file 同一落点），否则退回 sandbox 根
             （共享文件编辑兼容）；绝对路径行为完全不变。
     """
-    raw = Path(file_path)
+    raw = Path(_unquote_path(file_path))
     relative = not raw.is_absolute()
     p: Path
     if sandbox:
@@ -234,7 +256,7 @@ def _resolve_edit_target(
     reuse the exact same resolution rule without disturbing the fully-tested
     :func:`edit_file`.
     """
-    raw = Path(file_path)
+    raw = Path(_unquote_path(file_path))
     relative = not raw.is_absolute()
     p: Path
     if sandbox:

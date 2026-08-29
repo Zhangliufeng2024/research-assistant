@@ -1,5 +1,6 @@
 """FastAPI application factory."""
 
+import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
@@ -8,6 +9,7 @@ from urllib.parse import urlsplit
 from fastapi import FastAPI
 from fastapi.staticfiles import StaticFiles
 
+from ..artifacts import ArtifactVersionStore
 from ..config import (
     app_config_env_path,
     ensure_global_config,
@@ -18,6 +20,8 @@ from ..context import SourceStore
 from ..core import ensure_output_folder, setup_claude_skills
 from ..runtime import BackgroundTaskHub, DurableScheduler, PlatformStore, build_scheduler_dispatcher
 from ..tools.citation_verify import close_shared_clients
+
+LOG = logging.getLogger(__name__)
 
 # ---------------------------------------------------------------------------
 # 同源守卫（安全加固）：单点收口，覆盖 /api、/ws 与静态挂载
@@ -154,6 +158,20 @@ async def lifespan(app: FastAPI):
     app.state.task_hub = BackgroundTaskHub(platform_store)
     app.state.scheduler = DurableScheduler(platform_store, janitor_cwd=cwd)
     app.state.source_store = SourceStore(cwd / ".ra" / "sources.sqlite3")
+
+    # A+ 阶段 1 / F-1 存量修复：F-1 修复前，Janitor 淘汰快照 .bin 时并不改
+    # 索引，老工作区里因此可能残留一批「索引说有、磁盘没有」的悬空记录——
+    # 点「恢复」会删掉用户当前的真实文件。启动时把这类记录显性标记为已清理，
+    # 之后 UI 会禁用恢复入口、restore 也改为报 409 而非删文件。
+    #
+    # 幂等、且只在确有不一致时才回写 index.json；失败不得阻断启动。
+    try:
+        reconciled = ArtifactVersionStore(cwd).reconcile_snapshots()
+        if reconciled:
+            LOG.info("版本快照索引修复：标记 %d 条快照缺失的变更记录", reconciled)
+    except Exception:  # noqa: BLE001 — 启动路径绝不能因治理逻辑失败而中断
+        LOG.warning("版本快照索引修复失败（不影响启动）", exc_info=True)
+
     dispatchers, _dispatch = build_scheduler_dispatcher(
         store=platform_store,
         hub=app.state.task_hub,

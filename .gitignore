@@ -82,3 +82,22 @@ ResearchAssistant_Trial.spec
 
 # pytest basetemp（避免误入 stash/提交）
 .pytest_tmp*/
+
+# 覆盖率产物（A+ 阶段 0 引入；报告只用于 CI 归档与本地查阅）
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+frontend/coverage/
+
+# 本地跑测时重定向输出用的临时日志
+.cov_*.log
+.full_*.log
+
+# 审查/诊断临时产物（越权测试样本含 secret.txt，绝不可提交）
+.audit_tmp/
+audit_result.txt
+git_diag*.txt
+
+# 构建配置验证的临时输出（frontend/.verify-build，可随时手工删除）
+.verify-build/

@@ -307,7 +307,7 @@ def extract_title_from_tex(tex_file: str | None) -> str | None:
                 # Clean up LaTeX commands in title
                 title = re.sub(r'\\[a-zA-Z]+(\[.*?\])?(\{.*?\})?', '', title)
                 return title.strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 — 尽力而为：标题提取失败返回 None，调用方自行降级
         pass
 
     return None
@@ -356,7 +356,7 @@ def extract_title_from_docx(docx_file: str | None) -> str | None:
         for p in doc.paragraphs:
             if p.text.strip():
                 return p.text.strip()
-    except Exception:
+    except Exception:  # noqa: BLE001 — 尽力而为：docx 解析失败返回 None，不阻断调用方
         pass
 
     return None

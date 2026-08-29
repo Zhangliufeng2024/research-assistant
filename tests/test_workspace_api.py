@@ -373,3 +373,81 @@ class TestOpen:
         resp = client.post("/api/workspace/open", params={"path": "../../"})
         assert resp.status_code == 403
         assert calls == []  # 围栏拦截在前，不会触发任何系统调用
+
+
+# ---------------------------------------------------------------------------
+# A+ 阶段 1 / F-1：快照缺失时恢复必须报 409，而不是删掉用户文件
+#
+# 旧实现：restore() 读不到快照就走「删除目标文件」分支，于是 Janitor 淘汰过
+# bin 的老工作区里，用户在变更页点「恢复」= 销毁当前文件。
+# ---------------------------------------------------------------------------
+
+class TestRestoreMissingSnapshotIsRefused:
+    def _make_change(self, tmp_path) -> tuple[str, Path]:
+        from research_assistant.artifacts import ArtifactVersionStore
+
+        target = tmp_path / "report.md"
+        target.write_text("原始", encoding="utf-8")
+        store = ArtifactVersionStore(tmp_path)
+        rec = store.record(target, "原始".encode(), "改后".encode(), tool="write_file")
+        assert rec is not None
+        return rec["id"], target
+
+    def test_restore_with_evicted_snapshot_returns_409_and_keeps_file(
+        self, tmp_path, monkeypatch,
+    ):
+        from research_assistant.artifacts import ArtifactVersionStore
+
+        change_id, target = self._make_change(tmp_path)
+        ArtifactVersionStore(tmp_path).discard_snapshot(change_id, "before")
+
+        client = _client(tmp_path, monkeypatch)
+        resp = client.post(
+            f"/api/workspace/changes/{change_id}/restore", json={"side": "before"},
+        )
+
+        assert resp.status_code == 409, resp.text
+        assert "快照" in resp.json()["detail"]
+        # 最关键：文件必须原封不动
+        assert target.read_text(encoding="utf-8") == "原始"
+
+    def test_normal_restore_still_works(self, tmp_path, monkeypatch):
+        """反向断言：快照健在时恢复照常成功，不能被修 P0 时一并堵死。"""
+        change_id, target = self._make_change(tmp_path)
+        target.write_text("改后", encoding="utf-8")
+
+        client = _client(tmp_path, monkeypatch)
+        resp = client.post(
+            f"/api/workspace/changes/{change_id}/restore", json={"side": "before"},
+        )
+
+        assert resp.status_code == 200, resp.text
+        assert target.read_text(encoding="utf-8") == "原始"
+
+    def test_unknown_change_returns_404(self, tmp_path, monkeypatch):
+        client = _client(tmp_path, monkeypatch)
+        resp = client.post(
+            "/api/workspace/changes/does-not-exist/restore", json={"side": "before"},
+        )
+        assert resp.status_code == 404
+
+    def test_bad_side_returns_422(self, tmp_path, monkeypatch):
+        change_id, _target = self._make_change(tmp_path)
+        client = _client(tmp_path, monkeypatch)
+        resp = client.post(
+            f"/api/workspace/changes/{change_id}/restore", json={"side": "middle"},
+        )
+        assert resp.status_code == 422
+
+    def test_diff_reports_snapshot_availability(self, tmp_path, monkeypatch):
+        """diff 结果带上可用性标记，供前端禁用已失效的恢复入口。"""
+        from research_assistant.artifacts import ArtifactVersionStore
+
+        change_id, _target = self._make_change(tmp_path)
+        ArtifactVersionStore(tmp_path).discard_snapshot(change_id, "after")
+
+        client = _client(tmp_path, monkeypatch)
+        body = client.get(f"/api/workspace/changes/{change_id}").json()
+
+        assert body["after_available"] is False
+        assert body["before_available"] is True

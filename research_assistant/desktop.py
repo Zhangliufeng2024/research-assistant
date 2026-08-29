@@ -166,7 +166,7 @@ def load_last_workspace() -> str | None:
         p = data.get("last_workspace")
         if p and Path(p).is_dir():
             return p
-    except Exception:
+    except Exception:  # noqa: BLE001 — 尽力而为：记忆文件损坏时按无上次工作区处理
         pass
     return None
 

@@ -1,13 +1,13 @@
 """Python code execution tool."""
 
 import asyncio
-import os
 import sys
 import uuid
 from pathlib import Path
 
-from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
+from ..constants import truncate_tool_output
 from .bash import _run_process, decode_process_output
+from .exec_provider import sanitized_exec_env
 
 
 async def run_python(
@@ -51,7 +51,9 @@ async def run_python(
         # Bug A 源头治理：给 python 子进程注入 PYTHONUTF8=1（完整环境副本），
         # 让子进程的 print/文件读写默认 utf-8，减少乱码产生面；输出侧仍有
         # decode_process_output 兜底链双保险。
-        child_env = {**os.environ, "PYTHONUTF8": "1"}
+        # A+ 阶段 5 / G-4：剔除疑似密钥后再交给模型代码（原为完整 os.environ，
+        # 模型一行 os.environ["LLM_API_KEY"] 即可读走全部密钥）。
+        child_env = {**sanitized_exec_env(), "PYTHONUTF8": "1"}
         returncode, stdout, stderr = await _run_process(
             [sys.executable, str(temp_path)], cwd=cwd, timeout=timeout,
             env=child_env,
@@ -66,7 +68,7 @@ async def run_python(
         try:
             temp_path.unlink(missing_ok=True)
         except Exception:
-            pass
+            pass  # 尽力而为：临时脚本清理失败不影响执行结果返回
 
     output_parts = []
     if stdout:
@@ -80,11 +82,6 @@ async def run_python(
     if returncode != 0:
         result = f"Exit code: {returncode}\n{result}"
 
-    if len(result) > OUTPUT_TRUNCATION_LIMIT:
-        result = (
-            result[:OUTPUT_TRUNCATION_HALF]
-            + "\n\n... (output truncated) ...\n\n"
-            + result[-OUTPUT_TRUNCATION_HALF:]
-        )
+    result = truncate_tool_output(result)
 
     return result or "(no output)"

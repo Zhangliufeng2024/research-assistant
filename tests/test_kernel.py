@@ -9,6 +9,7 @@ from research_assistant.kernel.budget import (
     price_for,
 )
 from research_assistant.kernel.context import (
+    COMPACTION_TRIGGER_FRACTION,
     externalize_tool_result,
     find_cut_point,
     maybe_compact,
@@ -17,6 +18,16 @@ from research_assistant.kernel.context import (
 from research_assistant.kernel.events import AgentEvent, EventKind, HookBus, HookVerdict
 from research_assistant.llm.base import LLMClient, LLMResponse
 from research_assistant.models import TokenUsage
+
+
+def over_trigger(model: str) -> int:
+    """刚好越过压缩触发线的 input token 数。
+
+    不硬编码 190_000 —— 那个数字曾隐含"窗口 = 200k"的假设。窗口表随模型
+    演进而修正（如 Claude 5 实为 1M）后，硬编码值会让这些用例静默失去
+    "确实触发了压缩"这一前提，从而**假绿**。这里按模型实际窗口换算。
+    """
+    return int(window_for(model) * COMPACTION_TRIGGER_FRACTION) + 1
 
 # ---------------------------------------------------------------------------
 # HookBus
@@ -292,10 +303,10 @@ class TestMaybeCompact:
         client = _SummarizerClient()
         msgs = _long_history(40)
         original_first = dict(msgs[0])
-        # Force trigger via measured tokens.
+        # Force trigger via measured tokens（按模型实际窗口换算，不硬编码）。
         out, compacted, _info = await maybe_compact(
             msgs, llm_client=client, model="claude-sonnet-5",
-            last_input_tokens=190_000,
+            last_input_tokens=over_trigger("claude-sonnet-5"),
         )
         assert compacted
         # Original opening prompt untouched.
@@ -370,7 +381,7 @@ class TestCompactionMetering:
 
         await maybe_compact(
             msgs, llm_client=client, model="claude-sonnet-5",
-            last_input_tokens=190_000, budget=budget,
+            last_input_tokens=over_trigger("claude-sonnet-5"), budget=budget,
         )
 
         assert len(budget.recorded) == 1
@@ -378,9 +389,20 @@ class TestCompactionMetering:
 
 class TestWindowFor:
     def test_known_models(self):
-        assert window_for("claude-sonnet-5") == 200_000
+        # Claude 5 全系窗口为 1M（2026-08 核实）；此前整族误写为 200_000，
+        # 导致 1M 模型在 140k 就触发压缩。
+        assert window_for("claude-sonnet-5") == 1_000_000
+        assert window_for("claude-opus-5") == 1_000_000
+        assert window_for("claude-fable-5") == 1_000_000
+        # Claude 4.x 与 Haiku 仍为 200k
+        assert window_for("claude-sonnet-4-6") == 200_000
+        assert window_for("claude-haiku-4-5-20251001") == 200_000
         assert window_for("gpt-4o") == 128_000
         assert window_for("deepseek-chat") == 128_000
 
     def test_unknown_model_default(self):
         assert window_for("mystery-model") == 128_000
+
+    def test_version_entries_take_precedence_over_family(self):
+        """回归锁：window_for 是第一匹配即返回，版本级条目必须排在前面。"""
+        assert window_for("claude-opus-5") != window_for("claude-opus-4-6")

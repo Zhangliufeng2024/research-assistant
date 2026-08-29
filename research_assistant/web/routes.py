@@ -4,6 +4,7 @@ import asyncio
 import importlib.metadata
 import io
 import json
+import logging
 import mimetypes
 import os
 import platform
@@ -36,6 +37,8 @@ from ..utils import (
 from ..workflows import get_workflow_registry
 
 router = APIRouter()
+
+LOG = logging.getLogger(__name__)
 
 #: B2: events tail-read bounds (first-load default / hard cap).
 DEFAULT_TAIL_EVENTS = 500
@@ -97,7 +100,7 @@ def _paper_summary(paper_dir: Path) -> dict:
             d, t = parts[0], parts[1]
             date_str = f"{d[:4]}-{d[4:6]}-{d[6:8]} {t[:2]}:{t[2:4]}"
         except (IndexError, ValueError):
-            pass
+            pass  # 尽力而为：目录名日期段不规范时留空，不影响其余摘要字段
 
     info = scan_paper_directory(paper_dir)
 
@@ -337,7 +340,7 @@ async def import_project(request: Request, overwrite: bool | None = None, confli
             if isinstance(decoded, dict):
                 manifest = decoded
         except (KeyError, UnicodeDecodeError, json.JSONDecodeError):
-            pass
+            pass  # 合理降级：清单文件缺失或损坏时按无 manifest 导入（不阻断包导入）
         imported_rows = await asyncio.to_thread(
             request.app.state.platform_store.import_project_manifest,
             request.app.state.project["id"], manifest,
@@ -830,8 +833,91 @@ def _research_store(request: Request):
 
 @router.get("/research/overview")
 async def research_overview(request: Request):
+    """只读统一视图：科研对象计数 + 工作区级快照（会话/任务/作业/产物/事件）。
+
+    计划项 3.6：给前端一个稳定读法。纯只读聚合——不触发任何清退、
+    不新增写入路径；原 research_overview 的 counts/uncovered_claims
+    键保持不变，工作区快照以新增键合并进同一响应。
+    """
     store, project_id = _research_store(request)
-    return await asyncio.to_thread(store.research_overview, project_id)
+    base = await asyncio.to_thread(store.research_overview, project_id)
+    base.update(await asyncio.to_thread(_workspace_snapshot, request, store, project_id))
+    return base
+
+
+def _workspace_snapshot(request: Request, store, project_id: str) -> dict:
+    """聚合工作区级只读快照（全部走既有查询方法与只读 SQL）。"""
+    snapshot: dict[str, Any] = {}
+
+    # ---- 会话列表摘要：复用 chat.py 的会话目录摘要（不触发清退）----
+    from .chat import _load_run_state, _session_summary, _sessions_root
+
+    cwd = getattr(request.app.state, "cwd", None) or Path.cwd()
+    root = _sessions_root(cwd)
+    sessions: list[dict[str, Any]] = []
+    if root.is_dir():
+        for child in sorted(root.iterdir()):
+            if not child.is_dir() or child.name.startswith("."):
+                continue
+            if _load_run_state(child) is None:
+                continue  # 无 run.json 的杂散目录不算会话
+            try:
+                sessions.append(_session_summary(child))
+            except OSError:
+                continue  # 并发删除等竞态：跳过即可
+    sessions.sort(key=lambda s: -(s.get("updated_at") or 0))
+    snapshot["sessions"] = {
+        "total": len(sessions),
+        "recent": sessions[:20],
+    }
+
+    # ---- 任务计数与最近状态 ----
+    tasks = store.list_tasks(project_id, limit=200)
+    task_status_counts: dict[str, int] = {}
+    for t in tasks:
+        status = str(t.get("status") or "unknown")
+        task_status_counts[status] = task_status_counts.get(status, 0) + 1
+    snapshot["tasks"] = {
+        "total": len(tasks),
+        "by_status": task_status_counts,
+        "recent": [
+            {
+                "id": t.get("id"),
+                "title": t.get("title") or t.get("query") or "",
+                "status": t.get("status"),
+                "created_at": t.get("created_at"),
+                "updated_at": t.get("updated_at"),
+            }
+            for t in tasks[:5]
+        ],
+    }
+
+    # ---- 作业计数与最近状态 ----
+    jobs = store.list_jobs(project_id, limit=200)
+    job_status_counts: dict[str, int] = {}
+    for j in jobs:
+        status = str(j.get("status") or "unknown")
+        job_status_counts[status] = job_status_counts.get(status, 0) + 1
+    snapshot["jobs"] = {
+        "total": len(jobs),
+        "by_status": job_status_counts,
+        "recent": [
+            {
+                "id": j.get("id"),
+                "workflow_id": j.get("workflow_id"),
+                "status": j.get("status"),
+                "attempts": j.get("attempts"),
+                "updated_at": j.get("updated_at"),
+                "last_error": j.get("last_error") or "",
+            }
+            for j in jobs[:5]
+        ],
+    }
+
+    # ---- 产物计数（artifacts 表）与最近事件 ----
+    snapshot["artifacts"] = store.artifacts_overview()
+    snapshot["recent_events"] = store.recent_project_events(project_id, limit=10)
+    return snapshot
 
 
 @router.get("/research/quality")
@@ -1119,11 +1205,11 @@ async def _run_reproduce_script_frozen(*, script: Path, cwd: Path,
     try:
         exit_code = int(marker.read_text(encoding="ascii").strip())
     except (OSError, ValueError):
-        pass
+        pass  # 合理降级：标记未落盘即维持上方 -1 失败口径
     try:
         marker.unlink(missing_ok=True)
     except OSError:
-        pass
+        pass  # 尽力而为：标记清理失败不影响脚本结果返回
     return _ScriptResult(exit_code, output, "")
 
 
@@ -1167,6 +1253,29 @@ async def _reproduce_analysis(*, store, run_id: str, project_id: str, script: Pa
         current_runtime = runtime_environment(root)
         environment_changes = schema_changes(recorded_runtime, current_runtime)
         outputs = {"artifact_dir": str(output_dir.relative_to(root)).replace("\\", "/"), "input_schema_changes": changes, "input_file_changes": file_changes, "environment_changes": environment_changes}
+
+        # A+ 阶段 2 / F-3：把复现产物纳入版本历史。
+        #
+        # 复现脚本经 subprocess 在请求循环之外写文件，**完全绕开 ToolRegistry**
+        # ——产物此前只出现在 outputs_json 里，出错后无法 diff 也无法恢复。
+        # 这里走显式 opt-in 的 record_tree（不采用 atomic_write_text 全局钩子：
+        # 版本存储自身用它写 index.json，会造成「写索引→记变更→又写索引」的
+        # 递归）。缺口如实上报，不留静默。
+        try:
+            from ..artifacts.versioning import ArtifactVersionStore
+
+            scan = await asyncio.to_thread(
+                ArtifactVersionStore(root).record_tree,
+                output_dir, tool=f"analysis:{run_id}",
+            )
+            if scan.get("skipped_oversized") or scan.get("truncated"):
+                LOG.warning(
+                    "复现产物版本登记存在缺口 run=%s %s", run_id[:8], scan,
+                )
+            outputs["versioned_artifacts"] = scan
+        except Exception:  # noqa: BLE001 —— 版本登记失败不能影响复现结果本身
+            LOG.warning("复现产物版本登记失败 run=%s", run_id[:8], exc_info=True)
+
         await asyncio.to_thread(
             store.finish_analysis_run, run_id,
             status="complete" if completed.returncode == 0 else "failed", outputs=outputs,
@@ -1678,14 +1787,15 @@ async def get_paper(paper_name: str, request: Request):
         try:
             summary_content = Path(info["summary"]).read_text(encoding="utf-8")
         except Exception:
-            pass
+            # 真实错误上报：文件登记在案却读不出，静默返回空内容会误导前端
+            LOG.warning("summary 文件读取失败: %s", info["summary"], exc_info=True)
 
     progress_content = ""
     if info.get("progress_log"):
         try:
             progress_content = Path(info["progress_log"]).read_text(encoding="utf-8")
         except Exception:
-            pass
+            LOG.warning("progress_log 文件读取失败: %s", info["progress_log"], exc_info=True)
 
     return {
         **summary,

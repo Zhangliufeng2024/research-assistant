@@ -29,6 +29,7 @@ class ToolApprovalRequest:
     metadata: dict[str, Any] = field(default_factory=dict)
 
     def summary(self, max_args_chars: int = 300) -> str:
+        """单行摘要（工具名 + 参数 repr 截断 + 升级原因），供审批 UI 展示。"""
         try:
             args_text = repr(self.arguments)
         except Exception:
@@ -43,6 +44,8 @@ class ToolApprovalRequest:
 
 @dataclass
 class ApprovalDecision:
+    """审批结论：*approved* 为最终裁决，*note* 是给人看的一句话说明。"""
+
     approved: bool
     note: str = ""
 

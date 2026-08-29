@@ -16,7 +16,10 @@ import json
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:
+    from ..llm.base import LLMClient
 
 SUMMARY_MARKER = "[CONTEXT SUMMARY"
 EXTERNALIZE_THRESHOLD_CHARS = 4_000
@@ -26,7 +29,24 @@ KEEP_RECENT_MESSAGES = 12
 MIN_SPAN_MESSAGES = 6
 
 # Conservative context windows (input tokens) keyed by model-name prefix.
+#
+# ⚠️ window_for() 是**首个匹配即返回**（first-match），不是最长前缀匹配。
+# 因此更具体的前缀必须排在更前面，否则会被上面的宽泛条目先截走。
+#
+# 2026-08 核实：Fable 5 / Opus 5 / Sonnet 5 的窗口为 **1,000,000**（默认即
+# 最大值，无 beta header、无长上下文附加费）；Haiku 4.5 为 200,000。
+# 此前把整个 claude-sonnet / claude-opus 族写成 200_000，导致 1M 窗口的模型
+# 在 140k（0.7 × 200k）就触发压缩，**浪费 86% 可用窗口**。
+#
+# 版本号条目在前、家族兜底在后；未知的 Claude 模型仍落到保守的族级值。
 _MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
+    ("claude-fable-5", 1_000_000),
+    ("claude-opus-5", 1_000_000),
+    ("claude-sonnet-5", 1_000_000),
+    ("claude-mythos-5", 1_000_000),
+    ("claude-opus-4", 200_000),
+    ("claude-sonnet-4", 200_000),
+    ("claude-haiku-4", 200_000),
     ("claude-opus", 200_000),
     ("claude-sonnet", 200_000),
     ("claude-haiku", 200_000),
@@ -44,6 +64,8 @@ DEFAULT_CONTEXT_WINDOW = 128_000
 
 @dataclass
 class ModelWindow:
+    """单模型上下文窗口（输入 token 口径）。"""
+
     context_window: int
 
 
@@ -104,10 +126,14 @@ def externalize_tool_result(
         return result  # best-effort: never lose a tool result over an IO error
 
     head = result[:PREVIEW_CHARS]
+    # 路径加引号：Windows 工作区路径含空格极常见（如 D:\vscode files\），
+    # 不加引号时模型（以及按 \S+ 解析的测试）只能拿到被空格截断的残缺路径，
+    # 后续 read_file 必然失败——表现为「外置产物永远读不回来」。
+    # file_ops 的路径入口会剥掉这对包裹引号，模型照抄即可。
     return (
         f"{head}\n\n"
-        f"[OUTPUT TRUNCATED — full {len(result)}-char result saved to: {path} "
-        f"(use read_file to view)]"
+        f"[OUTPUT TRUNCATED — full {len(result)}-char result saved to: "
+        f'"{path}" (use read_file to view)]'
     )
 
 
@@ -186,7 +212,7 @@ def render_span_for_summary(span: list[dict]) -> str:
 
 
 async def summarize_span(
-    llm_client,
+    llm_client: LLMClient,
     span_text: str,
     max_tokens: int = 1600,
     budget: Any | None = None,
@@ -203,7 +229,7 @@ async def summarize_span(
     取消类异常（如主链路的 _TurnCancelled）原样穿出——本层不做降级，
     「压缩失败照常继续」的优雅降级只属于调用方。
     """
-    kwargs = dict(
+    kwargs: dict[str, Any] = dict(
         messages=[{"role": "user", "content": span_text}],
         system=_SUMMARY_SYSTEM,
         temperature=0.2,
@@ -224,14 +250,14 @@ async def summarize_span(
 async def maybe_compact(
     messages: list[dict],
     *,
-    llm_client,
+    llm_client: LLMClient,
     model: str,
     last_input_tokens: int = 0,
     keep_recent: int = KEEP_RECENT_MESSAGES,
     trigger_fraction: float = COMPACTION_TRIGGER_FRACTION,
     budget: Any | None = None,
     supervised_chat: SupervisedChat | None = None,
-) -> tuple[list[dict], bool]:
+) -> tuple[list[dict], bool, dict[str, int] | None]:
     """Compact *messages* in place when nearing the context window.
 
     Trigger: measured ``last_input_tokens`` when available, otherwise the

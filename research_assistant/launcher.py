@@ -35,7 +35,7 @@ def load_config() -> dict:
                 saved = json.load(f)
             merged = {**DEFAULTS, **saved}
             return merged
-        except Exception:
+        except Exception:  # noqa: BLE001 — 尽力而为：配置文件损坏时回退默认配置
             pass
     return dict(DEFAULTS)
 

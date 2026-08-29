@@ -1,6 +1,7 @@
 """Tool definitions and registry for the agent loop."""
 
 import asyncio
+import logging
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -361,16 +362,59 @@ def _clamp_timeout(raw: Any) -> int:
     return max(_EXEC_TIMEOUT_MIN_S, min(_EXEC_TIMEOUT_MAX_S, value))
 
 
-def _snapshot_exec_outputs(roots: list[Path], workspace: Path) -> dict[Path, bytes]:
+@dataclass(frozen=True)
+class SnapshotStats:
+    """一次执行快照的覆盖情况（A+ 阶段 2 / F-4）。
+
+    此前超限丢弃是**完全静默**的：文件数到 512 直接 return、字节超限直接
+    continue，回执只报「已记录 N 个变更」，用户无从得知有多少产物其实没进
+    版本历史。于是「变更」页看起来什么都有，真要恢复时才发现缺了一大半。
+    """
+
+    files_captured: int = 0
+    #: 文件数达到上限后中止扫描（剩余文件全部未被扫描，无法精确计数）
+    truncated: bool = False
+    #: 因单文件过大或累计超字节上限而被跳过的文件数
+    oversized_skipped: int = 0
+    #: 按名排除的执行中间脚本（_ra_exec_*.py）——有意排除，不算「漏网」
+    exec_scripts_skipped: int = 0
+
+    @property
+    def has_gaps(self) -> bool:
+        return self.truncated or self.oversized_skipped > 0
+
+    def notice(self) -> str:
+        """给模型的中文提示；无缺口时返回空串。"""
+        if not self.has_gaps:
+            return ""
+        parts: list[str] = []
+        if self.truncated:
+            parts.append(f"文件数达到上限 {_EXEC_SNAPSHOT_MAX_FILES}，部分产物未被扫描")
+        if self.oversized_skipped:
+            cap_mb = _EXEC_SNAPSHOT_MAX_BYTES // (1024 * 1024)
+            parts.append(f"{self.oversized_skipped} 个文件因超过 {cap_mb}MB 上限被跳过")
+        return f"（注意：{'；'.join(parts)}，这些文件未纳入版本跟踪，无法恢复）"
+
+
+def _snapshot_exec_outputs(
+    roots: list[Path], workspace: Path,
+) -> tuple[dict[Path, bytes], SnapshotStats]:
     """Bounded recursive snapshot around an execution tool invocation.
 
     Script tools can create many files without going through ``write_file``.
     Capture their before/after bytes in the same version store while keeping
     scanning bounded so an analysis job cannot stall the event loop.
+
+    Returns:
+        ``(snapshot, stats)``。stats 描述**未被覆盖**的部分，调用方必须把它
+        呈现出来（A+ 阶段 2 / F-4）——静默丢弃会让用户误以为产物全都被版本化了。
     """
     snapshot: dict[Path, bytes] = {}
     total = 0
     seen: set[Path] = set()
+    oversized_skipped = 0
+    exec_scripts_skipped = 0
+    truncated = False
     for root in roots:
         try:
             root = safe_resolve(root, workspace)
@@ -382,21 +426,33 @@ def _snapshot_exec_outputs(roots: list[Path], workspace: Path) -> dict[Path, byt
         candidates = [root] if root.is_file() else root.rglob("*")
         for path in candidates:
             if len(snapshot) >= _EXEC_SNAPSHOT_MAX_FILES:
-                return snapshot
+                truncated = True
+                break
             if any(part in _EXEC_SNAPSHOT_EXCLUDES for part in path.parts):
                 continue
             try:
                 resolved = safe_resolve(path, workspace)
-                if not resolved.is_file() or resolved.name.startswith("_ra_exec_"):
+                if not resolved.is_file():
+                    continue
+                if resolved.name.startswith("_ra_exec_"):
+                    exec_scripts_skipped += 1
                     continue
                 size = resolved.stat().st_size
                 if size > _EXEC_SNAPSHOT_MAX_BYTES or total + size > _EXEC_SNAPSHOT_MAX_BYTES:
+                    oversized_skipped += 1
                     continue
                 snapshot[resolved] = resolved.read_bytes()
                 total += size
             except (OSError, ValueError):
                 continue
-    return snapshot
+        if truncated:
+            break
+    return snapshot, SnapshotStats(
+        files_captured=len(snapshot),
+        truncated=truncated,
+        oversized_skipped=oversized_skipped,
+        exec_scripts_skipped=exec_scripts_skipped,
+    )
 
 
 class ToolRegistry:
@@ -417,6 +473,8 @@ class ToolRegistry:
         write_anchor: str | None = None,
         exec_cwd: str | None = None,
         allowed_tools: tuple[str, ...] | list[str] | None = None,
+        artifact_store: Any | None = None,
+        artifact_session: str | None = None,
     ):
         self.work_dir = work_dir
         self.write_anchor = write_anchor
@@ -429,6 +487,33 @@ class ToolRegistry:
         # Execution-world seam: defaults to the local provider. Swapping in a
         # container/remote provider moves bash/run_python wholesale.
         self.exec_provider: ExecProvider = exec_provider if exec_provider is not None else LocalExecProvider()
+        # A+ 阶段 2 / F-2：产物索引**推模式**回填。
+        #
+        # 此前 artifacts 表只在有人调用 `/chat/sessions/{id}/manifest` 时才被
+        # 拉模式回填（chat.py 的 replace_artifacts），也就是说：**没人查就不
+        # 记**。结果是同一份"产生了哪些文件"在 6 处各记一份且互不一致。
+        # 会话宿主把 PlatformStore 与 session_id 注入进来，工具写成功即回填，
+        # 让这张表成为唯一权威；manifest.json / artifact_reviews 降为派生视图。
+        # CLI / 单代理路径不注入（None）→ 行为与现状完全一致。
+        self.artifact_store = artifact_store
+        self.artifact_session = artifact_session or ""
+
+    def _notify_artifact(self, path: Path) -> None:
+        """写入成功后把产物推入索引（F-2 推模式）。
+
+        索引失败**绝不能**影响写入本身——它是辅助视图，不是数据。失败仅记
+        debug，留待下一次 manifest 重建兜底。
+        """
+        if self.artifact_store is None or not self.artifact_session:
+            return
+        try:
+            self.artifact_store.upsert_artifact(
+                self.artifact_session, path, workspace=Path(self.work_dir),
+            )
+        except Exception:  # noqa: BLE001 — 索引是旁路，不阻断主路径
+            logging.getLogger(__name__).debug(
+                "产物索引回填失败 path=%s", path, exc_info=True,
+            )
 
     def get_schemas(self) -> list[dict[str, Any]]:
         base: list[dict[str, Any]]
@@ -458,95 +543,103 @@ class ToolRegistry:
         self.extensions[ext.name] = ext
 
     async def execute(self, name: str, arguments: dict[str, Any]) -> str:
-        """Execute a tool by name and return the result as a string."""
+        """Execute a tool by name and return the result as a string.
+
+        A+ 阶段 3 / A-2 拆分后的分发骨架：本方法只做**顺序**决策——
+        extensions → 执行缝（bash/run_python）→ apply_patch → 通用 handler。
+        每个分支的细节在自己的私有方法里；所有分支的错误都以 ``Error …``
+        字符串返回（模型可读），不向上抛。
+        """
         if self.allowed_tools is not None and name not in self.allowed_tools:
             return f"Error: 工具 {name} 不在当前 Agent 的允许列表中"
-        # Declarative extensions dispatch first (they are not in _TOOL_HANDLERS).
         if name in self.extensions:
-            ext = self.extensions[name]
-            try:
-                result = ext.handler(**arguments)
-                if asyncio.iscoroutine(result):
-                    result = await result
-                return str(result)
-            except Exception as e:  # noqa: BLE001 — untrusted handler; report and continue
-                return f"Error executing extension {name}: {e}"
-        # Execution-provider tools are dispatched through the seam *before* the
-        # handler lookup: bash/run_python no longer live in _TOOL_HANDLERS, so
-        # swapping self.exec_provider moves the whole execution world (container,
-        # remote sandbox) without touching tool definitions. Argument
-        # normalization below is identical to what the local handlers received
-        # before the seam was introduced (no duplication, no loss).
+            return await self._execute_extension(name, arguments)
+        if name in ("bash", "run_python"):
+            return await self._execute_via_provider(name, arguments)
+        if name == "apply_patch":
+            return await self._execute_apply_patch(arguments)
+        return await self._execute_handler(name, arguments)
+
+    async def _execute_extension(self, name: str, arguments: dict[str, Any]) -> str:
+        """声明式扩展优先派发（它们不在 _TOOL_HANDLERS 里）。"""
+        ext = self.extensions[name]
+        try:
+            result = ext.handler(**arguments)
+            if asyncio.iscoroutine(result):
+                result = await result
+            return str(result)
+        except Exception as e:  # noqa: BLE001 — untrusted handler; report and continue
+            return f"Error executing extension {name}: {e}"
+
+    async def _execute_via_provider(self, name: str, arguments: dict[str, Any]) -> str:
+        """bash / run_python：经执行缝派发（交换 exec_provider 即整体迁移执行世界）。
+
+        两工具共享同一骨架：cwd 围栏解析 → 前置快照 → 调用 provider →
+        版本回填。差异只在参数归一（bash 有 path→cwd 的历史双键口径）与
+        provider 调用形状（run_python 额外带 workspace_root：会话模式下
+        cwd 可能是产物目录，而 WS 必须恒指工作区根）。
+        """
         if name == "bash":
-            if "path" not in arguments or not arguments.get("path"):
+            if not arguments.get("path"):
                 arguments["path"] = self.exec_cwd
             arguments["cwd"] = arguments.pop("path", self.exec_cwd)
-            try:
-                raw_cwd = Path(str(arguments.get("cwd") or self.exec_cwd))
-                workspace = Path(self.work_dir)
-                cwd = safe_resolve(raw_cwd if raw_cwd.is_absolute() else workspace / raw_cwd, workspace)
-                snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [cwd]
-                before = await asyncio.to_thread(
-                    _snapshot_exec_outputs, snapshot_roots, Path(self.work_dir),
-                )
-                result = await self.exec_provider.run_bash(
-                    command=arguments.get("command", ""),
-                    timeout=_clamp_timeout(arguments.get("timeout", 120)),
-                    cwd=str(cwd),
-                )
-                return await self._record_exec_changes(before, snapshot_roots, name, result)
-            except ValueError:
-                return "Error executing bash: working directory escapes workspace"
-            except Exception as e:
-                return f"Error executing {name}: {e}"
+        else:
+            arguments.setdefault("cwd", self.exec_cwd)
 
-        if name == "run_python":
-            if "cwd" not in arguments:
-                arguments["cwd"] = self.exec_cwd
-            try:
-                raw_cwd = Path(str(arguments["cwd"]))
-                workspace = Path(self.work_dir)
-                cwd = safe_resolve(raw_cwd if raw_cwd.is_absolute() else workspace / raw_cwd, workspace)
-                snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [cwd]
-                before = await asyncio.to_thread(
-                    _snapshot_exec_outputs, snapshot_roots, Path(self.work_dir),
+        async def run(cwd: str) -> str:
+            timeout = _clamp_timeout(arguments.get("timeout", 120))
+            if name == "bash":
+                return await self.exec_provider.run_bash(
+                    command=arguments.get("command", ""), timeout=timeout, cwd=cwd,
                 )
-                # workspace_root 恒取 work_dir（工作区根），与 cwd 解耦：
-                # 会话模式下 cwd 可能是产物目录，而 WS 必须指向根
-                result = await self.exec_provider.run_python(
-                    code=arguments.get("code", ""),
-                    timeout=_clamp_timeout(arguments.get("timeout", 120)),
-                    cwd=str(cwd),
-                    workspace_root=self.work_dir,
-                )
-                return await self._record_exec_changes(before, snapshot_roots, name, result)
-            except ValueError:
-                return "Error executing run_python: working directory escapes workspace"
-            except Exception as e:
-                return f"Error executing {name}: {e}"
+            return await self.exec_provider.run_python(
+                code=arguments.get("code", ""), timeout=timeout, cwd=cwd,
+                workspace_root=self.work_dir,
+            )
 
-        handler = self._handlers.get(name)
-        if name == "apply_patch":
-            # Multi-file batch edit: inject sandbox/anchor (model never passes
-            # them) and use the same snapshot-based version recording as the
-            # exec tools so批量编辑同样可在「变更」页 diff/恢复。
-            arguments["sandbox"] = self.work_dir
-            if self.write_anchor is not None:
-                arguments["write_anchor"] = self.write_anchor
-            snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [Path(self.work_dir)]
-            before = await asyncio.to_thread(
+        try:
+            raw_cwd = Path(str(arguments.get("cwd") or self.exec_cwd))
+            workspace = Path(self.work_dir)
+            cwd = safe_resolve(
+                raw_cwd if raw_cwd.is_absolute() else workspace / raw_cwd, workspace,
+            )
+            snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [cwd]
+            before, _before_stats = await asyncio.to_thread(
                 _snapshot_exec_outputs, snapshot_roots, Path(self.work_dir),
             )
-            try:
-                result = await apply_patch(
-                    patches=arguments.get("patches"),
-                    sandbox=arguments.get("sandbox", self.work_dir),
-                    write_anchor=arguments.get("write_anchor"),
-                )
-            except Exception as e:
-                return f"Error executing apply_patch: {e}"
+            result = await run(str(cwd))
             return await self._record_exec_changes(before, snapshot_roots, name, result)
+        except ValueError:
+            return f"Error executing {name}: working directory escapes workspace"
+        except Exception as e:
+            return f"Error executing {name}: {e}"
 
+    async def _execute_apply_patch(self, arguments: dict[str, Any]) -> str:
+        """多文件批量编辑：注入 sandbox/anchor（模型从不传），与执行工具共用
+        快照式版本记录，批量编辑同样可在「变更」页 diff/恢复。
+
+        快照根与执行工具不同：fallback 恒取工作区根而非 cwd——批量补丁
+        可能落在 anchor 之外的任意工作区路径。
+        """
+        arguments["sandbox"] = self.work_dir
+        if self.write_anchor is not None:
+            arguments["write_anchor"] = self.write_anchor
+        snapshot_roots = [Path(self.write_anchor)] if self.write_anchor else [Path(self.work_dir)]
+        before, _before_stats = await asyncio.to_thread(
+            _snapshot_exec_outputs, snapshot_roots, Path(self.work_dir),
+        )
+        try:
+            result = await apply_patch(
+                patches=arguments.get("patches"),
+                sandbox=arguments.get("sandbox", self.work_dir),
+                write_anchor=arguments.get("write_anchor"),
+            )
+        except Exception as e:
+            return f"Error executing apply_patch: {e}"
+        return await self._record_exec_changes(before, snapshot_roots, "apply_patch", result)
+
+    async def _execute_handler(self, name: str, arguments: dict[str, Any]) -> str:
+        """通用 handler 路径：围栏注入 → 路径预解析 → 调用 → 版本记录 + 推送。"""
         handler = self._handlers.get(name)
         if handler is None:
             return f"Error: Unknown tool '{name}'. Available tools: {list(self._handlers.keys())}"
@@ -614,7 +707,11 @@ class ToolRegistry:
                         tracked_path, before_bytes, after_bytes, tool=name,
                     )
                 except (OSError, ValueError):
-                    pass
+                    pass  # 尽力而为：版本登记是旁路可观测性，失败不影响工具写入本身
+                # A+ 阶段 2 / F-2：写入成功即推入产物索引。此前的拉模式只在
+                # 有人调 manifest 端点时才回填——没人查就不记。旁路失败
+                # 不影响写入本身。
+                self._notify_artifact(tracked_path)
             return result
         except Exception as e:
             return f"Error executing {name}: {e}"
@@ -626,14 +723,32 @@ class ToolRegistry:
         tool: str,
         result: str,
     ) -> str:
-        """Append indirect script writes/deletions to recoverable history."""
+        """Append indirect script writes/deletions to recoverable history.
+
+        A+ 阶段 2 / F-4：扫描本身也可能**漏掉**一部分文件（数量/字节上限），
+        这种情况必须在回执里说清楚。否则用户会以为产物都已纳入版本跟踪，
+        直到某天想恢复时才发现快照根本不存在——而那时（修复前）恢复动作
+        还会把当前文件删掉。
+        """
         workspace = Path(self.work_dir)
-        after = await asyncio.to_thread(_snapshot_exec_outputs, roots, workspace)
+        after, after_stats = await asyncio.to_thread(
+            _snapshot_exec_outputs, roots, workspace,
+        )
         changed = 0
         for path in sorted(set(before) | set(after)):
             try:
                 if self.version_store.record(path, before.get(path), after.get(path), tool=tool):
                     changed += 1
+                    # F-2 推模式：间接写入同样要进产物索引。只对实际发生
+                    # 变化的路径通知（before==after 的路径没有新版本）。
+                    self._notify_artifact(path)
             except (OSError, ValueError):
                 continue
-        return result if changed == 0 else f"{result}\n\n[已记录 {changed} 个脚本产物变更，可在“变更”页审阅或恢复]"
+        if changed == 0:
+            # 一个变更都没记录时，若扫描有缺口更要说清楚——否则用户只会
+            # 读到「没有变更」这个错误结论。
+            return f"{result}{after_stats.notice()}".rstrip() if after_stats.has_gaps else result
+        return (
+            f"{result}\n\n[已记录 {changed} 个脚本产物变更，可在“变更”页审阅或恢复]"
+            f"{after_stats.notice()}"
+        )

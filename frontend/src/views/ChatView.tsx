@@ -1,18 +1,29 @@
+/* 会话区（阶段 4 / U-4 常驻化）：会话抽屉外置 + 聊天流 + 审批卡 + 输入区
+ * + 检查器（宽屏内联 / 窄屏抽屉）。
+ *
+ * 本组件由 App 布局**常驻挂载**（不再作为路由视图卸载）：路由只决定它的
+ * 可见性（CSS display 切换）与 /chat/:sessionId 深链同步。切换会话时
+ * 输入草稿经 sessionStore 按会话 id 持久化，滚动锚点同理（离开前保存、
+ * 重进时恢复）。
+ */
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useNavigate, useParams } from "react-router-dom";
+import { Link, useLocation, useNavigate } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
-import { candidatePreviewPaths, loadDockCollapsed, saveDockCollapsed } from "@/lib/artifacts";
+import { candidatePreviewPaths } from "@/lib/artifacts";
 import { copyText } from "@/lib/clipboard";
 import { sessionTitle } from "@/lib/format";
 import type { MessageOpResult } from "@/lib/messageOps";
 import { shouldShowWaitHint } from "@/lib/waitHint";
 import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
+import { NEW_DRAFT_KEY, useSessionStore } from "@/stores/sessionStore";
+import { useUiStore } from "@/stores/uiStore";
 import { usePrefsStore, type Verbosity } from "@/stores/prefsStore";
 import { toast } from "@/stores/toastStore";
 import { usePinnedScroll } from "@/hooks/usePinnedScroll";
+import { useMediaQuery } from "@/hooks/useMediaQuery";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { PlanCard } from "@/components/chat/PlanCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
@@ -20,7 +31,6 @@ import { BudgetBar } from "@/components/chat/BudgetBar";
 import { Composer } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
 import { MessageList } from "@/components/chat/MessageList";
-import { SessionList } from "@/components/chat/SessionList";
 import {
   PeerSessionPanel,
   loadPeerSessionId,
@@ -29,6 +39,7 @@ import {
   saveSplitOpen,
 } from "@/components/chat/PeerSessionPanel";
 import { WorkspaceModal } from "@/components/chat/WorkspaceModal";
+import { NotificationsButton } from "@/components/layout/WorkspaceSearch";
 
 const PHASE_DOT: Record<string, string> = {
   idle: "bg-ink-3",
@@ -37,13 +48,12 @@ const PHASE_DOT: Record<string, string> = {
   error: "bg-danger",
 };
 
-/** 会话页：会话列表二级栏 + 聊天流 + 审批卡 + 输入区 + 右侧产出 dock（R12 P3）。 */
-export function ChatView() {
+/** 会话区：由 App 常驻挂载；active=当前路由处于会话区（控制可见性）。 */
+export function ChatView({ active = true }: { active?: boolean }) {
   const {
     conn,
     chat,
     sessions,
-    sessionsLoading,
     pendingAttachments,
     attaching,
     send,
@@ -55,7 +65,6 @@ export function ChatView() {
     newSession,
     openSession,
     refreshSessions,
-    deleteSession,
     promoteSession,
     regenerateMessage,
     editAndResend,
@@ -88,11 +97,14 @@ export function ChatView() {
 
   // R17 会话路由化：/chat/:sessionId 深链 → 打开对应会话；列表打开会话时
   // 同步写回 URL（浏览器前进后退/复制链接/通知跳转由此成立）。
-  const { sessionId: routeSessionId } = useParams<{ sessionId: string }>();
+  // 阶段 4 常驻化后本组件不在 Route 之下（useParams 拿不到），
+  // 改为直接解析 location.pathname 的 /chat/:sessionId 段。
+  const { pathname } = useLocation();
   const navigate = useNavigate();
+  const routeSessionId = /^\/chat\/([^/]+)/.exec(pathname)?.[1];
   useEffect(() => {
-    if (routeSessionId && routeSessionId !== chat.sessionId) {
-      void openSession(routeSessionId)
+    if (routeSessionId && decodeURIComponent(routeSessionId) !== chat.sessionId) {
+      void openSession(decodeURIComponent(routeSessionId))
         .then(() => refreshSessions())
         .catch(() => setLegacyToast("会话不存在或已被删除"));
     }
@@ -106,18 +118,15 @@ export function ChatView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [chat.sessionId]);
 
-  // ---- 产出 dock（C5）：折叠态记忆（与任务页共享）；xl(1280px) 以下默认收起 ----
-  const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
-  const toggleDock = useCallback(() => {
-    setDockCollapsed((prev) => {
-      const next = !prev;
-      saveDockCollapsed(next);
-      return next;
-    });
-  }, []);
-
-  // ---- 草稿入列（R12 P4）：未发送的新会话在左侧列表置顶高亮，点击聚焦输入框 --
-  const [draftFocusTick, setDraftFocusTick] = useState(0);
+  // ---- 检查器（阶段 4）：宽屏 ≥1280px 内联 dock（Ctrl+I 开关，展开态
+  // 记忆迁入 uiStore，仍持久化到原 localStorage 键）；<1280px 变抽屉（U-11）。
+  const isWide = useMediaQuery("(min-width: 1280px)");
+  const inspectorOpen = useUiStore((s) => s.inspectorOpen);
+  const inspectorDrawerOpen = useUiStore((s) => s.inspectorDrawerOpen);
+  const setInspectorDrawerOpen = useUiStore((s) => s.setInspectorDrawerOpen);
+  const toggleInspector = useUiStore((s) => s.toggleInspector);
+  // ---- 草稿入列（R12 P4）：自增信号来自 uiStore（全局 Ctrl+J / 抽屉草稿行共用）
+  const composerFocusTick = useUiStore((s) => s.composerFocusTick);
 
   // dock 根目录：connected 帧权威，恢复期兜底会话摘要（旧会话两者皆空 → null）
   const activeSummary = sessions.find((s) => s.id === chat.sessionId);
@@ -176,6 +185,59 @@ export function ChatView() {
   });
   // 流式进行中隐藏消息操作钮：regenerate/edit 此刻必被 busy 拒绝，藏起来更干净
   const opsEnabled = chat.phase !== "running";
+
+  // ---- 滚动锚点（阶段 4 / U-4）：仅非贴底（用户上翻过）时记录 scrollTop，
+  // 切走会话 / 会话区被隐藏（display:none 会清零 scrollTop）前都已随滚动
+  // 持久化；重进会话或重新可见时恢复。贴底跟随态无锚定价值，恢复跟随即可。
+  const sidForAnchor = chat.sessionId;
+  const pinnedRef = useRef(pinned);
+  pinnedRef.current = pinned;
+  useEffect(() => {
+    const el = containerRef.current;
+    if (!el || !sidForAnchor) return;
+    let raf = 0;
+    const onScroll = () => {
+      if (raf) return;
+      raf = requestAnimationFrame(() => {
+        raf = 0;
+        if (!pinnedRef.current && el.scrollTop > 0) {
+          useSessionStore.getState().setAnchor(sidForAnchor, el.scrollTop);
+        }
+      });
+    };
+    el.addEventListener("scroll", onScroll, { passive: true });
+    return () => {
+      el.removeEventListener("scroll", onScroll);
+      if (raf) cancelAnimationFrame(raf);
+    };
+  }, [sidForAnchor, containerRef]);
+
+  // 重新可见（导航离开又回来）：display:none 期间 scrollTop 归零，恢复锚点
+  useEffect(() => {
+    if (!active || !sidForAnchor) return;
+    const el = containerRef.current;
+    const anchor = sidForAnchor ? useSessionStore.getState().getAnchor(sidForAnchor) : 0;
+    if (el && anchor > 0) el.scrollTop = anchor;
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [active]);
+
+  // 会话切换：挂起恢复信号，等历史 items 渲染后再落锚（切会话瞬间内容未加载）
+  const pendingAnchorSidRef = useRef<string | null>(null);
+  useEffect(() => {
+    if (
+      sidForAnchor &&
+      useSessionStore.getState().getAnchor(sidForAnchor) > 0
+    ) {
+      pendingAnchorSidRef.current = sidForAnchor;
+    }
+  }, [sidForAnchor]);
+  useEffect(() => {
+    const pending = pendingAnchorSidRef.current;
+    if (!pending || pending !== chat.sessionId || chat.items.length === 0) return;
+    const el = containerRef.current;
+    if (el) el.scrollTop = useSessionStore.getState().getAnchor(pending);
+    pendingAnchorSidRef.current = null;
+  }, [chat.items, chat.sessionId, containerRef]);
 
   /* ---- 消息操作三件套（R14-M）：结果码 → 全局 toast ---- */
   const reportOpResult = useCallback((r: MessageOpResult) => {
@@ -280,29 +342,8 @@ export function ChatView() {
   }, [splitOpen, peerSessionId, sessions]);
 
   return (
-    <div className="flex h-full min-h-0">
-      {/* 会话列表二级栏 */}
-      <div className="hidden w-60 shrink-0 border-r border-edge bg-canvas md:block">
-        <SessionList
-          sessions={sessions}
-          activeId={chat.sessionId}
-          loading={sessionsLoading}
-          draftActive={chat.sessionId === null && chat.items.length === 0}
-          onDraftClick={() => setDraftFocusTick((t) => t + 1)}
-          onNew={() => newSession()}
-          onOpen={(id) => void openSession(id).then(() => refreshSessions()).catch(() => {})}
-          onDelete={async (id) => {
-            try {
-              await deleteSession(id);
-              setLegacyToast("会话已删除");
-            } catch {
-              setLegacyToast("删除失败");
-            }
-          }}
-        />
-      </div>
-
-      {/* 主聊天列 */}
+    <div className="flex h-full min-h-0 flex-1">
+      {/* 主聊天列（会话列表已外置为导航栏二级抽屉 SessionDrawer） */}
       <div className="flex min-w-0 flex-1 flex-col">
         {/* 工具条 */}
         <div className="flex shrink-0 items-center gap-2.5 border-b border-edge px-5 py-2.5">
@@ -317,6 +358,23 @@ export function ChatView() {
                 <BudgetBar budget={chat.budget} />
               </div>
             )}
+            {/* 窄屏检查器入口（U-11：<1280px dock 变抽屉，入口常在） */}
+            {!isWide && (
+              <button
+                type="button"
+                title="产物文件面板（窄屏为抽屉形态）"
+                aria-pressed={inspectorDrawerOpen}
+                onClick={() => setInspectorDrawerOpen(!inspectorDrawerOpen)}
+                className={`rounded-lg border px-2 py-1 text-[11px] font-medium transition-colors ${
+                  inspectorDrawerOpen
+                    ? "border-accent/50 bg-accent-tint text-accent-hover dark:text-accent"
+                    : "border-edge bg-surface text-ink-3 hover:border-accent/40 hover:text-accent-hover dark:hover:text-accent"
+                }`}
+              >
+                产物
+              </button>
+            )}
+            <NotificationsButton />
             <button
               type="button"
               title={splitOpen ? "关闭分屏对照" : "分屏对照——右侧只读展示另一会话"}
@@ -499,7 +557,8 @@ export function ChatView() {
         <Composer
           running={chat.phase === "running"}
           disabled={conn === "connecting" || conn === "reconnecting"}
-          focusSignal={draftFocusTick}
+          focusSignal={composerFocusTick}
+          draftKey={chat.sessionId ?? NEW_DRAFT_KEY}
           pendingAttachments={pendingAttachments}
           attaching={attaching}
           onSend={handleSend}
@@ -542,37 +601,62 @@ export function ChatView() {
         </div>
       )}
 
-      {/* 右侧产出 dock（R12 P3）：常驻可折叠；折叠为细条，展开为文件树+预览 */}
-      <div className="hidden shrink-0 border-l border-edge bg-canvas md:block">
-        {dockCollapsed ? (
-          <button
-            type="button"
-            onClick={toggleDock}
-            title="展开产出文件"
-            aria-label="展开产出文件面板"
-            className="flex h-full w-8 flex-col items-center gap-2 pt-3 text-ink-3 transition-colors hover:text-accent"
-          >
-            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
-              strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
-              <path d="m9 18 6-6-6-6" />
-            </svg>
-            <span
-              className="text-[11px] font-medium"
-              style={{ writingMode: "vertical-rl" }}
+      {/* 检查器（阶段 4）：宽屏内联 dock（Ctrl+I 开关）；窄屏抽屉（U-11） */}
+      {isWide && (
+        <div className="shrink-0 border-l border-edge bg-canvas">
+          {inspectorOpen ? (
+            <div className="flex h-full w-72 flex-col">
+              <ArtifactsPanel
+                rootRelPath={dockRoot}
+                refreshKey={dockRefreshKey}
+                onCollapse={toggleInspector}
+              />
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={toggleInspector}
+              title="展开产出文件"
+              aria-label="展开产出文件面板"
+              className="flex h-full w-8 flex-col items-center gap-2 pt-3 text-ink-3 transition-colors hover:text-accent"
             >
-              产出文件
-            </span>
-          </button>
-        ) : (
-          <div className="flex h-full w-72 flex-col">
-            <ArtifactsPanel
-              rootRelPath={dockRoot}
-              refreshKey={dockRefreshKey}
-              onCollapse={toggleDock}
-            />
-          </div>
-        )}
-      </div>
+              <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.75"
+                strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
+                <path d="m9 18 6-6-6-6" />
+              </svg>
+              <span
+                className="text-[11px] font-medium"
+                style={{ writingMode: "vertical-rl" }}
+              >
+                产出文件
+              </span>
+            </button>
+          )}
+        </div>
+      )}
+
+      {/* 窄屏检查器抽屉：<1280px 滑出，内容复用同一 ArtifactsPanel */}
+      {!isWide && inspectorDrawerOpen && (
+        <div
+          data-testid="inspector-drawer"
+          className="fixed inset-0 z-30 bg-black/20"
+          onMouseDown={() => setInspectorDrawerOpen(false)}
+        >
+          <aside
+            aria-label="检查器"
+            className="absolute bottom-0 right-0 top-0 w-80 border-l border-edge bg-canvas shadow-xl"
+            onMouseDown={(e) => e.stopPropagation()}
+          >
+            <div className="flex h-full w-full flex-col">
+              <ArtifactsPanel
+                rootRelPath={dockRoot}
+                refreshKey={dockRefreshKey}
+                onCollapse={() => setInspectorDrawerOpen(false)}
+              />
+            </div>
+          </aside>
+        </div>
+      )}
 
       {wsOpen && wsInfo && (
         <WorkspaceModal

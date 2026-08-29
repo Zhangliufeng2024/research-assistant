@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import shutil
 import time
 from collections.abc import AsyncGenerator
@@ -36,6 +37,8 @@ from ..orchestrator import (
     _sanitize_filename,
 )
 from .artifacts import ArtifactStore
+
+LOG = logging.getLogger(__name__)
 
 _ASSEMBLE_PROMPT = """Write the complete paper using python-docx via the run_python tool.
 
@@ -525,7 +528,9 @@ async def run_pipeline(
             try:
                 stale_final.unlink()
             except OSError:
-                pass
+                # 真实错误上报：陈旧 final 删除失败会让无效稿件继续留在
+                # final/ 下，下游会误读为成功发布。
+                LOG.warning("陈旧 final/manuscript.docx 删除失败: %s", stale_final)
         session.finish("failed", budget.snapshot())
         yield _t("[Quality gates] FAILED after maximum revision rounds; "
                   "final manuscript was not published.")

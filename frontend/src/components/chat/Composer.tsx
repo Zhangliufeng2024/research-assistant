@@ -1,6 +1,8 @@
 import { useEffect, useMemo, useRef, useState } from "react";
 import { commandSuggestions, type CommandDef } from "@/lib/commands";
 import type { AttachmentRef } from "@/lib/types";
+import { EVENT_COMPOSER_SEND } from "@/hooks/useHotkeys";
+import { useSessionStore } from "@/stores/sessionStore";
 
 /** 发送结果串（与 chatStore.send 对齐）；undefined 视同成功。 */
 type SendResult = "ok" | "empty" | "offline" | void;
@@ -20,6 +22,7 @@ export function Composer({
   focusSignal = 0,
   pendingAttachments,
   attaching,
+  draftKey,
   onSend,
   onAttach,
   onRemoveAttachment,
@@ -30,6 +33,10 @@ export function Composer({
   pendingAttachments: AttachmentRef[];
   /** 附件上传进行中：发送钮一并禁用（避免消息先于附件引用发出） */
   attaching: boolean;
+  /** 会话键（阶段 4 / U-4）：提供时启用每会话草稿持久化——切会话从
+   * sessionStore 恢复草稿、输入即写回、发送成功清空。未传则维持原
+   * 本地草稿行为（其它宿主不受影响）。 */
+  draftKey?: string | null;
   onSend: (text: string) => SendResult | Promise<SendResult>;
   onAttach: (files: File[]) => AttachResult | Promise<AttachResult>;
   onRemoveAttachment: (path: string) => void;
@@ -44,6 +51,25 @@ export function Composer({
   const fileRef = useRef<HTMLInputElement>(null);
   // 拖拽计数：子元素 dragenter/dragleave 成对触发，用计数抵消抖动
   const dragDepth = useRef(0);
+  const draftEnabled = draftKey !== undefined;
+
+  // ---- 每会话草稿（阶段 4）：draftKey 变化 = 切换会话 → 恢复该会话草稿。
+  // 会话区常驻后 Composer 不再重挂，恢复完全依赖这里。
+  useEffect(() => {
+    if (!draftEnabled) return;
+    const draft = useSessionStore.getState().getDraft(draftKey ?? null);
+    setValue(draft);
+    if (ref.current) ref.current.style.height = "auto";
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftKey, draftEnabled]);
+
+  // 全局发送事件（Ctrl/Cmd+Enter，useHotkeys 分发）：等价点击发送钮
+  const submitRef = useRef<() => void>(() => {});
+  useEffect(() => {
+    const onSendEvent = () => submitRef.current();
+    window.addEventListener(EVENT_COMPOSER_SEND, onSendEvent);
+    return () => window.removeEventListener(EVENT_COMPOSER_SEND, onSendEvent);
+  }, []);
 
   const suggestions = useMemo(
     () => (menuOpen ? commandSuggestions(value) : []),
@@ -68,15 +94,23 @@ export function Composer({
     // 先乐观清空（打字流畅度优先），失败再原样恢复草稿
     // （光标位置不强求——失败是异常路径，话还在比什么都重要）
     Promise.resolve(onSend(v)).then((r) => {
-      if (r !== undefined && r !== "ok") setValue(v);
+      if (r !== undefined && r !== "ok") {
+        setValue(v);
+        if (draftEnabled) useSessionStore.getState().setDraft(draftKey ?? null, v);
+      } else if (draftEnabled) {
+        useSessionStore.getState().clearDraft(draftKey ?? null);
+      }
     });
     setValue("");
+    if (draftEnabled) useSessionStore.getState().setDraft(draftKey ?? null, "");
     setMenuOpen(false);
     // 清空后恢复高度
     requestAnimationFrame(() => {
       if (ref.current) ref.current.style.height = "auto";
     });
   }
+  // 全局发送事件取最新闭包（ref 透传，监听只挂一次）
+  submitRef.current = submit;
 
   function addFiles(list: FileList | File[] | null) {
     if (!list) return;
@@ -211,6 +245,7 @@ export function Composer({
             className="max-h-44 min-h-[38px] flex-1 resize-none bg-transparent px-2.5 py-2 text-[14px] leading-6 outline-none placeholder:text-ink-3"
             onChange={(e) => {
               setValue(e.target.value);
+              if (draftEnabled) useSessionStore.getState().setDraft(draftKey ?? null, e.target.value);
               setMenuOpen(true);
               setMenuIdx(0);
               e.target.style.height = "auto";

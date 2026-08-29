@@ -121,7 +121,7 @@ class DurableScheduler:
             try:
                 await asyncio.wait_for(self._stop.wait(), timeout=self.poll_seconds)
             except asyncio.TimeoutError:
-                pass
+                pass  # 控制流：轮询超时即进入下一轮 claim，属正常调度节奏
         # 循环退出收尾：drain=True 等待全部活跃流水线；drain=False 转存引用
         # 后立即返回，由 stop(drain=False) 的调用方语义决定不等待。
         if self._drain:

@@ -14,11 +14,20 @@ from .errors import LLMError, classify_response
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
+#: OpenAI finish_reason → 统一 stop_reason（此前在流式/非流式两处各抄一份）。
+OPENAI_FINISH_REASON_MAP = {
+    "stop": "end_turn",
+    "tool_calls": "tool_use",
+    "length": "max_tokens",
+    "content_filter": "end_turn",
+}
+
 # Models that require `max_completion_tokens` and reject custom temperature.
 _REASONING_MODEL_PREFIXES = ("o1", "o3", "o4", "gpt-5", "chatgpt-4o")
 
 
 def uses_completion_tokens(model: str) -> bool:
+    """推理系模型（o1/o3/o4/gpt-5 等）需用 max_completion_tokens 且不接受自定义温度。"""
     low = (model or "").lower()
     return any(low.startswith(p) for p in _REASONING_MODEL_PREFIXES)
 
@@ -40,9 +49,46 @@ def _convert_tools_to_openai(tools: list[dict] | None) -> list[dict]:
     return result
 
 
+# ---------------------------------------------------------------------------
+# 多模态（G-3）：统一内部表示 → OpenAI 分格式
+#
+# 统一内部表示（与 anthropic.py 同一口径）：消息 content 可以是纯字符串，
+# 也可以是多部件列表：
+#   {"type": "text", "text": ...}
+#   {"type": "image", "media_type": "image/png", "data": "<base64>"}
+# OpenAI-compat 侧图片部件转成 data URL 形式的 image_url 部件。
+# ---------------------------------------------------------------------------
+
+
+def _part_to_openai(part: dict) -> dict:
+    """把统一内部表示的一个部件转成 OpenAI content part。"""
+    if part.get("type") == "image":
+        media_type = part.get("media_type", "image/png")
+        return {
+            "type": "image_url",
+            "image_url": {"url": f"data:{media_type};base64,{part.get('data', '')}"},
+        }
+    return {"type": "text", "text": str(part.get("text", ""))}
+
+
+def _content_to_openai(content: Any) -> Any:
+    """把统一 content（str 或部件列表）转成 OpenAI content。"""
+    if isinstance(content, list):
+        return [_part_to_openai(p) if isinstance(p, dict) else {"type": "text", "text": str(p)}
+                for p in content]
+    return content
+
+
 def _build_openai_messages(messages: list[dict], system: str = "") -> list[dict]:
-    """Convert unified message format to OpenAI's message format."""
-    result = []
+    """Convert unified message format to OpenAI's message format.
+
+    多模态（G-3）：content 为部件列表时逐部件适配；连续 user 消息在此合并
+    （与 anthropic.py 同口径——会话层把「图片消息 + 文本 prompt」拆成两条
+    user 消息传入，这里并回一条，保证两协议上下文一致）。
+    """
+    # 注解显式化（G-3）：content 可为 str 或部件列表，推断会让 mypy 把本列表
+    # 收窄成 list[dict[str, str]]，合并多部件 user 消息时误报。
+    result: list[dict[str, Any]] = []
     if system:
         result.append({"role": "system", "content": system})
 
@@ -78,7 +124,23 @@ def _build_openai_messages(messages: list[dict], system: str = "") -> list[dict]
             result.append(out)
             continue
 
-        result.append({"role": role, "content": content})
+        converted = _content_to_openai(content)
+        # 连续 user 消息合并为一条（跳过空文本部件）
+        if role == "user" and result and result[-1]["role"] == "user":
+            prev = result[-1]["content"]
+            prev_parts = (
+                [{"type": "text", "text": prev}] if isinstance(prev, str) else list(prev)
+            )
+            new_parts = (
+                [{"type": "text", "text": converted}]
+                if isinstance(converted, str)
+                else list(converted)
+            )
+            merged = [*prev_parts, *[p for p in new_parts if p.get("text") != "" or p.get("type") != "text"]]
+            result[-1]["content"] = merged
+            continue
+
+        result.append({"role": role, "content": converted})
     return result
 
 
@@ -106,6 +168,7 @@ class OpenAICompatClient(LLMClient):
         on_activity: Any | None = None,
         on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
+        """OpenAI Chat Completions 实现（流式回调语义见 :class:`LLMClient.chat`）。"""
         base = self.base_url
         if not base.endswith("/v1"):
             base = f"{base}/v1"
@@ -263,13 +326,7 @@ class OpenAICompatClient(LLMClient):
 
                 finish = choice.get("finish_reason")
                 if finish:
-                    stop_reason_map = {
-                        "stop": "end_turn",
-                        "tool_calls": "tool_use",
-                        "length": "max_tokens",
-                        "content_filter": "end_turn",
-                    }
-                    stop_reason = stop_reason_map.get(finish, finish)
+                    stop_reason = OPENAI_FINISH_REASON_MAP.get(finish, finish)
 
         tool_calls: list[ToolCall] = []
         for idx in sorted(tool_calls_by_index):
@@ -312,13 +369,7 @@ class OpenAICompatClient(LLMClient):
             ))
 
         finish_reason = choice.get("finish_reason", "stop")
-        stop_reason_map = {
-            "stop": "end_turn",
-            "tool_calls": "tool_use",
-            "length": "max_tokens",
-            "content_filter": "end_turn",
-        }
-        stop_reason = stop_reason_map.get(finish_reason, finish_reason)
+        stop_reason = OPENAI_FINISH_REASON_MAP.get(finish_reason, finish_reason)
 
         usage_data = data.get("usage", {})
         usage = TokenUsage(
@@ -334,4 +385,5 @@ class OpenAICompatClient(LLMClient):
         )
 
     async def close(self) -> None:
+        """释放底层 httpx 连接池。"""
         await self._client.aclose()

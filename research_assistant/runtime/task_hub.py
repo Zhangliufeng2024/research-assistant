@@ -208,6 +208,18 @@ class BackgroundTaskHub:
                 handle.task_id,
                 {"type": "done", "status": handle.status, "task_id": handle.task_id},
             )
+            # 释放 handle（A+ 阶段 1 / C-1：确定性内存泄漏修复）。
+            #
+            # 位置很关键：必须在**最后一次 publish 之后**。publish 靠
+            # self.handles.get(task_id) 找订阅者，提前摘除会让终端的 done 帧
+            # 发不出去，前端就永远等不到任务结束。
+            #
+            # 终态之后 handle 已无用途：stop/steer/approve 都会先检查
+            # status not in {"queued","running"} 再返回 False；subscribe /
+            # unsubscribe 对 handle is None 有兜底（从 store 回放事件）。
+            # 因此摘除不影响任何既有行为，只是不再让每个已完成任务都常驻
+            # 一份（subscribers set + 两个队列 + Task 引用）。
+            self.handles.pop(handle.task_id, None)
 
     async def publish(self, task_id: str, frame: dict[str, Any]) -> None:
         seq = await asyncio.to_thread(self._persist_frame, task_id, frame)
@@ -220,7 +232,7 @@ class BackgroundTaskHub:
                 try:
                     queue.get_nowait()
                 except asyncio.QueueEmpty:
-                    pass
+                    pass  # 控制流：腾位与消费方之间的极窄竞态，直接落入下方 put_nowait
             queue.put_nowait(message)
 
     def _persist_frame(self, task_id: str, frame: dict[str, Any]) -> int:

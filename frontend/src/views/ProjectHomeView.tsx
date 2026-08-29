@@ -32,18 +32,33 @@ export function ProjectHomeView() {
   const [recentProjects, setRecentProjects] = useState<Array<{ name: string; root: string; pinned?: boolean }>>([]);
   const refresh = useCallback(() => api.get<Home>("/api/project/home").then(setHome).catch((e: Error) => setError(e.message)), []);
   const refreshApprovals = useCallback(() => api.get<Approval[]>("/api/approvals").then(setApprovals).catch(() => setApprovals([])), []);
+  // 数据加载：只在挂载时跑（refresh / refreshApprovals 都是 useCallback([])，引用稳定）。
+  //
+  // ⚠️ 依赖数组里绝不能放 `home?.project` 这类**每次请求都是全新对象**的值：
+  // refresh() → setHome(新对象) → home?.project 引用变化 → 本 effect 重跑
+  // → 再 refresh() …… 落地页会以网络速度无限轮询 /api/project/home，
+  // 而且因为每次都 setHome，界面看不出来（数据一样），极易长期不被发现。
   useEffect(() => {
-    document.title = "研究助手 · 项目"; void refresh(); void refreshApprovals();
+    document.title = "研究助手 · 项目";
+    void refresh();
+    void refreshApprovals();
+  }, [refresh, refreshApprovals]);
+
+  // 最近项目：依赖收敛为 root/name **字符串**。对象变了不等于内容变了，
+  // 只有字符串变了才需要重算。
+  const projectRoot = home?.project?.root;
+  const projectName = home?.project?.name;
+  useEffect(() => {
     try {
       const stored = JSON.parse(localStorage.getItem("ra.recentProjects") || "[]") as Array<{ name: string; root: string; pinned?: boolean }>;
-      const current = home?.project;
       setRecentProjects(stored);
-      if (current && !stored.some(item => item.root === current.root)) {
-        const next = [{ name: current.name, root: current.root }, ...stored].slice(0, 12);
-        localStorage.setItem("ra.recentProjects", JSON.stringify(next)); setRecentProjects(next);
+      if (projectRoot && !stored.some(item => item.root === projectRoot)) {
+        const next = [{ name: projectName ?? projectRoot, root: projectRoot }, ...stored].slice(0, 12);
+        localStorage.setItem("ra.recentProjects", JSON.stringify(next));
+        setRecentProjects(next);
       }
     } catch { setRecentProjects([]); }
-  }, [refresh, refreshApprovals, home?.project]);
+  }, [projectRoot, projectName]);
   async function resolveApproval(id: string, approved: boolean) { await api.post(`/api/approvals/${id}/resolve`, { approved }); setApprovals(items => items.filter(item => item.id !== id)); }
 
   if (!home) return <div className="flex h-full items-center justify-center text-sm text-ink-3">{error || "正在加载项目空间…"}</div>;

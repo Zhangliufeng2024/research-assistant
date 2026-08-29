@@ -29,6 +29,7 @@ from .core import (
     setup_claude_skills,
 )
 from .display import format_status_line, format_tool_result_tag, format_tool_start
+from .mcp_client import McpServerConnection, connect_mcp_servers, parse_servers_config
 from .models import TokenUsage
 from .orchestrator import run_orchestrated_generation
 from .retry import (
@@ -56,7 +57,7 @@ def _list_runs(output_folder: Path) -> list[tuple[str, str]]:
         if rf.exists():
             try:
                 status = json.loads(rf.read_text(encoding="utf-8")).get("status", "?")
-            except Exception:
+            except Exception:  # noqa: BLE001 — 尽力而为：run.json 损坏按「?」展示，不影响目录列表
                 pass
         runs.append((d.name, status))
     return runs
@@ -126,6 +127,21 @@ MID-EXECUTION STEERING:
 
         llm_client = build_llm_client(model=model)
         tool_registry = ToolRegistry(work_dir=str(cwd))
+
+        # G-2：MCP 外部工具接入——RA_MCP_SERVERS 非空时连接并注册远端工具。
+        # 失败的服务器内部已记录并跳过（部分可用优于全或无），接入本身是
+        # 增强能力，整体失败也不阻断会话。
+        mcp_connections: list[McpServerConnection] = []
+        raw_servers = os.getenv("RA_MCP_SERVERS", "")
+        if raw_servers.strip():
+            try:
+                mcp_connections = await connect_mcp_servers(
+                    tool_registry, parse_servers_config(raw_servers),
+                )
+                if mcp_connections:
+                    print(f"MCP: 已接入 {len(mcp_connections)} 个服务器", flush=True)
+            except Exception as exc:  # noqa: BLE001 — 增强能力失败不阻断主流程
+                print(f"MCP 服务器接入失败（忽略）: {exc}", flush=True)
 
         async def _on_text(text: str) -> None:
             if not silent:
@@ -226,6 +242,8 @@ MID-EXECUTION STEERING:
         finally:
             steer_reader.stop()
             await llm_client.close()
+            for conn in mcp_connections:
+                await conn.close()
 
     async def _run_multi_agent_query(prompt: str) -> None:
         nonlocal current_paper_path
@@ -262,7 +280,7 @@ MID-EXECUTION STEERING:
                     most_recent = max(paper_dirs, key=lambda d: d.stat().st_mtime)
                     if time.time() - most_recent.stat().st_mtime < 30:
                         current_paper_path = str(most_recent)
-            except Exception:
+            except Exception:  # noqa: BLE001 — 尽力而为：探测最新论文目录失败不阻断会话启动
                 pass
 
     # Welcome message
@@ -374,7 +392,7 @@ MID-EXECUTION STEERING:
                             most_recent = max(paper_dirs, key=lambda d: d.stat().st_mtime)
                             if time.time() - most_recent.stat().st_mtime < 15:
                                 current_paper_path = str(most_recent)
-                    except Exception:
+                    except Exception:  # noqa: BLE001 — 尽力而为：论文目录轮询失败静等下一轮
                         pass
 
                     if current_paper_path:
@@ -433,7 +451,7 @@ User request: {user_input}"""
                             if time.time() - most_recent.stat().st_mtime < 10:
                                 current_paper_path = str(most_recent)
                                 print(f"\nWorking on: {most_recent.name}")
-                    except Exception:
+                    except Exception:  # noqa: BLE001 — 尽力而为：论文目录轮询失败不阻断主循环
                         pass
 
             except KeyboardInterrupt:
@@ -442,8 +460,8 @@ User request: {user_input}"""
             except Exception as e:
                 print(f"\nError: {e}")
                 print("Please try again or type 'exit' to quit.")
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001 — 真实错误上报：内层逐轮兜底之外逃逸的异常须可见
+        print(f"\nSession terminated due to an unexpected error: {e}")
 
     if track_token_usage:
         return TokenUsage(
@@ -479,7 +497,7 @@ async def _classify_intent(user_input: str, llm_client) -> str:
             return "writing"
         if "question" in result:
             return "question"
-    except Exception:
+    except Exception:  # noqa: BLE001 — 合理降级：分类失败按默认 writing 走，不阻断用户输入
         pass
     return "writing"
 

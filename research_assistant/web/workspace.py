@@ -21,6 +21,7 @@ from fastapi.responses import FileResponse
 from pydantic import BaseModel
 
 from ..artifacts import ArtifactVersionStore
+from ..artifacts.versioning import SnapshotMissingError
 from ..config import load_project_env, resolve_model
 from ..core import ensure_output_folder, safe_resolve, setup_claude_skills
 
@@ -70,6 +71,19 @@ async def restore_workspace_change(
         return _version_store(request).restore(change_id, payload.side)
     except KeyError as exc:
         raise HTTPException(status_code=404, detail="变更不存在") from exc
+    except SnapshotMissingError as exc:
+        # A+ 阶段 1 / F-1：快照已被清理（如 Janitor 容量淘汰）。
+        #
+        # 旧实现会把它当成「这一侧当时没有文件」而删除目标文件——恢复按钮
+        # 变成销毁按钮。这里改为 409 并给出可操作的文案，用户的文件毫发无损。
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"{exc}。该快照可能已被磁盘清理策略淘汰，"
+                "为避免误删当前文件已拒绝恢复。可改用「变更」页的其它版本，"
+                "或手动重建该文件。"
+            ),
+        ) from exc
     except ValueError as exc:
         raise HTTPException(status_code=422, detail=str(exc)) from exc
 

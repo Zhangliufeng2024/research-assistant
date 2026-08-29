@@ -55,7 +55,7 @@ def document_metrics(run_dir: Path) -> dict[str, Any]:
         out["has_final_docx"] = (run_dir / "final" / "manuscript.docx").exists()
         try:
             out["word_count"] = count_words(extract_docx_text(docx))
-        except Exception:
+        except Exception:  # noqa: BLE001 — 尽力而为：评估指标统计失败不计入，不影响评估主流程
             pass
 
     figs = run_dir / "figures"

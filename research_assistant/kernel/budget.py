@@ -16,6 +16,7 @@ zero with a warning so cost tracking degrades gracefully instead of lying.
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -23,8 +24,28 @@ from dataclasses import dataclass, field
 
 from ..llm.base import LLMResponse
 
+LOG = logging.getLogger(__name__)
+
 #: USD per million tokens: {"input": x, "output": y, "cache_write": z, "cache_read": w}
+#:
+#: price_for() 取**最长前缀**匹配，所以版本级条目（claude-opus-5）会自然优先于
+#: 家族兜底条目（claude-opus），无需依赖字典顺序。
+#:
+#: 2026-08-28 核实（此前 opus 一栏 3 倍高估、fable 完全缺失）：
+#:   Fable 5   $10 / $50    Opus 5  $5 / $25    Sonnet 5  $2 / $10（intro）
+#:   Haiku 4.5  $1 / $5     Opus 4.x $15 / $75  Sonnet 4.x $3 / $15
+#: cache_write 统一按 5 分钟缓存 = 1.25 × input（与既有条目口径一致）。
+#:
+#: Sonnet 5 的 $2/$10 是** introductory 价，2026-08-31 结束**，2026-09-01 起
+#: 标准价 $3/$15。此处刻意取标准价：成本**高估**会让预算闸提前触发，
+#: 是安全方向；低估才会导致实际超支。
 PRICES_USD_PER_MTOK: dict[str, dict[str, float]] = {
+    "claude-fable-5": {"input": 10.0, "output": 50.0, "cache_write": 12.5, "cache_read": 1.00},
+    "claude-opus-5": {"input": 5.0, "output": 25.0, "cache_write": 6.25, "cache_read": 0.50},
+    "claude-opus-4": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
+    "claude-sonnet-5": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-sonnet-4": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
+    "claude-haiku-4": {"input": 1.0, "output": 5.0, "cache_write": 1.25, "cache_read": 0.10},
     "claude-opus": {"input": 15.0, "output": 75.0, "cache_write": 18.75, "cache_read": 1.50},
     "claude-sonnet": {"input": 3.0, "output": 15.0, "cache_write": 3.75, "cache_read": 0.30},
     "claude-haiku": {"input": 0.80, "output": 4.0, "cache_write": 1.0, "cache_read": 0.08},
@@ -59,6 +80,7 @@ class BudgetLimits:
 
     @classmethod
     def from_env(cls) -> BudgetLimits:
+        """从 RA_MAX_COST_USD / RA_MAX_TOKENS / RA_MAX_TURNS / RA_MAX_WALL_SECONDS 构造。"""
         def _float(name: str) -> float | None:
             raw = os.getenv(name)
             if not raw:
@@ -82,6 +104,7 @@ class BudgetLimits:
 
     @property
     def any_limit(self) -> bool:
+        """是否配置了任一上限（无上限时预算检查整体跳过）。"""
         return bool(
             self.max_cost_usd or self.max_total_tokens
             or self.max_turns or self.max_wall_seconds
@@ -98,6 +121,8 @@ class BudgetExceededError(RuntimeError):
 
 @dataclass
 class BudgetState:
+    """累计用量快照（token / 花费 / 轮次），由 :class:`BudgetGuard` 维护。"""
+
     input_tokens: int = 0
     output_tokens: int = 0
     cache_creation_tokens: int = 0
@@ -107,6 +132,7 @@ class BudgetState:
 
     @property
     def total_tokens(self) -> int:
+        """输入 + 输出 token 总量（缓存增量单列，不计入本口径）。"""
         return self.input_tokens + self.output_tokens
 
 
@@ -119,6 +145,7 @@ class BudgetVerdict:
 
     @property
     def ok(self) -> bool:
+        """未触发任何硬限制时为 True。"""
         return not self.exceeded_reasons
 
 
@@ -149,9 +176,7 @@ class BudgetGuard:
         self.started_at = started_at if started_at is not None else time.monotonic()
         if not self.prices.get("input") and not self.prices.get("output"):
             if self.limits.max_cost_usd and self.limits.any_limit:
-                import logging
-
-                logging.getLogger(__name__).warning(
+                LOG.warning(
                     "No price table entry for model %r — cost budget unenforceable", model
                 )
         # 未知价格 + 设了成本上限 → 上限无法按美元强制执行（token/轮次/时长上限不受影响）。
@@ -174,6 +199,12 @@ class BudgetGuard:
             price_known = bool(
                 self.prices.get("input") or self.prices.get("output")
             )
+            # 与 __init__ 同口径告警：切换到一个没有价格条目的模型，同样会让
+            # 美元上限失去强制力。此前这里静默放行的结果是前端显示 $0.00。
+            if not price_known and self.limits.max_cost_usd and self.limits.any_limit:
+                LOG.warning(
+                    "No price table entry for model %r — cost budget unenforceable", model
+                )
             self.cost_cap_enforceable = (
                 not self.limits.max_cost_usd or price_known
             )
@@ -359,6 +390,7 @@ class BudgetGuard:
     # -- reporting ----------------------------------------------------------
 
     def snapshot(self, include_elapsed: bool = True) -> dict:
+        """当前用量/预留/上限的可序列化快照（session 落盘与 API 返回共用）。"""
         with self._lock:
             s = self.state
             d = {

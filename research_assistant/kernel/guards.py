@@ -35,6 +35,7 @@ class RepeatToolCallGuard:
         self._count = 0
 
     def reset(self) -> None:
+        """清空连续重复计数（新回合开始时由内核调用）。"""
         self._last_key = None
         self._count = 0
 

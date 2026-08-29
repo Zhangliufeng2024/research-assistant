@@ -922,6 +922,40 @@ class PlatformStore:
     # 迭代2：产物清单索引（会话 manifest 端点回填 → artifacts scope 检索）
     # ------------------------------------------------------------------
 
+    def upsert_artifact(
+        self, session_id: str, path: str | Path, *, workspace: str | Path,
+    ) -> bool:
+        """A+ 阶段 2 / F-2：**推模式**回填单条产物索引。
+
+        此前 artifacts 表只在有人调用 ``/chat/sessions/{id}/manifest`` 时才被
+        整体重建（拉模式）——没人查就不记，导致它与其他 5 套产物记录互不一致。
+        推模式让工具写入成功即落表，这张表因此可成为**唯一权威源**；
+        manifest.json 与 artifact_reviews 降为派生视图。
+
+        语义上是 ``replace_artifacts`` 的单行增量版：同一 (session_id, path)
+        重复写入即更新（与文件系统的最新状态对齐），不会堆重复行。
+
+        Returns:
+            是否成功登记（path 不在工作区内 / 文件已消失 / DB 错误均返回 False）。
+        """
+        try:
+            resolved = Path(path).resolve()
+            root = Path(workspace).resolve()
+            rel = resolved.relative_to(root).as_posix()
+            stat = resolved.stat()
+        except (ValueError, OSError):
+            return False
+        with self._lock, self._connect() as conn:
+            conn.execute(
+                "INSERT OR REPLACE INTO artifacts(session_id, path, name, ext, size, mtime) "
+                "VALUES(?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, rel, resolved.name, resolved.suffix.lower(),
+                    int(stat.st_size), float(stat.st_mtime),
+                ),
+            )
+        return True
+
     def replace_artifacts(
         self, session_id: str, entries: list[dict[str, Any]],
     ) -> int:
@@ -961,6 +995,46 @@ class PlatformStore:
                 (needle, needle, limit),
             ).fetchall()
         return [dict(r) for r in rows]
+
+    def artifacts_overview(self) -> dict[str, Any]:
+        """artifacts 表只读汇总：总数、去重会话数与按扩展名分布（overview 端点用）。"""
+        with self._lock, self._connect() as conn:
+            total = int(conn.execute("SELECT COUNT(*) FROM artifacts").fetchone()[0])
+            sessions = int(
+                conn.execute("SELECT COUNT(DISTINCT session_id) FROM artifacts").fetchone()[0]
+            )
+            by_ext = {
+                row["ext"] or "(none)": int(row["n"])
+                for row in conn.execute(
+                    "SELECT ext, COUNT(*) AS n FROM artifacts GROUP BY ext ORDER BY n DESC"
+                ).fetchall()
+            }
+        return {"total": total, "sessions": sessions, "by_ext": by_ext}
+
+    def recent_project_events(self, project_id: str, *, limit: int = 10) -> list[dict[str, Any]]:
+        """跨任务最近事件若干条（overview 端点只读聚合，不区分任务逐条拉取）。"""
+        limit = max(1, min(int(limit), 100))
+        with self._lock, self._connect() as conn:
+            rows = conn.execute(
+                "SELECT e.task_id, e.seq, e.ts, e.type, e.payload_json FROM task_events e "
+                "JOIN tasks t ON t.id = e.task_id WHERE t.project_id = ? "
+                "ORDER BY e.ts DESC, e.task_id DESC, e.seq DESC LIMIT ?",
+                (project_id, limit),
+            ).fetchall()
+        events: list[dict[str, Any]] = []
+        for row in rows:
+            try:
+                payload = json.loads(row["payload_json"])
+            except json.JSONDecodeError:
+                continue
+            events.append({
+                "task_id": row["task_id"],
+                "seq": row["seq"],
+                "ts": row["ts"],
+                "type": row["type"],
+                "payload": payload,
+            })
+        return events
 
     def set_session_flags(
         self,
@@ -1985,7 +2059,13 @@ class PlatformStore:
     def complete_job(self, job_id: str) -> None:
         # 归属校验：只有仍处于 running 的作业才能被标记完成 —— 租约过期被
         # 回收（可能已被其它 worker 重领）后，旧持有者的迟到写回必须失效。
+        #
+        # A+ 阶段 1 / C-6：显式 BEGIN IMMEDIATE。Python 的 sqlite3 默认是
+        # deferred 事务，读快照与其他进程的写并发时，升级为写会立刻拿到
+        # SQLITE_BUSY_SNAPSHOT（**不等待** busy_timeout），导致这次状态转换
+        # 被静默丢掉。取写锁在前可以彻底避免。与 claim_job 口径一致。
         with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "UPDATE job_queue SET status='complete', lease_until=NULL, updated_at=? WHERE id = ? AND status='running'",
                 (time.time(), job_id),
@@ -2014,6 +2094,15 @@ class PlatformStore:
     def fail_job(self, job_id: str, *, error: str, retry_delay: float = 30.0) -> dict[str, Any] | None:
         now = time.time()
         with self._lock, self._connect() as conn:
+            # A+ 阶段 1 / C-6：**这个方法最需要** BEGIN IMMEDIATE。
+            #
+            # 它是典型的 read-modify-write：先 SELECT attempts/max_attempts 读
+            # 出一个快照，再据其决定 status='failed' 还是回队重跑。deferred
+            # 事务下，若读快照之后有别的进程（多 worker 场景）提交了对同一行
+            # 的修改，升级写会立刻抛 SQLITE_BUSY_SNAPSHOT——不等待 busy_timeout
+            # ——结果是这次失败/重试判定被整条丢掉，作业卡在 running 直到租约
+            # 过期。取写锁在前才能让这三步真正原子。
+            conn.execute("BEGIN IMMEDIATE")
             # 归属校验（同 complete_job / defer_job）：只对仍 running 的作业生效。
             row = conn.execute(
                 "SELECT attempts, max_attempts FROM job_queue WHERE id = ? AND status='running'",
@@ -2042,6 +2131,9 @@ class PlatformStore:
         """
         now = time.time()
         with self._lock, self._connect() as conn:
+            # A+ 阶段 1 / C-6：同 complete_job —— 先取写锁，避免 deferred
+            # 事务在写回后立即读回时撞上并发提交。
+            conn.execute("BEGIN IMMEDIATE")
             conn.execute(
                 "UPDATE job_queue SET status='queued', lease_until=NULL, last_error=?, run_after=?, updated_at=? WHERE id=? AND status='running'",
                 (str(reason)[:4000], now + max(0.25, float(delay)), now, str(job_id)),
@@ -2054,6 +2146,9 @@ class PlatformStore:
 
     def recover_expired_jobs(self) -> int:
         with self._lock, self._connect() as conn:
+            # A+ 阶段 1 / C-6：与 claim_job 同口径先取写锁。回收过期作业与
+            # 并发领取是同一批行的竞争双方，两者都必须在写锁下判定。
+            conn.execute("BEGIN IMMEDIATE")
             cursor = conn.execute("UPDATE job_queue SET status='queued', lease_until=NULL, updated_at=? WHERE status='running' AND lease_until < ?", (time.time(), time.time()))
             return int(cursor.rowcount)
 

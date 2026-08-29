@@ -7,7 +7,8 @@ import re
 import subprocess
 import sys
 
-from ..constants import OUTPUT_TRUNCATION_HALF, OUTPUT_TRUNCATION_LIMIT
+from ..constants import truncate_tool_output
+from .exec_provider import sanitized_exec_env
 
 #: 冻结态拦截的可执行名（小写、去 .exe；python* 前缀另行匹配）。
 _PY_INVOKABLE = frozenset({"python", "python3", "py", "pip", "pip3"})
@@ -119,24 +120,58 @@ def _is_python_invocation(segment: str) -> bool:
     return False
 
 
+def _windows_ansi_codec() -> str | None:
+    """Windows ANSI 代码页对应的 Python 编码名；非 Windows 返回 None。
+
+    为什么不用 ``locale.getpreferredencoding(False)``：Python 3.13 在 UTF-8
+    模式（或 PYTHONIOENCODING/UTF-8 模式环境）下它返回 ``utf-8``——于是
+    「utf-8 失败 → 回退 preferred」的兜底链退化成 utf-8 → utf-8，GBK 字节
+    照样解成乱码（实测踩中）。ANSI 代码页必须显式向系统要：中文 Windows
+    GetACP()=936 → ``cp936``。``mbcs`` 是 Windows 专有的 ANSI 代码页别名，
+    作为 GetACP 不可用时的兜底。
+    """
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+
+        acp = int(ctypes.windll.kernel32.GetACP())  # type: ignore[attr-defined]
+        if acp > 0:
+            return f"cp{acp}"
+    except Exception:  # noqa: BLE001 — 编码探测失败不应影响命令执行
+        pass
+    return "mbcs"
+
+
 def decode_process_output(data: bytes) -> str:
-    """子进程字节流解码：utf-8 strict 失败回退本地首选编码（Bug A）。
+    """子进程字节流解码：utf-8 strict 失败回退本地 ANSI 代码页（Bug A）。
 
     中文 Windows 上 cmd.exe 内建命令（dir/echo 等）经管道输出的是
     GBK(cp936) 字节而非 UTF-8——一律按 utf-8+replace 解会得到乱码
-    （用户实测「中文路径无法识别」的根因）。先试 utf-8 strict（python
-    子进程输出、PYTHONUTF8=1 场景原样保留），UnicodeDecodeError 再按
-    locale.getpreferredencoding(False) 兜底；errors="replace" 保证对任何
-    杂凑字节都不抛异常。
+    （用户实测「中文路径无法识别」的根因）。
+
+    兜底顺序（取第一个能解的）：
+      1. ``utf-8`` strict —— python 子进程 / PYTHONUTF8=1 的输出原样保留；
+      2. Windows ANSI 代码页（GetACP → cp936 等；非 Windows 跳过）；
+      3. ``locale.getpreferredencoding(False)`` —— POSIX 上的最后参考；
+      4. ``utf-8`` + ``errors="replace"`` —— 任何杂凑字节都不抛异常。
     """
     try:
         return data.decode("utf-8")
     except UnicodeDecodeError:
-        fallback = locale.getpreferredencoding(False) or "utf-8"
+        pass  # 控制流：非 UTF-8 输出，继续走下方解码兜底链
+    candidates: list[str] = []
+    ansi = _windows_ansi_codec()
+    if ansi:
+        candidates.append(ansi)
+    candidates.append(locale.getpreferredencoding(False) or "utf-8")
+    candidates.append("utf-8")
+    for codec in candidates:
         try:
-            return data.decode(fallback, errors="replace")
-        except LookupError:
-            return data.decode("utf-8", errors="replace")
+            return data.decode(codec, errors="replace")
+        except (LookupError, UnicodeDecodeError):
+            continue
+    return data.decode("utf-8", errors="replace")  # pragma: no cover — 永不可达
 
 
 async def _kill_process(proc: asyncio.subprocess.Process) -> None:
@@ -151,7 +186,7 @@ async def _kill_process(proc: asyncio.subprocess.Process) -> None:
             proc.kill()
             await proc.wait()
     except ProcessLookupError:
-        pass
+        pass  # 尽力而为：进程已自行退出，终止目标已达成
 
 
 async def _run_process(
@@ -167,8 +202,15 @@ async def _run_process(
     loops even after ``communicate``.  A managed ``Popen`` in a worker thread
     avoids those transports while retaining cancellation/timeout cleanup.
 
-    ``env``：None 表示继承父进程环境；传入完整副本可注入 PYTHONUTF8 等。
+    ``env``：None 表示继承**净化后**的父进程环境（``sanitized_exec_env``，
+    A+ 阶段 5 / G-4）；传入完整副本则原样使用（调用方自行负责净化，
+    python_exec 传入前已过 ``sanitized_exec_env``）。
+
+    在这里做默认净化而不是各调用方自管，理由是这是**所有模型驱动子进程的
+    唯一咽喉**：放调用方意味着每新增一个执行工具都要记得净化，漏一处就是
+    密钥泄露面（本次修复正是 bash 漏了——run_python 修了、bash 没修）。
     """
+    effective_env = sanitized_exec_env() if env is None else env
     if sys.platform == "win32":
         # Bug B：桌面应用（无控制台窗体）里 spawn cmd.exe 不能闪终端黑框，
         # win32 分支统一加 CREATE_NO_WINDOW（asyncio 分支仅 POSIX 走到）。
@@ -178,8 +220,7 @@ async def _run_process(
             "cwd": cwd,
             "creationflags": _CREATE_NO_WINDOW,
         }
-        if env is not None:
-            popen_kwargs["env"] = env
+        popen_kwargs["env"] = effective_env
         proc = subprocess.Popen(args, **popen_kwargs)
         try:
             stdout, stderr = await asyncio.to_thread(
@@ -200,7 +241,7 @@ async def _run_process(
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
         cwd=cwd,
-        env=env,
+        env=effective_env,
     )
     try:
         stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
@@ -263,11 +304,6 @@ async def run_bash(
     if returncode != 0:
         result = f"Exit code: {returncode}\n{result}"
 
-    if len(result) > OUTPUT_TRUNCATION_LIMIT:
-        result = (
-            result[:OUTPUT_TRUNCATION_HALF]
-            + "\n\n... (output truncated) ...\n\n"
-            + result[-OUTPUT_TRUNCATION_HALF:]
-        )
+    result = truncate_tool_output(result)
 
     return result or "(no output)"

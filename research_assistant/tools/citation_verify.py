@@ -173,7 +173,7 @@ async def _crossref_doi(
                 note="DOI not found on Crossref (HTTP 404) -- likely fabricated",
             )
     except (httpx.TimeoutException, httpx.RequestError):
-        pass
+        pass  # 合理降级：本层网络失败返回 None，由上层验证链继续下一来源
     return None
 
 
@@ -224,7 +224,7 @@ async def _crossref_title(
                 note=f"Title match on Crossref (similarity {best_sim:.2f})",
             )
     except (httpx.TimeoutException, httpx.RequestError):
-        pass
+        pass  # 合理降级：本层网络失败返回 None，由上层验证链继续下一来源
     return None
 
 
@@ -267,7 +267,7 @@ async def _semantic_scholar_title(
                 note=f"Title match on Semantic Scholar (similarity {best_sim:.2f})",
             )
     except (httpx.TimeoutException, httpx.RequestError):
-        pass
+        pass  # 合理降级：本层网络失败返回 None，由上层验证链继续下一来源
     return None
 
 
@@ -309,7 +309,7 @@ async def _openalex_title(
                 note=f"Title match on OpenAlex (similarity {best_sim:.2f})",
             )
     except (httpx.TimeoutException, httpx.RequestError):
-        pass
+        pass  # 合理降级：来源链最后一层，失败即按 unverified 处理
     return None
 
 
@@ -555,7 +555,7 @@ async def verify_bibtex_file(
                 results_by_key[ref.key] = CitationResult(**result_data)
                 continue
             except (TypeError, ValueError):
-                pass
+                pass  # 合理降级：缓存条目损坏则放弃命中，走下方重新在线验证
         missing.append(ref)
 
     fresh = await _verify_batch(missing, ss_api_key, openalex_email) if missing else []
@@ -566,7 +566,7 @@ async def verify_bibtex_file(
         try:
             _save_cache(resolved_cache_path, cache)
         except OSError:
-            pass
+            pass  # 尽力而为：验证缓存写失败只影响下次命中，不影响本次结果
     results = [results_by_key[ref.key] for ref in refs]
 
     report = VerificationReport(bib_path=str(bib_path), total=len(refs))

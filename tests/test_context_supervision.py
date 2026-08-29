@@ -22,12 +22,23 @@ from pathlib import Path
 
 from research_assistant.agent import RunConfig, _TurnCancelled, run_agent
 from research_assistant.kernel.context import (
+    COMPACTION_TRIGGER_FRACTION,
     externalize_tool_result,
     maybe_compact,
     summarize_span,
+    window_for,
 )
 from research_assistant.llm.base import LLMResponse
 from research_assistant.models import TokenUsage
+
+
+def over_trigger(model: str) -> int:
+    """刚好越过压缩触发线的 input token 数（按模型实际窗口换算）。
+
+    硬编码 190_000 曾隐含"窗口 = 200k"这一假设；窗口表修正后（Claude 5 实为
+    1M）该值不再触发压缩，会让用例**假绿**。改为动态换算。
+    """
+    return int(window_for(model) * COMPACTION_TRIGGER_FRACTION) + 1
 
 # ---------------------------------------------------------------------------
 # 桩
@@ -294,7 +305,7 @@ class TestSupervisedChatInjection:
             msgs,
             llm_client=_BareCallForbiddenClient(),
             model="claude-sonnet-5",
-            last_input_tokens=190_000,
+            last_input_tokens=over_trigger("claude-sonnet-5"),
             supervised_chat=_supervised,
         )
 
@@ -325,7 +336,8 @@ class TestExternalizeSameNameNoOverwrite:
 
         # 两份预览各自引用自己那份文件，引用的文件都真实存在、内容对应。
         def pointer(out):
-            match = re.search(r"saved to: (\S+)", out)
+            # 路径已加引号（Windows 工作区路径常含空格，\S+ 会被截断）
+            match = re.search(r'saved to: "([^"\n]+)"', out)
             assert match, out[-200:]
             return match.group(1)
 

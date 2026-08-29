@@ -82,6 +82,6 @@ class CitationGate(Gate):
                 out.write_text(_format_report(report), encoding="utf-8")
                 details["report_saved_to"] = str(out)
             except OSError:
-                pass
+                pass  # 尽力而为：报告落盘失败不影响门禁判定结果本身
 
         return self._result(passed, failures or None, details)

@@ -37,6 +37,7 @@ include 两次：
 from __future__ import annotations
 
 import asyncio
+import base64
 import itertools
 import json
 import logging
@@ -65,9 +66,13 @@ from ..core import (
 )
 from ..kernel.approval import QueueApprover, ToolApprovalRequest
 from ..kernel.budget import BudgetGuard
+from ..kernel.events import HookBus
+from ..kernel.memory import build_memory_store
+from ..kernel.tracing import maybe_attach_tracing
 from ..llm.base import LLMClient, LLMResponse, OnChunkCallback
 from ..session.store import SessionStore
 from ..tools.file_ops import _reject_windows_hazard
+from ..tools.memory_tools import build_memory_extensions, memory_prompt_section
 from ..tools.registry import ToolRegistry
 
 router = APIRouter()
@@ -188,10 +193,11 @@ def _read_history(run_dir: Path) -> list[dict]:
         raw_atts = m.get("attachments")
         if isinstance(raw_atts, list) and raw_atts:
             clean_atts = [
-                {"name": str(a.get("name", "")), "path": str(a.get("path", ""))}
+                _normalize_attachment(a)
                 for a in raw_atts
                 if isinstance(a, dict)
             ]
+            clean_atts = [a for a in clean_atts if a]
             if clean_atts:
                 entry["attachments"] = clean_atts
         if m.get("partial") is True:
@@ -218,7 +224,8 @@ def _write_history(run_dir: Path, messages: list[dict]) -> None:
             json.dumps(payload, ensure_ascii=False),
         )
     except OSError:
-        pass
+        # 真实错误上报：历史写回失败意味着对话记录丢失，静默会掩盖数据损坏
+        LOG.warning("会话历史写回失败 run_dir=%s", run_dir, exc_info=True)
 
 
 class _GuardedSessionStore(SessionStore):
@@ -710,7 +717,7 @@ async def delete_session(session_id: str, request: Request):
         try:
             await live.close(code=4002, reason="会话已被删除")
         except Exception:
-            pass
+            pass  # 尽力而为：socket 多半已断，关闭失败不影响删除主流程
 
     handle = _ACTIVE.get(session_id)
     if handle is not None:
@@ -1090,6 +1097,60 @@ ORPHAN_HARD_CANCEL_S = 30.0
 #: 超出丢最旧（丢的只是最老的 usage 快照，不影响语义完整性）。
 FRAME_RING_CAP = 4000
 
+#: 单条 WebSocket 连接的出站信箱上限（A+ 阶段 1 / C-7）。
+#:
+#: 与任务侧 ``BackgroundTaskHub`` 的订阅队列（maxsize=1000）同口径，避免
+#: 「任务有背压、聊天没有」的不对称。1000 帧在正常回合下远超消费速度，
+#: 只有在客户端长时间不消费（弱网、页面被节流、连接挂死）时才会触顶。
+#: 可用 ``RA_CHAT_OUTBOX_MAXSIZE`` 调整；设为 0 表示无限（退回旧行为）。
+def _outbox_maxsize() -> int:
+    raw = os.getenv("RA_CHAT_OUTBOX_MAXSIZE")
+    try:
+        value = int(raw) if raw is not None else 1000
+    except (TypeError, ValueError):
+        value = 1000
+    return value if value > 0 else 0
+
+
+OUTBOX_MAXSIZE = _outbox_maxsize()
+
+
+def bounded_put(queue: asyncio.Queue, frame: dict) -> bool:
+    """入队一帧；队列满时**丢最旧**再入，返回是否发生过丢弃。
+
+    A+ 阶段 1 / C-7 的背压策略核心，独立成模块级函数以便直接测试
+    （内联在 ws_chat 的闭包里只能靠构造慢客户端来覆盖，不可靠）。
+
+    为什么丢最旧而不是丢最新：帧流是**有序增量**，丢最新会截断尾部（丢掉
+    result/usage 终态帧）、丢中间会造成空洞；丢最旧只是让本连接的直播流
+    暂时落后，完整序列仍在回合句柄的环形缓冲里，重连 ``attach{after}``
+    可以精确补回。
+
+    刻意**不修改 frame**：入队对象可能与环形缓冲里的帧共享引用（attach
+    回放的整段无 await 快照），就地改写会污染回放源。
+
+    Args:
+        queue: 目标队列。``maxsize<=0``（无界）时退化为 ``put_nowait``。
+        frame: 待入队帧，原样放入。
+
+    Returns:
+        True 表示发生了丢弃（调用方据此记数/告警）。
+    """
+    try:
+        queue.put_nowait(frame)
+        return False
+    except asyncio.QueueFull:
+        pass  # 控制流：队列满即丢弃最旧帧腾位，返回值由调用方记数
+    try:
+        queue.get_nowait()
+    except asyncio.QueueEmpty:  # pragma: no cover — 竞态窗口极窄
+        return False
+    try:
+        queue.put_nowait(frame)
+    except asyncio.QueueFull:  # pragma: no cover — 上一步刚腾出位
+        return False
+    return True
+
 
 @dataclass
 class _TurnHandle:
@@ -1144,6 +1205,52 @@ _SESSIONS: dict[str, dict] = {}
 _ACTIVE: dict[str, _TurnHandle] = {}
 
 
+def _has_active_turn(sid: str) -> bool:
+    """sid 是否已有**未结束**的活动回合。
+
+    A+ 阶段 1 / C-4 的判定核心。独立成模块级函数有两个理由：一是
+    ``_start_turn`` 里要复用主循环的同款判据，避免两处各写一份而漂移；
+    二是它可被测——原先内联在协程里，只能靠构造竞态才能覆盖。
+    """
+    handle = _ACTIVE.get(sid)
+    if handle is None:
+        return False
+    return not (handle.task is not None and handle.task.done())
+
+
+def _register_connection(sid: str, websocket: Any, sink: Any) -> Any:
+    """原子接管 sid 的连接登记，返回被替换掉的旧 socket（无则 None）。
+
+    A+ 阶段 1 / C-3：本函数内**不得出现任何 await**。
+
+    修复前是 `await previous.close()` 之后再写 `_LIVE`/`_SINKS`：那个挂起点
+    让两条几乎同时进入的新连接互相覆盖——后写的把先写的踢出登记表，
+    于是某条活跃连接拿不到帧，而另一条会收到不属于自己的回合输出。
+
+    现在「读 previous + 同步占位」在无 await 段内一次完成，关闭旧连接交由
+    调用方用后台任务处理（见 ``_close_quietly``）。
+    """
+    previous = _LIVE.get(sid)
+    _LIVE[sid] = websocket
+    _SINKS[sid] = sink
+    return previous
+
+
+async def _close_quietly(sock: Any, *, code: int, reason: str) -> None:
+    """后台关闭一条 WebSocket，吞掉一切异常。
+
+    A+ 阶段 1 / C-3 的配套：踢掉旧连接原本是 `await previous.close()`，
+    那个挂起点正是 `_LIVE`/`_SINKS` 注册竞态的来源。改为后台任务后，
+    关闭失败（连接已断、传输已关）不能影响新连接，故在此静默并记录。
+    """
+    try:
+        await sock.close(code=code, reason=reason)
+    except asyncio.CancelledError:
+        raise
+    except Exception:
+        LOG.debug("关闭被替换的旧连接失败", exc_info=True)
+
+
 async def _orphan_reap(sid: str, handle: _TurnHandle) -> None:
     """孤儿回合看门狗：最后一个观察者离开满 ORPHAN_GRACE_S 后收尸。
 
@@ -1162,7 +1269,7 @@ async def _orphan_reap(sid: str, handle: _TurnHandle) -> None:
             LOG.warning("回合未响应协作停止，硬取消兜底 sid=%s", sid)
             handle.task.cancel()
     except asyncio.CancelledError:
-        pass
+        pass  # 控制流：定时器自身被取消即正常退出路径
 
 
 def _content_for_llm(entry: dict) -> dict:
@@ -1171,6 +1278,10 @@ def _content_for_llm(entry: dict) -> dict:
     history.json 存结构化 attachments 字段供 UI 渲染；模型侧只需要知道
     「文件在哪、怎么读」，因此在喂给内核前（且仅在此处）拼进文本——权威
     数据保持结构化，不因模型的展示口径而失真。
+
+    多模态（G-3）：条目携带图片附件时，content 升级为**多部件列表**
+    （统一内部表示：text + image 部件；图片数据从留盘文件现读现编码），
+    由各 LLM 客户端的消息构造层适配为对应协议的分格式。
     """
     flat = {"role": entry.get("role", "user"), "content": str(entry.get("content", ""))}
     atts = entry.get("attachments")
@@ -1178,12 +1289,18 @@ def _content_for_llm(entry: dict) -> dict:
         lines = "\n".join(
             f'- {a.get("name", "")}: {a.get("path", "")}（可用 read_file/grep 直接读取）'
             for a in atts
-            if isinstance(a, dict) and a.get("path")
+            if isinstance(a, dict) and a.get("path") and not a.get("mime_type")
         )
         if lines:
             flat["content"] = (
                 f'{flat["content"]}\n\n[本条消息携带的附件]\n{lines}'
             )
+        image_parts = _image_parts_from_entry(entry)
+        if image_parts:
+            flat["content"] = [
+                {"type": "text", "text": flat["content"]},
+                *image_parts,
+            ]
     return flat
 
 
@@ -1194,6 +1311,166 @@ def _content_for_llm(entry: dict) -> dict:
 ATTACHMENTS_MAX = 8  # 单条消息最多携带附件数
 UPLOAD_TOTAL_LIMIT = 50 * 1024 * 1024  # 单次上传请求总字节上限
 _UPLOAD_NAME_RE = re.compile(r"[^A-Za-z0-9\u4e00-\u9fff._ ()\[\]-]+")
+
+# ---------------------------------------------------------------------------
+# 多模态视觉输入（G-3）：WS 内联 base64 图片 → 统一内部表示
+#
+# 入站 attachments 支持两种形态（可混用）：
+#   {"name", "path"}                  —— 既有路径引用（REST 上传后引用）
+#   {"name", "mime_type", "data_base64"} —— 内联图片（本次新增）
+# 内联图片经校验（mime 白名单 / base64 可解码 / 单图 5MB / 单条 ≤5 张）后
+# 落盘到 outputs/<sid>/uploads/ 留档，历史 attachments 只存 {name, path,
+# mime_type}——权威数据在磁盘，不把 base64 膨胀进 history.json。
+# RA_VISION_DISABLED=1 时拒绝一切图片并给出友好错误帧。
+# ---------------------------------------------------------------------------
+
+VISION_IMAGE_MAX_BYTES = 5 * 1024 * 1024  # 单图 base64 解码后大小上限
+VISION_MAX_IMAGES = 5  # 单条消息最多图片数
+
+#: 支持视觉输入的图片 mime 白名单（Anthropic / OpenAI 公共支持集）
+_IMAGE_MIME_ALLOW = {"image/png", "image/jpeg", "image/gif", "image/webp"}
+
+#: 扩展名 → mime（路径引用的图片附件与缺失 mime_type 的内联图片用）
+_IMAGE_MIME_BY_EXT = {
+    ".png": "image/png",
+    ".jpg": "image/jpeg",
+    ".jpeg": "image/jpeg",
+    ".gif": "image/gif",
+    ".webp": "image/webp",
+}
+
+
+def _vision_enabled() -> bool:
+    """视觉开关：RA_VISION_DISABLED=1 时会话层拒绝一切图片输入。"""
+    return os.getenv("RA_VISION_DISABLED", "0") != "1"
+
+
+def _guess_image_mime(name: str) -> str | None:
+    """按扩展名猜图片 mime；非图片扩展名返回 None。"""
+    return _IMAGE_MIME_BY_EXT.get(Path(name).suffix.lower())
+
+
+def _normalize_attachment(a: dict) -> dict | None:
+    """历史归一化用：附件条目保留 name/path，图片类附件补留 mime_type。"""
+    path = str(a.get("path", ""))
+    if not path and not a.get("name"):
+        return None
+    entry: dict = {"name": str(a.get("name", "")), "path": path}
+    mime = str(a.get("mime_type", "")) or _guess_image_mime(entry["name"] or path)
+    if mime:
+        entry["mime_type"] = mime
+    return entry
+
+
+def _image_parts_from_entry(entry: dict) -> list[dict]:
+    """从历史条目的 attachments 提取图片 → 统一内部表示的 image 部件。
+
+    纯函数口径（可不经 WS 直接测）：读 attachments 里 mime 为图片的文件、
+    base64 编码；文件缺失 / 超过单图上限 / 非白名单 mime 的条目静默跳过
+    （留档的路径清单文本仍在，模型至少知道附件存在）。
+    """
+    parts: list[dict] = []
+    atts = entry.get("attachments")
+    if not isinstance(atts, list):
+        return parts
+    for a in atts:
+        if not isinstance(a, dict):
+            continue
+        path = str(a.get("path") or "")
+        if not path:
+            continue
+        mime = str(a.get("mime_type") or "") or _guess_image_mime(path)
+        if not mime or mime not in _IMAGE_MIME_ALLOW:
+            continue
+        try:
+            data = Path(path).read_bytes()
+        except OSError:
+            continue  # 文件已清理/不可读：降级为无图片，不阻塞回合
+        if len(data) > VISION_IMAGE_MAX_BYTES:
+            continue
+        parts.append({
+            "type": "image",
+            "media_type": mime,
+            "data": base64.b64encode(data).decode("ascii"),
+        })
+    return parts
+
+
+def _save_inline_image(cwd: Path, sid: str, name: str, mime: str, data: bytes) -> dict:
+    """内联图片落盘 outputs/<sid>/uploads/ 留档，返回历史附件元数据。"""
+    stamp = datetime.now().strftime("%H%M%S_%f")
+    safe_name = _safe_upload_name(name or f"image.{mime.split('/', 1)[-1]}")
+    dest = _outputs_root(cwd) / sid / "uploads"
+    dest.mkdir(parents=True, exist_ok=True)
+    target = dest / f"{stamp}_{safe_name}"
+    target.write_bytes(data)
+    return {"name": safe_name, "path": str(target), "mime_type": mime}
+
+
+def _prepare_attachments(cwd: Path, sid: str, raw: Any) -> tuple[list[dict], str]:
+    """WS user 消息附件总入口：路径引用 + 内联 base64 图片统一校验。
+
+    返回 (规范化的附件元数据列表, 错误串)；出错时元数据为空列表、错误串
+    非空（调用方转成 error 帧，不开轮）。错误串口径与
+    _validate_attachment_refs 保持一致的中文风格。
+    """
+    if raw is None:
+        return [], ""
+    if not isinstance(raw, list):
+        return [], "attachments 必须是数组"
+    if len(raw) > ATTACHMENTS_MAX:
+        return [], f"附件数量超过上限（{ATTACHMENTS_MAX} 个）"
+
+    inline: list[dict] = []
+    refs: list[dict] = []
+    for item in raw:
+        if not isinstance(item, dict):
+            return [], "attachments 元素必须是对象"
+        if item.get("data_base64"):
+            inline.append(item)
+        elif item.get("path"):
+            refs.append(item)
+        else:
+            return [], "附件缺少 path 或 data_base64"
+
+    meta: list[dict] = []
+    if refs:
+        checked = _validate_attachment_refs(cwd, sid, refs)
+        if isinstance(checked, str):
+            return [], checked
+        # 图片类路径引用补 mime_type：与内联图片同一套视觉注入口径
+        meta.extend(
+            {**a, "mime_type": mime} if (mime := _guess_image_mime(a["name"] or a["path"])) else a
+            for a in checked
+        )
+
+    if inline:
+        if not _vision_enabled():
+            return [], "当前配置已禁用视觉输入（RA_VISION_DISABLED=1），无法接收图片附件"
+        # 图片总数（路径引用中的图片 + 内联图片）单条消息 ≤ VISION_MAX_IMAGES
+        ref_images = [a for a in meta if _guess_image_mime(str(a.get("name", "")))]
+        if len(inline) + len(ref_images) > VISION_MAX_IMAGES:
+            return [], f"图片数量超过上限（每条消息最多 {VISION_MAX_IMAGES} 张）"
+        for item in inline:
+            mime = str(item.get("mime_type") or "") or _guess_image_mime(
+                str(item.get("name") or "")
+            ) or ""
+            if mime not in _IMAGE_MIME_ALLOW:
+                return [], (
+                    f"不支持的图片类型：{mime or '未知'}"
+                    f"（仅支持 {', '.join(sorted(_IMAGE_MIME_ALLOW))}）"
+                )
+            try:
+                data = base64.b64decode(str(item["data_base64"]), validate=True)
+            except (ValueError, TypeError):
+                return [], f"附件 {item.get('name', '')} 的 base64 数据无法解码"
+            if len(data) > VISION_IMAGE_MAX_BYTES:
+                limit_mb = VISION_IMAGE_MAX_BYTES // (1024 * 1024)
+                return [], f"图片 {item.get('name', '')} 超过大小上限（{limit_mb}MB）"
+            meta.append(_save_inline_image(
+                cwd, sid, str(item.get("name") or ""), mime, data,
+            ))
+    return meta, ""
 
 
 def _safe_upload_name(raw: str) -> str:
@@ -1403,7 +1680,20 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
     """
     await websocket.accept()
 
-    outbox: asyncio.Queue = asyncio.Queue()  # 本连接出站信箱（无界）
+    # A+ 阶段 1 / C-7：出站信箱**有界**，与任务侧（task_hub 的 maxsize=1000
+    # + 满则丢最旧）保持同一背压口径。
+    #
+    # 修复前这里是无界队列：客户端读得慢（弱网、页面被系统节流、或干脆
+    # 挂着一个不消费的 WebSocket）时，回合会持续往内存里堆帧——一个长回合
+    # 的文本帧可达数万条，进程 RSS 无上限增长，而服务端没有任何信号表明
+    # 「对端已经跟不上了」。
+    #
+    # 丢最旧而不是丢最新：帧流是**有序增量**，丢中间/最新会造成乱序或丢
+    # 尾；丢最旧只是让该连接的直播流暂时落后，而完整序列仍在回合句柄的
+    # 环形缓冲（FRAME_RING_CAP）里，重连 attach(after) 可以精确补回。
+    outbox: asyncio.Queue = asyncio.Queue(maxsize=OUTBOX_MAXSIZE)
+    #: 因信箱满而丢弃的帧数（仅本连接，用于日志；不回写帧对象）。
+    outbox_dropped: list[int] = [0]
     sid = ""
     #: 本连接在 _SINKS 里的登记凭证（finally 按引用比对注销）。
     sink_fn: Any = None
@@ -1429,8 +1719,19 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
     def _post(frame: dict) -> None:
         """同步入箱（不 await）。事件循环协作式调度下，「快照→过滤→补发」
         因此可以写成无 await 的原子段——回合任务的发射不可能插进回放中间，
-        回放帧与直播帧在同一 FIFO 里严格保序、不重不漏。"""
-        outbox.put_nowait(frame)
+        回放帧与直播帧在同一 FIFO 里严格保序、不重不漏。
+
+        满则丢最旧（见 ``bounded_put``）；落后量经日志暴露，不塞进每一帧——
+        入队对象可能与环形缓冲共享引用，就地改写会污染回放源。
+        """
+        if bounded_put(outbox, frame):
+            outbox_dropped[0] += 1
+            if outbox_dropped[0] == 1 or outbox_dropped[0] % 500 == 0:
+                LOG.warning(
+                    "出站信箱已满，丢弃最旧帧 sid=%s 累计丢弃=%d"
+                    "（对端消费过慢，完整序列仍可经 attach 回放补回）",
+                    sid, outbox_dropped[0],
+                )
 
     async def _drain() -> None:
         """等信箱清空再返回（close 前确保错误帧真的发出去）。
@@ -1545,17 +1846,24 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             store.save()
 
         # ---- 并发连接：踢掉同会话旧 socket --------------------------------
-        previous = _LIVE.get(sid)
+        #
+        # A+ 阶段 1 / C-3：**先同步占位，再异步关旧连接**。
+        #
+        # 修复前 `await previous.close(...)` 是挂起点：两条新连接 C1、C2 几乎
+        # 同时进来时，C1 在 await 处让出 → C2 读到的 previous 仍是 A_old，
+        # 关掉它并把自己写进 _LIVE/_SINKS → C1 恢复后**覆盖** C2。
+        # 结果是 C2 明明活着却不在 _SINKS 里：C2 的回合帧被投递给 C1 的信箱
+        # ——一个标签页看到另一个会话的输出，而自己这边永远空白。
+        #
+        # 修复要点是让「读 previous → 写 _LIVE/_SINKS」落在**无 await 的
+        # 原子段**内，把真正需要 await 的 close 挪出去用后台任务做。
+        previous = _register_connection(sid, websocket, outbox.put_nowait)
         if previous is not None and previous is not websocket:
-            try:
-                await previous.close(code=4001, reason="replaced by newer connection")
-            except Exception:
-                pass
             # 被踢连接在自己的 finally 里释放观察者名额——若它正观察着活动
             # 回合且无新连接接替，孤儿看门狗会在那里武装。
-        _LIVE[sid] = websocket
-        sink_fn = outbox.put_nowait
-        _SINKS[sid] = sink_fn  # 运行中回合的尾流自此路由到本连接
+            asyncio.get_running_loop().create_task(
+                _close_quietly(previous, code=4001, reason="replaced by newer connection")
+            )
 
         # ---- 会话级运行时：预算跨重连持续累计 ------------------------------
         rt = _SESSIONS.setdefault(sid, {})
@@ -1568,12 +1876,31 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
 
         # 双轨制注入：sandbox 围栏恒为工作区根；相对写入与执行默认 CWD 归巢
         # 产物目录（savefig 相对保存自动落家）；读共享数据靠契约绝对路径口径。
+        #
+        # A+ 阶段 2 / F-2：注入 PlatformStore 与 sid，开启产物索引**推模式**——
+        # 工具写成功即回填 artifacts 表，该表由此成为唯一权威源。此前的拉模式
+        # 只在有人调用 manifest 端点时才回填，没人查就不记。
+        # CLI / 单代理路径不注入，行为不变。
+        _platform_store = getattr(websocket.app.state, "platform_store", None)
         tools = ToolRegistry(
             work_dir=str(cwd),
             write_anchor=str(outputs_abs),
             exec_cwd=str(outputs_abs),
+            artifact_store=_platform_store,
+            artifact_session=sid,
         )
+
+        # A+ 阶段 5 / G-1：跨会话记忆。工具三件套经声明式扩展注册（存/取/忘），
+        # 既有记忆摘要在**连接建立时**注入系统提示（每回合重复构建
+        # system_instructions 时的读取成本 = 一次 JSON 读，可忽略；回合中
+        # 新存的记忆从下一轮提示可见——模型也可 recall_memory 即时取）。
+        _memory_store = build_memory_store(cwd)
+        for _ext in build_memory_extensions(cwd, store=_memory_store):
+            tools.register_extension(_ext)
         system_instructions = _chat_system_instructions(cwd, outputs_abs)
+        memory_section = memory_prompt_section(_memory_store)
+        if memory_section:
+            system_instructions += memory_section
 
         card_seq = itertools.count(1)  # 卡片 ID 连接内唯一（跨轮不重置：
         # 前端 cards 映射按 id 合并；回合私有的是 pending_cards FIFO 配对表）
@@ -1617,6 +1944,20 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             等客户端 plan_decision；批准后才执行原请求（模型可见提示词里
             附上已确认的计划）。"""
             turn_t0 = time.monotonic()
+
+            # A+ 阶段 1 / C-4：入口处二次确认没有活动回合。
+            #
+            # 主循环在调用本函数前已查过一次，但那次检查与这里的
+            # `_ACTIVE[sid] = handle` 之间存在间隙；一旦 C-3 的竞态让两条
+            # 连接并存，两个回合就会同时对 history.json 做
+            # read-modify-write 而丢更新。此处是**第二道防线**：本函数从
+            # 入口到写入 _ACTIVE 之间没有 await，所以这个检查是原子的。
+            # 正常路径永远不会触发（调用方已把在途消息转成 steer）。
+            if _has_active_turn(sid):
+                LOG.warning(
+                    "拒绝并发回合：sid=%s 已有活动回合（调用方应先走 steer 路径）", sid
+                )
+                return
 
             handle = _TurnHandle(cancel_event=asyncio.Event(), budget=budget)
             # seq 会话内单调续接：此刻 rt["last"] 仍是上一回合句柄（本回合
@@ -1715,12 +2056,23 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                      sid, len(text), model_now,
                      " [plan]" if plan_query is not None else "")
             history_prefix = [_content_for_llm(m) for m in messages[:-1]]
+            # 多模态（G-3）：本回合的图片附件作为 image 部件并入本轮上下文。
+            # 内核 run_agent 只接收字符串 prompt（user 消息由它自行追加），
+            # 因此图片以独立 user 条目挂在 initial_messages 尾部，与紧随的
+            # prompt 文本消息在协议适配层合并为一条多部件 user 消息。
+            current_images = _image_parts_from_entry(user_entry)
+            if current_images:
+                history_prefix.append({"role": "user", "content": current_images})
 
             async def _invoke(user_prompt: str):
                 # 每轮实时构建客户端：设置页保存即刻生效；历史由包装层前置
                 # 进本轮首个请求（_HistoryClient），内核仍从单条 user 起步。
                 llm_client = _HistoryClient(build_llm_client(model=model_now))
                 llm_client.set_prefix([])
+                # G-6 执行链路 tracing：RA_TRACE_DIR 设置时每次 run 写
+                # trace-<ts>.jsonl；未设置返回 None、不注册任何 handler。
+                run_hooks = HookBus()
+                maybe_attach_tracing(run_hooks)
                 try:
                     return await run_agent(
                         prompt=user_prompt,
@@ -1735,6 +2087,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                             approver=handle.approver,
                             session_log=store,  # events.jsonl 审计镜像
                             initial_messages=history_prefix,
+                            hooks=run_hooks,
                         ),
                         on_text=lambda delta: _on_text(handle, delta),
                         on_thought=lambda delta: _on_thought(handle, delta),
@@ -1746,7 +2099,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     try:
                         await llm_client.close()
                     except Exception:
-                        pass
+                        pass  # 尽力而为：连接收尾失败不掩盖本轮真实结果
 
             async def _wait_plan_decision(active: _TurnHandle) -> str:
                 """等 plan_decision / stop / 超时，返回 approve|deny|timeout|cancel。"""
@@ -1772,6 +2125,9 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                 """
                 plan_text = ""
                 llm_client = _HistoryClient(build_llm_client(model=model_now))
+                # G-6：planner 回合同样按 env 开关挂 tracing（独立 run 独立文件）
+                plan_hooks = HookBus()
+                maybe_attach_tracing(plan_hooks)
                 try:
                     result = await run_agent(
                         prompt=query,
@@ -1784,6 +2140,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                             cancel_event=handle.cancel_event,
                             session_log=store,
                             initial_messages=history_prefix,
+                            hooks=plan_hooks,
                         ),
                         on_text=lambda delta: _on_plan_text(handle, delta),
                     )
@@ -1795,7 +2152,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                     try:
                         await llm_client.close()
                     except Exception:
-                        pass
+                        pass  # 尽力而为：连接收尾失败不掩盖本轮真实结果
                 plan_id = uuid.uuid4().hex
                 handle.ask_state["plan"] = plan_id
                 await _emit(handle, {
@@ -1870,7 +2227,7 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                             try:
                                 await handle.feeder
                             except BaseException:
-                                pass
+                                pass  # 尽力而为清理：等待已取消的 feeder 收尾，异常不再上抛
                     handle.feeder = None
 
                 # ---- 全路径持久化：用户消息之后必有 assistant 条目 -------------
@@ -1981,8 +2338,21 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
             if target is None:
                 await _send({"type": "replay_empty"})
                 return
+            # A+ 阶段 1 / C-2：重复 attach **只打日志就放行**是错的。
+            #
+            # `_observe` 无条件 `observers += 1`，但 `watching.append` 是有
+            # 条件的；而 `_release` 以 `watching` 为准（不在其中直接 return）。
+            # 于是同一连接 attach 两次 → observers=2 而 watching 只有 1 项
+            # → 断连只减 1 → observers 停在 1 → `observers == 0` 永不成立
+            # → **孤儿看门狗永不武装**，无人观察的回合会一直跑到预算耗尽。
+            #
+            # 断连重连在网络抖动场景下很常见，这个洞是可达的。
             already = target in watching
-            _observe(target)
+            if already:
+                # 仍回放一次（幂等：按 after 游标续播），但不再占用观察者名额。
+                LOG.debug("重复 attach 同一回合 sid=%s after=%d —— 不再累加观察者", sid, after)
+            else:
+                _observe(target)
             # 下面整段无 await（_post 同步入箱）：快照、过滤、begin/帧/end
             # 的入箱顺序对回合任务的并发发射是原子的——要么 emit 整段先跑
             # （其 seq 进了快照、由回放补发），要么整段后跑（由直播路由送
@@ -2137,9 +2507,9 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                         # 前端输入框在运行期本就是 steer 通道）。
                         active.steers.put_nowait(text[:MAX_STEER_LENGTH])
                         continue
-                    checked = _validate_attachment_refs(cwd, sid, msg.get("attachments"))
-                    if isinstance(checked, str):
-                        await _send({"type": "error", "message": checked})
+                    atts_meta, att_err = _prepare_attachments(cwd, sid, msg.get("attachments"))
+                    if att_err:
+                        await _send({"type": "error", "message": att_err})
                         continue
                     # 方案 4：空闲期收到 slash 命令——/plan 启动带确认门的回合
                     #（用户消息照常落盘），其余命令就地分派（不占回合）。
@@ -2153,11 +2523,11 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
                                                 "助手先给出计划，确认后再执行"),
                                 })
                             else:
-                                await _start_turn(text, checked, plan_query=rest)
+                                await _start_turn(text, atts_meta, plan_query=rest)
                         else:
                             await _handle_command(name, rest, text)
                         continue
-                    await _start_turn(text, checked)
+                    await _start_turn(text, atts_meta)
             else:
                 await _dispatch(msg)
 
@@ -2181,6 +2551,6 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         try:
             await pump_task
         except asyncio.CancelledError:
-            pass
+            pass  # 控制流：泵任务按计划被取消，属正常收尾
         # 注意：不清 active_tasks 注册项——回合生命周期归 _turn_main 收尾管
         # （注册项带真实 task 对象，删除端点的精确等待依赖它）。

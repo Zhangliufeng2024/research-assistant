@@ -30,9 +30,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from ..artifacts.versioning import ArtifactVersionStore
+
 LOG = logging.getLogger("ra.runtime.janitor")
 
 AUDIT_FILE = "janitor_audit.jsonl"
+
+#: 一天的秒数（与 tmp_days 等既有用 86400.0 内联的口径一致，这里提出来
+#: 是因为 _sweep_tool_outputs / _rotate_audit 也需要）。生产代码不在仓库
+#: 全局共享常量，避免把"时间单位"这种小事提升为跨模块依赖。
+DAY_SECONDS = 86400.0
 
 
 @dataclass(frozen=True)
@@ -43,6 +50,13 @@ class JanitorConfig:
     events_rotate_mb: float = 10.0
     events_keep: int = 3
     tmp_days: float = 7.0
+    #: A+ 阶段 2 / F-6：上下文外置产物（.ra/tool_outputs/）的保留天数。
+    #: agent.py 把超大工具结果落盘到这里，只在历史里留指针，从不清理——
+    #: 长跑项目里这个目录会单调增长。
+    tool_outputs_days: float = 7.0
+    #: 审计日志自身的大小上限（MB）与保留代数。此前只 append 不轮转。
+    audit_rotate_mb: float = 5.0
+    audit_keep: int = 3
 
     @classmethod
     def from_env(cls) -> JanitorConfig:
@@ -59,6 +73,9 @@ class JanitorConfig:
             events_rotate_mb=_f("RA_JANITOR_EVENTS_ROTATE_MB", 10.0),
             events_keep=int(_f("RA_JANITOR_EVENTS_KEEP", 3)),
             tmp_days=_f("RA_JANITOR_TMP_DAYS", 7.0),
+            tool_outputs_days=_f("RA_JANITOR_TOOL_OUTPUTS_DAYS", 7.0),
+            audit_rotate_mb=_f("RA_JANITOR_AUDIT_ROTATE_MB", 5.0),
+            audit_keep=int(_f("RA_JANITOR_AUDIT_KEEP", 3)),
         )
 
 
@@ -157,36 +174,126 @@ def _sweep_cold(cwd: Path, store: Any, cfg: JanitorConfig, stats: dict) -> None:
 
 
 def _sweep_changes(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
-    """.ra/changes/ 总量 LRU：超 cap 按 mtime 从旧到新淘汰。"""
+    """.ra/changes/ 总量 LRU：超 cap 按 mtime 从旧到新淘汰快照 .bin。
+
+    A+ 阶段 1 / F-1：淘汰必须经 ``ArtifactVersionStore.discard_snapshot()``——
+    它删 .bin 的同时会在索引里置 ``<side>_evicted``，两者是一个动作。
+
+    修复前这里直接 ``path.unlink()``：bin 没了但 index.json 里的记录仍在，
+    于是变更页照常显示这条记录、「恢复」按钮照常可点，而 restore() 读不到
+    快照就走「删除目标文件」的分支——**恢复按钮变成销毁按钮**。
+
+    另外这里只扫 ``*.bin``，绝不碰 index.json：旧实现的 ``rglob("*")``
+    在极端 mtime 排序下理论上会把索引本身也当成最旧文件删掉。
+    """
     changes = cwd / ".ra" / "changes"
     if not changes.is_dir():
         return
-    files: list[tuple[float, int, Path]] = []
+    bins: list[tuple[float, int, Path]] = []
     try:
-        for p in changes.rglob("*"):
+        for p in changes.rglob("*.bin"):
             if p.is_file():
                 try:
                     st = p.stat()
-                    files.append((st.st_mtime, st.st_size, p))
+                    bins.append((st.st_mtime, st.st_size, p))
                 except OSError:
                     continue
     except OSError:
         return
-    total = sum(size for _, size, _ in files)
+    total = sum(size for _, size, _ in bins)
     cap = cfg.changes_cap_mb * 1024 * 1024
     if total <= cap:
         return
-    files.sort()  # mtime 升序：最旧的先淘汰
-    for _mtime, size, path in files:
+    bins.sort()  # mtime 升序：最旧的先淘汰
+
+    store = ArtifactVersionStore(cwd)
+    for _mtime, size, path in bins:
         if total <= cap:
             break
+        change_id = path.parent.name
+        side = path.stem
+        if side not in {"before", "after"}:
+            continue
         try:
-            _audit(cwd, "evict_change", path, f"changes {total / 1048576:.0f}MB > cap {cfg.changes_cap_mb:.0f}MB")
-            path.unlink()
-            total -= size
-            stats["changes_evicted"] += 1
+            _audit(
+                cwd, "evict_change", path,
+                f"changes {total / 1048576:.0f}MB > cap {cfg.changes_cap_mb:.0f}MB",
+            )
+            if store.discard_snapshot(change_id, side):
+                total -= size
+                stats["changes_evicted"] += 1
         except OSError:
             continue
+
+
+def _sweep_tool_outputs(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
+    """A+ 阶段 2 / F-6：清理过期的上下文外置产物。
+
+    agent.py 把超过阈值的工具结果落到 ``.ra/tool_outputs/``，只在会话历史里
+    留一个指针。但**从来没有任何清理路径**——指针会随会话压缩/删除而消失，
+    文件却永久留在工作区里，长期项目上单调增长。
+
+    保留 ``tool_outputs_days``（默认 7）天：外置产物是"可重得的中间态"，
+    真正需要长期留存的产物会经 write_file 进入产物目录并纳入版本跟踪，
+    与这里不是同一回事。
+    """
+    root = cwd / ".ra" / "tool_outputs"
+    if not root.is_dir():
+        return
+    cutoff = time.time() - cfg.tool_outputs_days * DAY_SECONDS
+    try:
+        for path in list(root.rglob("*")):
+            if not path.is_file():
+                continue
+            try:
+                if path.stat().st_mtime >= cutoff:
+                    continue
+            except OSError:
+                continue
+            try:
+                _audit(cwd, "delete_tool_output", path, f"older than {cfg.tool_outputs_days}d")
+                path.unlink()
+                stats["tool_outputs_removed"] += 1
+            except OSError:
+                continue
+    except OSError:
+        return
+
+
+def _rotate_audit(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
+    """A+ 阶段 2 / F-6：审计日志自身轮转。
+
+    ``_audit`` 是"删除前先留证"的 fail-safe 机制，它自己却**只增不减**——
+    一个跑了半年的工作区，审计日志会无限膨胀，反而拖慢每一次删除动作
+    （每次都要 append 到一个越来越大的文件上）。
+
+    轮转放**在其它清理层之后**执行（见 run_janitor 的顺序）：本轮产生的
+    审计记录先完整落盘，再滚动，绝不丢失"刚刚删了什么"的证据。
+    """
+    audit_path = cwd / ".ra" / AUDIT_FILE
+    if not audit_path.is_file():
+        return
+    cap = cfg.audit_rotate_mb * 1024 * 1024
+    try:
+        if audit_path.stat().st_size < cap:
+            return
+    except OSError:
+        return
+
+    try:
+        # 依次把 .N 推到 .N+1，最旧的一代丢弃
+        for gen in range(cfg.audit_keep, 0, -1):
+            src = audit_path.with_name(f"{AUDIT_FILE}.{gen}")
+            if not src.exists():
+                continue
+            if gen >= cfg.audit_keep:
+                src.unlink()
+                continue
+            src.rename(audit_path.with_name(f"{AUDIT_FILE}.{gen + 1}"))
+        audit_path.rename(audit_path.with_name(f"{AUDIT_FILE}.1"))
+        stats["audit_rotated"] += 1
+    except OSError:
+        LOG.warning("审计日志轮转失败（不影响清理）", exc_info=True)
 
 
 def _rotate_events(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
@@ -240,13 +347,18 @@ def run_janitor(cwd: Path, store: Any = None, config: JanitorConfig | None = Non
     stats: dict[str, int] = {
         "archived": 0, "gzipped": 0, "drafts_removed": 0,
         "changes_evicted": 0, "rotated": 0, "tmp_removed": 0,
+        "tool_outputs_removed": 0, "audit_rotated": 0,
     }
     # 顺序即安全语义：cold 先于 warm——冷层只处理「上一轮就已归档」的会话，
     # 温层本轮新归档的要等下一轮才可能被压缩/清稿（先观察、后销毁）。
+    # tool_outputs 与 audit 放最后：前者是最"可丢"的层；后者必须等其他层
+    # 的审计记录都写完再滚动，否则会丢「刚刚删了什么」的证据。
     for name, fn in (
         ("cold", _sweep_cold), ("warm", _sweep_warm),
         ("changes", _sweep_changes), ("rotate", _rotate_events),
         ("tmp", _sweep_tmp),
+        ("tool_outputs", _sweep_tool_outputs),
+        ("audit", _rotate_audit),
     ):
         try:
             fn(cwd, store, cfg, stats) if name in {"warm", "cold"} else fn(cwd, cfg, stats)

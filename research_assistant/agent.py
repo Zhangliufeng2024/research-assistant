@@ -23,7 +23,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .constants import DEFAULT_MAX_CONTINUATIONS, TASK_COMPLETE_MARKER
+from .constants import DEFAULT_MAX_CONTINUATIONS, STEER_PREFIX, TASK_COMPLETE_MARKER
 from .kernel.approval import ToolApprovalRequest, resolve_approval
 from .kernel.budget import BudgetExceededError, BudgetGuard
 from .kernel.context import externalize_tool_result, maybe_compact
@@ -195,10 +195,12 @@ class _ActivityWatchdog:
 
     @staticmethod
     async def _swallow(task: "asyncio.Task[Any]") -> None:
+        # 尽力而为清理：等待已取消的内层任务收尾，其异常（多为 CancelledError）
+        # 已由调用方按超时/取消语义另行上报，无需在此重复。
         task.cancel()
         try:
             await task
-        except BaseException:
+        except BaseException:  # noqa: BLE001 — 取消路径专用兜底
             pass
 
     async def call(self, coro_factory: Callable[[], Any]) -> LLMResponse:
@@ -271,6 +273,8 @@ async def _cancelable(coro: Any, cancel_event: asyncio.Event | None) -> LLMRespo
             try:
                 await runner
             except BaseException:
+                # 尽力而为清理：内层请求已随 cancel_event 终止，
+                # 真实原因以 _TurnCancelled 路径为准，这里只等收尾。
                 pass
 
 
@@ -296,6 +300,12 @@ async def run_agent(
 ) -> AgentResult:
     """Run an agentic conversation loop to completion.
 
+    A+ 阶段 3 / A-1 拆分后的编排壳：本函数只保留**顺序决策**（回合循环、
+    各阶段衔接、终止判定），可变的运行状态显式化为 :class:`_RunState`，
+    运行环境为 :class:`_RunEnv`，各阶段（预算门 / LLM 调用 / 压缩 / 工具批 /
+    steer 注入）各自成模块级函数。所有错误都以 ``Error …`` 语义经
+    ``AgentResult``/异常上抛路径返回，行为与拆分前逐分支等价。
+
     Args:
         prompt: The user's initial request.
         system_prompt: System instructions for the LLM.
@@ -320,6 +330,269 @@ async def run_agent(
     Returns:
         AgentResult with collected output, metadata, and stop_reason.
     """
+    env, state = _prepare_run(
+        prompt=prompt, system_prompt=system_prompt, llm_client=llm_client,
+        tools=tools, config=config, max_turns=max_turns,
+        auto_continue=auto_continue, max_continuations=max_continuations,
+        temperature=temperature, max_tokens=max_tokens,
+        on_text=on_text, on_thought=on_thought, on_tool_use=on_tool_use,
+        on_tool_start=on_tool_start, on_turn_start=on_turn_start,
+        steer_queue=steer_queue, on_steer_injected=on_steer_injected,
+    )
+    cfg = env.cfg
+    mirror = state.mirror
+    start_time = time.time()
+
+    async def _emit(kind: EventKind, **kw: Any) -> Any:
+        return await env.hooks.emit(AgentEvent(kind, **kw))
+
+    # --- RUN_START + 历史镜像入账（原 setup 段尾部，需 await 故留在编排壳） ---
+    await _emit(EventKind.RUN_START, payload={"prompt_chars": len(prompt)})
+    for restored in state.messages[:-1]:
+        mirror.log_append(restored, origin="history")
+    mirror.log_append(state.messages[-1], origin="current")
+
+    async def _supervised_chat(
+        *,
+        messages: list[dict],
+        system: str,
+        temperature: float,
+        max_tokens: int,
+    ) -> LLMResponse:
+        """带完整监督的单次 chat 调用，注入给压缩摘要（kernel/context）。
+
+        复用主链路同一套设施——_ActivityWatchdog 两阶段看门狗（活动标记在
+        每尝试入口自清）、_llm_call_with_retry 指数退避重试、_cancelable 停止
+        打断（_TurnCancelled 语义与主链路一致）——不自建第二套监督。
+        """
+        watchdog = _ActivityWatchdog(
+            env.heartbeat_timeout,
+            # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
+            first_byte_timeout=min(env.heartbeat_timeout, get_first_byte_timeout()),
+            wall_timeout=get_attempt_wall_timeout(),
+        )
+        kwargs: dict[str, Any] = (
+            {"on_activity": watchdog.beat} if env.use_activity else {}
+        )
+        return await _cancelable(
+            _llm_call_with_retry(
+                llm_client, messages, system, None,
+                temperature, max_tokens, env.heartbeat_timeout,
+                env.max_retries, env.base_delay,
+                extra_kwargs=kwargs,
+                watchdog=watchdog,
+            ),
+            cfg.cancel_event,
+        )
+    env.supervised_chat = _supervised_chat
+
+    turn = -1
+    for turn in range(cfg.max_turns):
+        # --- cooperative cancellation -------------------------------------
+        if cfg.cancel_event is not None and cfg.cancel_event.is_set():
+            state.stop_reason = "cancelled"
+            break
+
+        await _drain_steer_and_announce(env, state)
+
+        await _maybe_await(
+            env.on_turn_start, turn + 1, time.time() - start_time,
+            state.total_usage,
+        )
+        await _emit(EventKind.TURN_START, turn=turn + 1)
+
+        # --- budget gate ---------------------------------------------------
+        reservation, request_max_tokens, blocked = await _reserve_budget(
+            env, state, turn,
+        )
+        if blocked:
+            break
+
+        # --- LLM call ------------------------------------------------------
+        try:
+            response = await _call_llm_turn(
+                env, state, turn, request_max_tokens, reservation,
+            )
+        except _TurnCancelled:
+            state.stop_reason = "cancelled"
+            break
+        # BudgetExceededError / Exception / BaseException 的清理与事件已在
+        # _call_llm_turn 内完成（归还预留 + RUN_END），这里原样上抛。
+
+        # --- context compaction (after measuring real usage) ---------------
+        if await _compact_if_needed(env, state, turn, response):
+            break
+
+        if response.content:
+            state.collected_text += response.content
+            if not env.streaming:
+                await _maybe_await(env.on_text, response.content)
+
+        if response.tool_calls:
+            if await _execute_tool_batch(env, state, turn, response):
+                # cancel hit mid-tool-batch
+                break
+            state.recent_text_responses.clear()
+            continue
+
+        if response.stop_reason == "max_tokens":
+            await _append_continuation(
+                env, state, content=response.content,
+                nudge="Continue from where you left off.",
+            )
+            if state.continuation_count >= cfg.max_continuations:
+                state.stop_reason = "max_continuations"
+                break
+            continue
+
+        if response.stop_reason == "end_turn":
+            if TASK_COMPLETE_MARKER in (response.content or ""):
+                break
+
+            if response.content and not response.tool_calls:
+                state.recent_text_responses.append(response.content.strip())
+                if len(state.recent_text_responses) > 5:
+                    state.recent_text_responses.pop(0)
+
+            if _is_completion_loop(state.recent_text_responses):
+                break
+
+            if cfg.auto_continue and state.continuation_count < cfg.max_continuations:
+                await _append_continuation(
+                    env, state, content=response.content, nudge="Continue.",
+                )
+                continue
+            break
+
+        break
+    else:
+        state.stop_reason = "max_turns"
+
+    await _emit(EventKind.RUN_END, payload={
+        "stop_reason": state.stop_reason,
+        "turns": state.n_llm_calls,
+    })
+    mirror.slog("run_end", stop_reason=state.stop_reason, turns=state.n_llm_calls)
+
+    duration = time.time() - start_time
+    return AgentResult(
+        success=True,
+        text_output=state.collected_text,
+        files_written=state.files_written,
+        duration_seconds=duration,
+        token_usage=state.total_usage,
+        turns=state.n_llm_calls,
+        stop_reason=state.stop_reason,
+    )
+
+
+class _SessionMirror:
+    """会话日志镜像（"model-visible is logged"）。
+
+    `messages` 的每次变更都经由本类，维护一个长度账本；每次 LLM 请求前
+    断言真实列表长度与账本一致，未入账的变更无法悄然溜过（软告警——
+    契约见 docs/protocol.md）。A+ 3.1 从 run_agent 内嵌三元组闭包显式化。
+    """
+
+    def __init__(self, session_log: Any) -> None:
+        self.session_log = session_log
+        self.appended = 0
+        self.deleted = 0
+
+    @property
+    def expected_len(self) -> int:
+        return self.appended - self.deleted
+
+    def slog(self, kind: str, **data: Any) -> None:
+        if self.session_log is None:
+            return
+        try:
+            self.session_log.log(kind, data)
+        except Exception:
+            pass  # telemetry must never break the run
+
+    def log_append(self, msg: dict, *, origin: str = "current") -> None:
+        self.appended += 1
+        seq = self.appended - self.deleted - 1
+        content = msg.get("content", "")
+        if isinstance(content, list):
+            content = json.dumps(content, ensure_ascii=False, default=str)
+        self.slog("msg_add", seq=seq, role=msg.get("role", "?"),
+                  content=str(content)[:20_000],
+                  tool_calls=bool(msg.get("tool_calls")), origin=origin)
+
+    def log_delete(self, n: int) -> None:
+        self.deleted += n
+
+
+@dataclass
+class _RunState:
+    """run_agent 回合循环的可变状态（A+ 3.1：从 556 行闭包里显式化）。"""
+
+    messages: list[dict]
+    mirror: _SessionMirror
+    collected_text: str = ""
+    files_written: list[str] = field(default_factory=list)
+    total_usage: TokenUsage = field(default_factory=TokenUsage)
+    n_llm_calls: int = 0
+    continuation_count: int = 0
+    recent_text_responses: list[str] = field(default_factory=list)
+    stop_reason: str = "completed"
+
+
+@dataclass
+class _RunEnv:
+    """run_agent 的运行环境（回调 / 基础设施；一次构建，循环内只读）。"""
+
+    cfg: RunConfig
+    hooks: HookBus
+    tools: ToolRegistry
+    llm_client: LLMClient
+    budget: BudgetGuard | None
+    heartbeat_timeout: float
+    max_retries: int
+    base_delay: float
+    tool_schemas: list[dict]
+    system_prompt: str
+    artifacts_dir: Path | None
+    use_activity: bool
+    streaming: bool
+    steer_queue: asyncio.Queue | None
+    on_text: OnTextCallback | None
+    on_thought: OnTextCallback | None
+    on_tool_use: OnToolCallback | None
+    on_tool_start: OnToolStartCallback | None
+    on_turn_start: OnTurnStartCallback | None
+    on_steer_injected: OnSteerCallback | None
+    #: 压缩摘要用的受监督 chat；由 run_agent 在闭包内赋值（依赖本地设施）。
+    supervised_chat: Callable[..., Any] | None = None
+
+    async def emit(self, kind: EventKind, **kw: Any) -> Any:
+        """统一事件出口：各阶段函数经此发事件（原 _emit 闭包的显式化）。"""
+        return await self.hooks.emit(AgentEvent(kind, **kw))
+
+
+def _prepare_run(
+    *,
+    prompt: str,
+    system_prompt: str,
+    llm_client: LLMClient,
+    tools: ToolRegistry,
+    config: RunConfig | None,
+    max_turns: int,
+    auto_continue: bool,
+    max_continuations: int,
+    temperature: float,
+    max_tokens: int,
+    on_text: OnTextCallback | None,
+    on_thought: OnTextCallback | None,
+    on_tool_use: OnToolCallback | None,
+    on_tool_start: OnToolStartCallback | None,
+    on_turn_start: OnTurnStartCallback | None,
+    steer_queue: asyncio.Queue | None,
+    on_steer_injected: OnSteerCallback | None,
+) -> tuple[_RunEnv, _RunState]:
+    """装配运行环境与初始状态（原 run_agent 的 323-427 行 setup 段）。"""
     if config is not None:
         cfg = config
     else:
@@ -356,54 +629,11 @@ async def run_agent(
         else get_heartbeat_timeout()
     )
 
-    start_time = time.time()
     messages: list[dict] = [dict(message) for message in cfg.initial_messages]
     messages.append({"role": "user", "content": prompt})
     tool_schemas = tools.get_schemas()
 
-    collected_text = ""
-    files_written: list[str] = []
-    total_usage = TokenUsage()
-    n_llm_calls = 0
-    continuation_count = 0
-    max_retries = get_max_retries()
-    base_delay = get_retry_base_delay()
-    recent_text_responses: list[str] = []
-
-    streaming = on_text is not None
-    stop_reason = "completed"
-
-    async def _emit(kind: EventKind, **kw: Any) -> Any:
-        return await hooks.emit(AgentEvent(kind, **kw))
-
-    # --- session-log mirroring ("model-visible is logged") -----------------
-    # Every mutation of `messages` goes through the helpers below, which keep
-    # a length ledger; before each LLM request we assert the live list length
-    # matches the ledger, so an unlogged mutation cannot slip through
-    # unnoticed (soft warning — see docs/protocol.md for the contract).
-    ledger = {"appended": 0, "deleted": 0}
-    session_log = cfg.session_log
-
-    def _slog(kind: str, **data: Any) -> None:
-        if session_log is None:
-            return
-        try:
-            session_log.log(kind, data)
-        except Exception:
-            pass  # telemetry must never break the run
-
-    def _log_append(msg: dict, *, origin: str = "current") -> None:
-        ledger["appended"] += 1
-        seq = ledger["appended"] - ledger["deleted"] - 1
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            content = json.dumps(content, ensure_ascii=False, default=str)
-        _slog("msg_add", seq=seq, role=msg.get("role", "?"),
-              content=str(content)[:20_000],
-              tool_calls=bool(msg.get("tool_calls")), origin=origin)
-
-    def _log_delete(n: int) -> None:
-        ledger["deleted"] += n
+    mirror = _SessionMirror(cfg.session_log)
 
     # Mount the repeat-call guard (env-tunable, on by default).
     if cfg.repeat_guard is not False:
@@ -412,11 +642,6 @@ async def run_agent(
         if guard is not None:
             hooks.on(EventKind.PRE_TOOL_USE, guard)
 
-    await _emit(EventKind.RUN_START, payload={"prompt_chars": len(prompt)})
-    for restored in messages[:-1]:
-        _log_append(restored, origin="history")
-    _log_append(messages[-1], origin="current")
-
     # Per-run scratch space for externalized tool outputs.
     artifacts_dir: Path | None = None
     if cfg.externalize_outputs:
@@ -424,411 +649,364 @@ async def run_agent(
         if work_dir:
             artifacts_dir = Path(work_dir) / ".ra" / "tool_outputs"
 
-    use_activity = _supports_on_activity(llm_client)
-
-    async def _supervised_chat(
-        *,
-        messages: list[dict],
-        system: str,
-        temperature: float,
-        max_tokens: int,
-    ) -> LLMResponse:
-        """带完整监督的单次 chat 调用，注入给压缩摘要（kernel/context）。
-
-        复用主链路同一套设施——_ActivityWatchdog 两阶段看门狗（活动标记在
-        每尝试入口自清）、_llm_call_with_retry 指数退避重试、_cancelable 停止
-        打断（_TurnCancelled 语义与主链路一致）——不自建第二套监督。
-        """
-        watchdog = _ActivityWatchdog(
-            heartbeat_timeout,
-            # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
-            first_byte_timeout=min(heartbeat_timeout, get_first_byte_timeout()),
-            wall_timeout=get_attempt_wall_timeout(),
-        )
-        kwargs: dict[str, Any] = (
-            {"on_activity": watchdog.beat} if use_activity else {}
-        )
-        return await _cancelable(
-            _llm_call_with_retry(
-                llm_client, messages, system, None,
-                temperature, max_tokens, heartbeat_timeout,
-                max_retries, base_delay,
-                extra_kwargs=kwargs,
-                watchdog=watchdog,
-            ),
-            cfg.cancel_event,
-        )
-
-    turn = -1
-    for turn in range(cfg.max_turns):
-        # --- cooperative cancellation -------------------------------------
-        if cfg.cancel_event is not None and cfg.cancel_event.is_set():
-            stop_reason = "cancelled"
-            break
-
-        injected = _drain_steer_queue(steer_queue, messages)
-        if injected:
-            _log_append(messages[-1])
-        for s in injected:
-            await _maybe_await(on_steer_injected, s)
-            await _emit(EventKind.STEER_INJECTED, payload={"message": s})
-            _slog("steer", message=s[:2000])
-
-        await _maybe_await(
-            on_turn_start, turn + 1, time.time() - start_time, total_usage,
-        )
-        await _emit(EventKind.TURN_START, turn=turn + 1)
-
-        # --- budget gate ---------------------------------------------------
-        reservation = None
-        request_max_tokens = cfg.max_tokens
-        if budget is not None:
-            try:
-                reservation = budget.reserve(
-                    max_output_tokens=cfg.max_tokens,
-                    estimated_input_tokens=_conservative_request_token_estimate(
-                        messages, system_prompt, tool_schemas,
-                    ),
-                )
-                request_max_tokens = reservation.max_output_tokens
-                for w in reservation.warnings:
-                    await _emit(EventKind.BUDGET_WARNING, payload={"message": w})
-            except BudgetExceededError as exc:
-                await _emit(EventKind.BUDGET_EXCEEDED, payload={"report": exc.report})
-                stop_reason = "budget_exceeded"
-                collected_text += f"\n[BUDGET EXCEEDED] {exc.report}\n"
-                break
-
-        # --- LLM call ------------------------------------------------------
-        expected_len = ledger["appended"] - ledger["deleted"]
-        if len(messages) != expected_len:
-            await _emit(EventKind.INVARIANT_WARNING, payload={
-                "expected": expected_len, "actual": len(messages),
-            })
-            _slog("invariant_warning", expected=expected_len, actual=len(messages))
-
-        watchdog = _ActivityWatchdog(
-            heartbeat_timeout,
-            # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
-            first_byte_timeout=min(heartbeat_timeout, get_first_byte_timeout()),
-            wall_timeout=get_attempt_wall_timeout(),
-        )
-
-        llm_started = time.monotonic()
-        call_first_chunk_at: float | None = None
-
-        async def _stream_chunk(chunk: str) -> None:
-            nonlocal call_first_chunk_at
-            if call_first_chunk_at is None:
-                call_first_chunk_at = time.monotonic()
-            await _maybe_await(on_text, chunk)
-
-        async def _stream_thought(chunk: str) -> None:
-            # R17：思考增量直通，不进重试发布追踪（thought 无需重发标注，
-            # 也绝不混入 reply 正文）。
-            await _maybe_await(on_thought, chunk)
-
-        async def _do_call(
-            watchdog=watchdog,
-            messages=messages,
-            request_max_tokens=request_max_tokens,
-        ) -> LLMResponse:
-            kwargs: dict[str, Any] = {}
-            if use_activity:
-                kwargs["on_activity"] = watchdog.beat
-            if on_thought is not None:
-                kwargs["on_thought"] = _stream_thought
-            # watchdog 传入重试循环内部：监督每次尝试（R9，见函数 docstring）
-            return await _llm_call_with_retry(
-                llm_client, messages, system_prompt, tool_schemas,
-                cfg.temperature, request_max_tokens, heartbeat_timeout,
-                max_retries, base_delay,
-                on_chunk=_stream_chunk if streaming else None,
-                extra_kwargs=kwargs,
-                watchdog=watchdog,
-            )
-
-        await _emit(EventKind.LLM_REQUEST, turn=turn + 1,
-                    payload={"messages": len(messages)})
-        try:
-            # _cancelable：停止/断连可立即打断在途调用（含尝试间退避期）
-            response = await _cancelable(_do_call(), cfg.cancel_event)
-        except _TurnCancelled:
-            if reservation is not None:
-                budget.release(reservation)
-            stop_reason = "cancelled"
-            break
-        except BudgetExceededError:
-            if reservation is not None:
-                budget.release(reservation)
-            raise
-        except Exception as exc:
-            if reservation is not None:
-                budget.release(reservation)
-            await _emit(EventKind.ERROR, payload={"error": str(exc)})
-            # RUN_END must fire even when the run dies mid-loop.
-            await _emit(EventKind.RUN_END, payload={
-                "stop_reason": "error", "turns": n_llm_calls,
-            })
-            raise
-        except BaseException:
-            # 缺陷 A：asyncio.CancelledError 是 BaseException，旧实现直接穿堂——
-            # supervisor.wait_for 超时、断连兜底 task.cancel() 后预算预留永久
-            # 滞留 BudgetGuard、RUN_END 缺失。这里先归还预留（同步方法），再
-            # 尽力补发 RUN_END(cancelled) 让前端收尾，最后原样上抛取消。
-            if reservation is not None:
-                budget.release(reservation)
-            try:
-                await _emit(EventKind.RUN_END, payload={
-                    "stop_reason": "cancelled", "turns": n_llm_calls,
-                })
-            except BaseException:
-                pass  # 取消路径上的收尾尽力而为；原始异常优先上抛
-            raise
-
-        _accumulate_usage(total_usage, response)
-        n_llm_calls += 1
-        if budget is not None:
-            if reservation is not None:
-                budget.commit(reservation, response)
-            else:
-                budget.record(response)
-        await _emit(EventKind.LLM_RESPONSE, turn=turn + 1, payload={
-            "stop_reason": response.stop_reason,
-            "tool_calls": len(response.tool_calls),
-            "input_tokens": response.usage.input_tokens,
-            "output_tokens": response.usage.output_tokens,
-            "elapsed_seconds": round(time.monotonic() - llm_started, 3),
-            "first_chunk_seconds": (
-                round(call_first_chunk_at - llm_started, 3)
-                if call_first_chunk_at is not None
-                else None
-            ),
-        })
-        _slog(
-            "llm_timing", turn=turn + 1,
-            elapsed_seconds=round(time.monotonic() - llm_started, 3),
-            first_chunk_seconds=(
-                round(call_first_chunk_at - llm_started, 3)
-                if call_first_chunk_at is not None
-                else None
-            ),
-            input_tokens=response.usage.input_tokens,
-            output_tokens=response.usage.output_tokens,
-        )
-
-        # --- context compaction (after measuring real usage) ---------------
-        if cfg.compaction:
-            try:
-                messages, compacted, compact_info = await maybe_compact(
-                    messages,
-                    llm_client=llm_client,
-                    model=getattr(llm_client, "model", ""),
-                    last_input_tokens=response.usage.input_tokens,
-                    # 压缩用的摘要调用同样计入预算计量（缺陷 I）
-                    budget=budget,
-                    # 摘要调用复用主链路监督（看门狗/取消/重试）——否则挂死的
-                    # 摘要请求既不会被击杀也不会被「停止」打断（永久思考中）
-                    supervised_chat=_supervised_chat,
-                )
-                if compacted:
-                    if compact_info:
-                        ledger["appended"] += compact_info.get("appended", 0)
-                        ledger["deleted"] += compact_info.get("deleted", 0)
-                    await _emit(EventKind.CONTEXT_COMPACTION, turn=turn + 1,
-                                payload=compact_info or {})
-                    _slog("compaction", turn=turn + 1, **(compact_info or {}))
-            except _TurnCancelled:
-                # 用户停止打断挂死中的摘要：取消不得被下面的「尽力而为」降级
-                # 吞成照常继续——普通异常才允许降级，取消语义与主链路一致。
-                stop_reason = "cancelled"
-                break
-            except Exception as exc:
-                # 压缩是尽力而为：失败不杀健康的运行，但静默吞掉会让
-                # 「上下文为何爆掉」无从排查（缺陷 I）。
-                logger.warning("上下文压缩失败: %s", exc)
-
-        if response.content:
-            collected_text += response.content
-            if not streaming:
-                await _maybe_await(on_text, response.content)
-
-        if response.tool_calls:
-            assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": [
-                {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
-                for tc in response.tool_calls
-            ]}
-            if response.content:
-                assistant_msg["content"] = response.content
-            messages.append(assistant_msg)
-            _log_append(assistant_msg)
-
-            for tc in response.tool_calls:
-                if cfg.cancel_event is not None and cfg.cancel_event.is_set():
-                    stop_reason = "cancelled"
-                    break
-
-                verdict = await _emit(
-                    EventKind.PRE_TOOL_USE,
-                    turn=turn + 1,
-                    tool_name=tc.name,
-                    payload={"arguments": tc.arguments},
-                )
-                approved_via_ask = False
-                if verdict.ask and verdict.allowed:
-                    request = ToolApprovalRequest(
-                        tool_name=tc.name, arguments=tc.arguments,
-                        turn=turn + 1, reason=verdict.reason,
-                        agent_id=cfg.agent_id, agent_role=cfg.agent_role,
-                        request_id=uuid.uuid4().hex,
-                    )
-                    await _emit(EventKind.APPROVAL_REQUESTED, turn=turn + 1,
-                                tool_name=tc.name,
-                                payload={"summary": request.summary(), "agent_id": cfg.agent_id, "role": cfg.agent_role})
-                    approved, note = await resolve_approval(
-                        cfg.approver, request, cfg.approval_timeout,
-                    )
-                    await _emit(EventKind.APPROVAL_RESOLVED, turn=turn + 1,
-                                tool_name=tc.name,
-                                payload={"approved": approved, "note": note, "agent_id": cfg.agent_id, "role": cfg.agent_role})
-                    _slog("approval", tool=tc.name, approved=approved, note=note)
-                    if approved:
-                        approved_via_ask = True
-                    else:
-                        result_text = f"[DENIED by approval] {note or verdict.reason}"
-                elif not verdict.allowed:
-                    result_text = f"[DENIED by policy] {verdict.reason}"
-
-                if not verdict.allowed or (verdict.ask and not approved_via_ask):
-                    pass  # result_text already carries the denial text
-                else:
-                    await _maybe_await(on_tool_start, tc.name, tc.arguments)
-                    await _emit(EventKind.TOOL_START, turn=turn + 1,
-                                tool_name=tc.name, payload={"arguments": tc.arguments})
-                    _slog("tool_call", tool=tc.name, arguments=tc.arguments)
-                    tool_started = time.monotonic()
-                    result_text = await tools.execute(tc.name, tc.arguments)
-                    tool_elapsed = round(time.monotonic() - tool_started, 3)
-                    raw_result_text = result_text
-                    rewrite = await hooks.first_response(AgentEvent(
-                        EventKind.TOOL_RESULT_REWRITE, turn=turn + 1,
-                        tool_name=tc.name,
-                        payload={"arguments": tc.arguments, "result": raw_result_text},
-                    ))
-                    if isinstance(rewrite, str) and rewrite != raw_result_text:
-                        _slog("tool_result_rewrite",
-                              chars_before=len(raw_result_text),
-                              chars_after=len(rewrite))
-                        result_text = rewrite
-                    if artifacts_dir is not None:
-                        result_text = externalize_tool_result(
-                            result_text, tc.name, turn + 1, artifacts_dir,
-                        )
-                    await _emit(EventKind.TOOL_END, turn=turn + 1,
-                                tool_name=tc.name,
-                                payload={
-                                    "result_chars": len(result_text),
-                                    "elapsed_seconds": tool_elapsed,
-                                })
-                    _slog(
-                        "tool_timing", tool=tc.name, turn=turn + 1,
-                        elapsed_seconds=tool_elapsed,
-                        result_chars=len(result_text),
-                    )
-                await _maybe_await(on_tool_use, tc.name, tc.arguments, result_text)
-
-                if tc.name in ("write_file",) and (
-                    not result_text.startswith("[DENIED")
-                ):
-                    fp = tc.arguments.get("file_path", "")
-                    if fp:
-                        files_written.append(fp)
-
-                messages.append({
-                    "role": "tool",
-                    "tool_call_id": tc.id,
-                    "content": result_text,
-                    # Providers surface this to the model (Anthropic sets
-                    # is_error on the tool_result block).
-                    "is_error": result_text.startswith(
-                        ("Error:", "[DENIED by policy]", "[DENIED by approval]")),
-                })
-                _log_append(messages[-1])
-            else:
-                recent_text_responses.clear()
-                continue
-            # cancel hit mid-tool-batch
-            break
-
-        if response.stop_reason == "max_tokens":
-            messages.append({"role": "assistant", "content": response.content})
-            _log_append(messages[-1])
-            injected = _drain_steer_queue(steer_queue, messages)
-            if not injected:
-                messages.append({"role": "user", "content": "Continue from where you left off."})
-                _log_append(messages[-1])
-            else:
-                _log_append(messages[-1])
-                for s in injected:
-                    await _maybe_await(on_steer_injected, s)
-                    await _emit(EventKind.STEER_INJECTED, payload={"message": s})
-                    _slog("steer", message=s[:2000])
-            continuation_count += 1
-            if continuation_count >= cfg.max_continuations:
-                stop_reason = "max_continuations"
-                break
-            continue
-
-        if response.stop_reason == "end_turn":
-            if TASK_COMPLETE_MARKER in (response.content or ""):
-                break
-
-            if response.content and not response.tool_calls:
-                recent_text_responses.append(response.content.strip())
-                if len(recent_text_responses) > 5:
-                    recent_text_responses.pop(0)
-
-            if _is_completion_loop(recent_text_responses):
-                break
-
-            if cfg.auto_continue and continuation_count < cfg.max_continuations:
-                messages.append({"role": "assistant", "content": response.content})
-                _log_append(messages[-1])
-                injected = _drain_steer_queue(steer_queue, messages)
-                if not injected:
-                    messages.append({"role": "user", "content": "Continue."})
-                    _log_append(messages[-1])
-                else:
-                    _log_append(messages[-1])
-                    for s in injected:
-                        await _maybe_await(on_steer_injected, s)
-                        await _emit(EventKind.STEER_INJECTED, payload={"message": s})
-                        _slog("steer", message=s[:2000])
-                continuation_count += 1
-                continue
-            else:
-                break
-
-        break
-    else:
-        stop_reason = "max_turns"
-
-    await _emit(EventKind.RUN_END, payload={
-        "stop_reason": stop_reason,
-        "turns": n_llm_calls,
-    })
-    _slog("run_end", stop_reason=stop_reason, turns=n_llm_calls)
-
-    duration = time.time() - start_time
-    return AgentResult(
-        success=True,
-        text_output=collected_text,
-        files_written=files_written,
-        duration_seconds=duration,
-        token_usage=total_usage,
-        turns=n_llm_calls,
-        stop_reason=stop_reason,
+    env = _RunEnv(
+        cfg=cfg, hooks=hooks, tools=tools, llm_client=llm_client,
+        budget=budget, heartbeat_timeout=heartbeat_timeout,
+        max_retries=get_max_retries(), base_delay=get_retry_base_delay(),
+        tool_schemas=tool_schemas, system_prompt=system_prompt,
+        artifacts_dir=artifacts_dir,
+        use_activity=_supports_on_activity(llm_client),
+        streaming=on_text is not None,
+        steer_queue=steer_queue,
+        on_text=on_text, on_thought=on_thought, on_tool_use=on_tool_use,
+        on_tool_start=on_tool_start, on_turn_start=on_turn_start,
+        on_steer_injected=on_steer_injected,
     )
+    state = _RunState(messages=messages, mirror=mirror)
+    return env, state
+
+
+async def _drain_steer_and_announce(env: _RunEnv, state: _RunState) -> list[str]:
+    """回合开始处消费 steer 队列并广播（原回合开头段，三处重复中第一处）。"""
+    injected = _drain_steer_queue(env.steer_queue, state.messages)
+    if injected:
+        state.mirror.log_append(state.messages[-1])
+    for s in injected:
+        await _maybe_await(env.on_steer_injected, s)
+        await env.emit(EventKind.STEER_INJECTED, payload={"message": s})
+        state.mirror.slog("steer", message=s[:2000])
+    return injected
+
+
+async def _append_continuation(
+    env: _RunEnv, state: _RunState, *, content: str, nudge: str,
+) -> None:
+    """max_tokens 续跑与 auto_continue 共用（原两处近乎相同的块）：
+    追加 assistant 消息 → 注入 steer 或追加续跑提示 → 计数。"""
+    state.messages.append({"role": "assistant", "content": content})
+    state.mirror.log_append(state.messages[-1])
+    injected = _drain_steer_queue(env.steer_queue, state.messages)
+    if not injected:
+        state.messages.append({"role": "user", "content": nudge})
+        state.mirror.log_append(state.messages[-1])
+    else:
+        state.mirror.log_append(state.messages[-1])
+        for s in injected:
+            await _maybe_await(env.on_steer_injected, s)
+            await env.emit(EventKind.STEER_INJECTED, payload={"message": s})
+            state.mirror.slog("steer", message=s[:2000])
+    state.continuation_count += 1
+
+
+async def _reserve_budget(
+    env: _RunEnv, state: _RunState, turn: int,
+) -> tuple[Any, int, bool]:
+    """预算门（原 budget gate 段）。
+
+    Returns:
+        ``(reservation, request_max_tokens, blocked)``；``blocked=True``
+        表示预算已超限（事件已发、stop_reason 已置、文本已附），调用方
+        应立即终止运行。
+    """
+    if env.budget is None:
+        return None, env.cfg.max_tokens, False
+    try:
+        reservation = env.budget.reserve(
+            max_output_tokens=env.cfg.max_tokens,
+            estimated_input_tokens=_conservative_request_token_estimate(
+                state.messages, env.system_prompt, env.tool_schemas,
+            ),
+        )
+    except BudgetExceededError as exc:
+        await env.emit(EventKind.BUDGET_EXCEEDED, payload={"report": exc.report})
+        state.stop_reason = "budget_exceeded"
+        state.collected_text += f"\n[BUDGET EXCEEDED] {exc.report}\n"
+        return None, env.cfg.max_tokens, True
+    for w in reservation.warnings:
+        await env.emit(EventKind.BUDGET_WARNING, payload={"message": w})
+    return reservation, reservation.max_output_tokens, False
+
+
+async def _call_llm_turn(
+    env: _RunEnv, state: _RunState, turn: int,
+    request_max_tokens: int, reservation: Any,
+) -> LLMResponse:
+    """单次 LLM 调用 + 用量入账 + 计时事件（原 LLM call + accounting 段）。
+
+    失败路径在本函数内完成清理（归还预算预留、补发 RUN_END）后**原样上抛**；
+    调用方只负责把异常映射为 ``stop_reason``/终止（_TurnCancelled → cancelled，
+    BudgetExceededError 与其余异常照原语义上抛）。
+    """
+    mirror = state.mirror
+    expected_len = mirror.expected_len
+    if len(state.messages) != expected_len:
+        await env.emit(EventKind.INVARIANT_WARNING, payload={
+            "expected": expected_len, "actual": len(state.messages),
+        })
+        mirror.slog("invariant_warning", expected=expected_len,
+                    actual=len(state.messages))
+
+    watchdog = _ActivityWatchdog(
+        env.heartbeat_timeout,
+        # 显式配置的静默窗若小于首字节默认值，则以其为准（不放宽调用方契约）
+        first_byte_timeout=min(env.heartbeat_timeout, get_first_byte_timeout()),
+        wall_timeout=get_attempt_wall_timeout(),
+    )
+
+    llm_started = time.monotonic()
+    call_first_chunk_at: float | None = None
+
+    async def _stream_chunk(chunk: str) -> None:
+        nonlocal call_first_chunk_at
+        if call_first_chunk_at is None:
+            call_first_chunk_at = time.monotonic()
+        await _maybe_await(env.on_text, chunk)
+
+    async def _stream_thought(chunk: str) -> None:
+        # R17：思考增量直通，不进重试发布追踪（thought 无需重发标注，
+        # 也绝不混入 reply 正文）。
+        await _maybe_await(env.on_thought, chunk)
+
+    async def _do_call() -> LLMResponse:
+        kwargs: dict[str, Any] = {}
+        if env.use_activity:
+            kwargs["on_activity"] = watchdog.beat
+        if env.on_thought is not None:
+            kwargs["on_thought"] = _stream_thought
+        # watchdog 传入重试循环内部：监督每次尝试（R9，见函数 docstring）
+        return await _llm_call_with_retry(
+            env.llm_client, state.messages, env.system_prompt, env.tool_schemas,
+            env.cfg.temperature, request_max_tokens, env.heartbeat_timeout,
+            env.max_retries, env.base_delay,
+            on_chunk=_stream_chunk if env.streaming else None,
+            extra_kwargs=kwargs,
+            watchdog=watchdog,
+        )
+
+    await env.emit(EventKind.LLM_REQUEST, turn=turn + 1,
+                   payload={"messages": len(state.messages)})
+    try:
+        # _cancelable：停止/断连可立即打断在途调用（含尝试间退避期）
+        response = await _cancelable(_do_call(), env.cfg.cancel_event)
+    except _TurnCancelled:
+        if reservation is not None:
+            env.budget.release(reservation)
+        raise
+    except BudgetExceededError:
+        if reservation is not None:
+            env.budget.release(reservation)
+        raise
+    except Exception as exc:
+        if reservation is not None:
+            env.budget.release(reservation)
+        await env.emit(EventKind.ERROR, payload={"error": str(exc)})
+        # RUN_END must fire even when the run dies mid-loop.
+        await env.emit(EventKind.RUN_END, payload={
+            "stop_reason": "error", "turns": state.n_llm_calls,
+        })
+        raise
+    except BaseException:
+        # 缺陷 A：asyncio.CancelledError 是 BaseException，旧实现直接穿堂——
+        # supervisor.wait_for 超时、断连兜底 task.cancel() 后预算预留永久
+        # 滞留 BudgetGuard、RUN_END 缺失。这里先归还预留（同步方法），再
+        # 尽力补发 RUN_END(cancelled) 让前端收尾，最后原样上抛取消。
+        if reservation is not None:
+            env.budget.release(reservation)
+        try:
+            await env.emit(EventKind.RUN_END, payload={
+                "stop_reason": "cancelled", "turns": state.n_llm_calls,
+            })
+        except BaseException:
+            pass  # 取消路径上的收尾尽力而为；原始异常优先上抛
+        raise
+
+    _accumulate_usage(state.total_usage, response)
+    state.n_llm_calls += 1
+    if env.budget is not None:
+        if reservation is not None:
+            env.budget.commit(reservation, response)
+        else:
+            env.budget.record(response)
+    await env.emit(EventKind.LLM_RESPONSE, turn=turn + 1, payload={
+        "stop_reason": response.stop_reason,
+        "tool_calls": len(response.tool_calls),
+        "input_tokens": response.usage.input_tokens,
+        "output_tokens": response.usage.output_tokens,
+        "elapsed_seconds": round(time.monotonic() - llm_started, 3),
+        "first_chunk_seconds": (
+            round(call_first_chunk_at - llm_started, 3)
+            if call_first_chunk_at is not None
+            else None
+        ),
+    })
+    mirror.slog(
+        "llm_timing", turn=turn + 1,
+        elapsed_seconds=round(time.monotonic() - llm_started, 3),
+        first_chunk_seconds=(
+            round(call_first_chunk_at - llm_started, 3)
+            if call_first_chunk_at is not None
+            else None
+        ),
+        input_tokens=response.usage.input_tokens,
+        output_tokens=response.usage.output_tokens,
+    )
+    return response
+
+
+async def _compact_if_needed(
+    env: _RunEnv, state: _RunState, turn: int, response: LLMResponse,
+) -> bool:
+    """上下文压缩（原 compaction 段）。返回 True = 因取消终止运行。"""
+    if not env.cfg.compaction:
+        return False
+    try:
+        state.messages, compacted, compact_info = await maybe_compact(
+            state.messages,
+            llm_client=env.llm_client,
+            model=getattr(env.llm_client, "model", ""),
+            last_input_tokens=response.usage.input_tokens,
+            # 压缩用的摘要调用同样计入预算计量（缺陷 I）
+            budget=env.budget,
+            # 摘要调用复用主链路监督（看门狗/取消/重试）——否则挂死的
+            # 摘要请求既不会被击杀也不会被「停止」打断（永久思考中）
+            supervised_chat=env.supervised_chat,
+        )
+        if compacted:
+            if compact_info:
+                state.mirror.appended += compact_info.get("appended", 0)
+                state.mirror.deleted += compact_info.get("deleted", 0)
+            await env.emit(EventKind.CONTEXT_COMPACTION, turn=turn + 1,
+                           payload=compact_info or {})
+            state.mirror.slog("compaction", turn=turn + 1, **(compact_info or {}))
+        return False
+    except _TurnCancelled:
+        # 用户停止打断挂死中的摘要：取消不得被下面的「尽力而为」降级
+        # 吞成照常继续——普通异常才允许降级，取消语义与主链路一致。
+        state.stop_reason = "cancelled"
+        return True
+    except Exception as exc:
+        # 压缩是尽力而为：失败不杀健康的运行，但静默吞掉会让
+        # 「上下文为何爆掉」无从排查（缺陷 I）。
+        logger.warning("上下文压缩失败: %s", exc)
+        return False
+
+
+async def _execute_tool_batch(
+    env: _RunEnv, state: _RunState, turn: int, response: LLMResponse,
+) -> bool:
+    """执行本回合的整批工具调用（原 tool batch 段，最大的单一分块）。
+
+    Returns:
+        True = 批中途命中取消（调用方应终止运行）；
+        False = 全部执行完毕（调用方进入下一回合）。
+    """
+    mirror = state.mirror
+    assistant_msg: dict[str, Any] = {"role": "assistant", "tool_calls": [
+        {"id": tc.id, "name": tc.name, "arguments": tc.arguments}
+        for tc in response.tool_calls
+    ]}
+    if response.content:
+        assistant_msg["content"] = response.content
+    state.messages.append(assistant_msg)
+    mirror.log_append(assistant_msg)
+
+    for tc in response.tool_calls:
+        if env.cfg.cancel_event is not None and env.cfg.cancel_event.is_set():
+            state.stop_reason = "cancelled"
+            return True
+
+        verdict = await env.emit(
+            EventKind.PRE_TOOL_USE,
+            turn=turn + 1,
+            tool_name=tc.name,
+            payload={"arguments": tc.arguments},
+        )
+        approved_via_ask = False
+        if verdict.ask and verdict.allowed:
+            request = ToolApprovalRequest(
+                tool_name=tc.name, arguments=tc.arguments,
+                turn=turn + 1, reason=verdict.reason,
+                agent_id=env.cfg.agent_id, agent_role=env.cfg.agent_role,
+                request_id=uuid.uuid4().hex,
+            )
+            await env.emit(EventKind.APPROVAL_REQUESTED, turn=turn + 1,
+                           tool_name=tc.name,
+                           payload={"summary": request.summary(),
+                                    "agent_id": env.cfg.agent_id,
+                                    "role": env.cfg.agent_role})
+            approved, note = await resolve_approval(
+                env.cfg.approver, request, env.cfg.approval_timeout,
+            )
+            await env.emit(EventKind.APPROVAL_RESOLVED, turn=turn + 1,
+                           tool_name=tc.name,
+                           payload={"approved": approved, "note": note,
+                                    "agent_id": env.cfg.agent_id,
+                                    "role": env.cfg.agent_role})
+            mirror.slog("approval", tool=tc.name, approved=approved, note=note)
+            if approved:
+                approved_via_ask = True
+            else:
+                result_text = f"[DENIED by approval] {note or verdict.reason}"
+        elif not verdict.allowed:
+            result_text = f"[DENIED by policy] {verdict.reason}"
+
+        if not verdict.allowed or (verdict.ask and not approved_via_ask):
+            pass  # result_text already carries the denial text
+        else:
+            await _maybe_await(env.on_tool_start, tc.name, tc.arguments)
+            await env.emit(EventKind.TOOL_START, turn=turn + 1,
+                           tool_name=tc.name,
+                           payload={"arguments": tc.arguments})
+            mirror.slog("tool_call", tool=tc.name, arguments=tc.arguments)
+            tool_started = time.monotonic()
+            result_text = await env.tools.execute(tc.name, tc.arguments)
+            tool_elapsed = round(time.monotonic() - tool_started, 3)
+            raw_result_text = result_text
+            rewrite = await env.hooks.first_response(AgentEvent(
+                EventKind.TOOL_RESULT_REWRITE, turn=turn + 1,
+                tool_name=tc.name,
+                payload={"arguments": tc.arguments, "result": raw_result_text},
+            ))
+            if isinstance(rewrite, str) and rewrite != raw_result_text:
+                mirror.slog("tool_result_rewrite",
+                            chars_before=len(raw_result_text),
+                            chars_after=len(rewrite))
+                result_text = rewrite
+            if env.artifacts_dir is not None:
+                result_text = externalize_tool_result(
+                    result_text, tc.name, turn + 1, env.artifacts_dir,
+                )
+            await env.emit(EventKind.TOOL_END, turn=turn + 1,
+                           tool_name=tc.name,
+                           payload={
+                               "result_chars": len(result_text),
+                               "elapsed_seconds": tool_elapsed,
+                           })
+            mirror.slog(
+                "tool_timing", tool=tc.name, turn=turn + 1,
+                elapsed_seconds=tool_elapsed,
+                result_chars=len(result_text),
+            )
+        await _maybe_await(env.on_tool_use, tc.name, tc.arguments, result_text)
+
+        if tc.name in ("write_file",) and (
+            not result_text.startswith("[DENIED")
+        ):
+            fp = tc.arguments.get("file_path", "")
+            if fp:
+                state.files_written.append(fp)
+
+        state.messages.append({
+            "role": "tool",
+            "tool_call_id": tc.id,
+            "content": result_text,
+            # Providers surface this to the model (Anthropic sets
+            # is_error on the tool_result block).
+            "is_error": result_text.startswith(
+                ("Error:", "[DENIED by policy]", "[DENIED by approval]")),
+        })
+        mirror.log_append(state.messages[-1])
+    return False
 
 
 async def _llm_call_with_retry(
@@ -947,7 +1125,7 @@ def _drain_steer_queue(
             break
 
     if steers:
-        combined = "\n".join(f"[USER STEER]: {s}" for s in steers)
+        combined = "\n".join(f"{STEER_PREFIX} {s}" for s in steers)
         messages.append({"role": "user", "content": combined})
 
     return steers

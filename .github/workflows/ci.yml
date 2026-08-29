@@ -21,15 +21,36 @@ jobs:
       - name: Install
         run: |
           python -m pip install --upgrade pip
-          pip install -e . pytest pytest-asyncio ruff
+          pip install -e . pytest pytest-asyncio pytest-cov ruff
       # Lint 范围扩到全部自有代码（2026-08-25 本地全量试跑 `ruff check
       # research_assistant tests scripts build.py` 通过）。
       # 扩展前置条件：若 research_assistant/tests 再积累大量存量违规且短期
       # 无法清理，先回退为 `ruff check research_assistant`，勿让 lint 挡合并。
       - name: Lint
         run: ruff check research_assistant tests scripts build.py
+      # A+ 阶段 2 / F-7 守卫：.claude/skills 字节级重复（实测 55 组 / 103 个
+      # 冗余文件 / 2.16MB，详见 docs/quality/skills-duplication-audit.md）。
+      # 当前仍允许失败——去重必须先建共享层并保留旧路径转发层（该目录是
+      # core.sync_tree 的运行时镜像源）。去重完成后移除 continue-on-error。
+      - name: Skills duplication guard
+        continue-on-error: true
+        run: python scripts/audit_skills_duplication.py
       - name: Test
         run: pytest -q
+      # 覆盖率只在 ubuntu + 3.12 这一个组合上跑（测量有额外开销，全矩阵跑不划算）。
+      # 阶段 0 只报告、不阻断（--cov-fail-under 暂不施加）；基线入档后，
+      # 随阶段推进逐步提高阈值，A+ 验收口径为整体 ≥75%、关键模块 ≥85%。
+      - name: Coverage
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        run: |
+          pytest -q --cov=research_assistant --cov-report=term-missing --cov-report=xml
+      - name: Upload coverage report
+        if: matrix.os == 'ubuntu-latest' && matrix.python-version == '3.12'
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-xml-py${{ matrix.python-version }}
+          path: coverage.xml
+          if-no-files-found: warn
 
   # 前端线：tsc 类型检查 + vitest（显式一次性运行，防 watch 挂死）+ vite 构建。
   # package.json 的 build = "tsc -b && vite build"，产物直出后端静态目录。
@@ -51,5 +72,14 @@ jobs:
         run: npx tsc -b
       - name: Test
         run: npx vitest run
+      # 阶段 0 只报告、不阻断；A+ 阈值（整体 ≥70%、纯函数层 ≥90%）随阶段推进施加。
+      - name: Coverage
+        run: npx vitest run --coverage
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-frontend
+          path: frontend/coverage
+          if-no-files-found: warn
       - name: Build
         run: npm run build

@@ -109,7 +109,7 @@ class HookBus:
         try:
             self._handlers.get(kind, []).remove(handler)
         except ValueError:
-            pass
+            pass  # 控制流：handler 未注册时 off 本就是 no-op（见 docstring）
 
     async def emit(self, event: AgentEvent) -> HookVerdict:
         """Dispatch *event* to all handlers of its kind.
@@ -122,7 +122,7 @@ class HookBus:
             try:
                 result = handler(event)
                 if hasattr(result, "__await__"):
-                    result = await result  # type: ignore[union-attr]
+                    result = await result  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001 — hooks are untrusted
                 import logging
 
@@ -144,7 +144,7 @@ class HookBus:
             try:
                 result = handler(event)
                 if hasattr(result, "__await__"):
-                    result = await result  # type: ignore[union-attr]
+                    result = await result  # type: ignore[misc]
             except Exception as exc:  # noqa: BLE001
                 import logging
 

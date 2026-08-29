@@ -54,7 +54,7 @@ def atomic_write_text(
         try:
             temporary.unlink()
         except FileNotFoundError:
-            pass
+            pass  # os.replace 成功后临时文件已不存在，属正常竞争
 
 
 def ensure_dotenv_loaded() -> None:
@@ -67,7 +67,7 @@ def ensure_dotenv_loaded() -> None:
         from dotenv import load_dotenv
         load_dotenv()
     except ImportError:
-        pass
+        pass  # 可选依赖：未安装 python-dotenv 时静默跳过，环境变量照常读取
 
 
 SYNC_MANIFEST_NAME = ".sync_manifest.json"
@@ -139,14 +139,14 @@ def sync_tree(source_dir: Path, dest_dir: Path) -> dict:
                     target.unlink()
                     removed += 1
             except OSError:
-                pass
+                pass  # 尽力而为：陈旧副本清理失败不阻断同步主流程（下次重试）
 
     try:
         manifest_path.write_text(
             _json.dumps(source_files, indent=0, sort_keys=True), encoding="utf-8",
         )
     except OSError:
-        pass
+        pass  # 尽力而为：清单写失败只退化下次同步为全量比对，不影响本次结果
     return {"updated": updated, "removed": removed}
 
 
