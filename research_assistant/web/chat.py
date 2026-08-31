@@ -831,6 +831,7 @@ class _HistoryClient(LLMClient):
         max_tokens: int = 16384,
         on_chunk: OnChunkCallback | None = None,
         on_activity: Any | None = None,
+        on_thought: OnChunkCallback | None = None,
     ) -> LLMResponse:
         if self._prefix and len(messages) == 1 and messages[0].get("role") == "user":
             messages = [*self._prefix, *messages]
@@ -842,6 +843,7 @@ class _HistoryClient(LLMClient):
             max_tokens=max_tokens,
             on_chunk=on_chunk,
             on_activity=on_activity,
+            on_thought=on_thought,
         )
 
     async def close(self) -> None:
