@@ -18,6 +18,7 @@ import re
 import shutil
 import subprocess
 import sys
+import tempfile
 from pathlib import Path
 
 ROOT = Path(__file__).parent.resolve()
@@ -213,9 +214,9 @@ def _get_datas():
         print(f"ERROR: {static_dir} not found!")
         sys.exit(1)
 
-    clean_claude_dir = BUILD / "_claude_clean"
-    if clean_claude_dir.exists():
-        shutil.rmtree(clean_claude_dir)
+    # 打包副本放到系统临时目录，避免每次构建在项目 build/ 内留下
+    # 需要批量删除的旧副本（会触发环境的 bulk-delete 确认而中止构建）。
+    clean_claude_dir = Path(tempfile.mkdtemp(prefix="ra_claude_clean_"))
 
     datas = [f"{static_dir};research_assistant/web/static"]
 

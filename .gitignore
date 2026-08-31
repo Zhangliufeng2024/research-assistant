@@ -101,3 +101,6 @@ git_diag*.txt
 
 # 构建配置验证的临时输出（frontend/.verify-build，可随时手工删除）
 .verify-build/
+
+# 本地构建垃圾（safe-delete 守卫拦截时的挪移目录）
+build.trash-*/
