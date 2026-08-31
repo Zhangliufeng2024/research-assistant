@@ -128,8 +128,10 @@ class HeartbeatTimeoutError(LLMError):
 # ---------------------------------------------------------------------------
 # Body parsing helpers
 # ---------------------------------------------------------------------------
+# 公开常量（P2-5③ 收敛单一来源）：retry.py 的裸异常分类路径引用同一张表，
+# 避免两处各维护一份导致漂移（历史上 retry.py 侧已落后 3+1 条标记）。
 
-_CONTEXT_MARKERS = (
+CONTEXT_MARKERS = (
     "input token limit",
     "context length",
     "context_length_exceeded",
@@ -141,13 +143,17 @@ _CONTEXT_MARKERS = (
     "exceeds the maximum",
 )
 
-_MODEL_MARKERS = (
+MODEL_MARKERS = (
     "not supported model",
     "model not found",
     "invalid model",
     "model_not_found",
     "does not exist or you do not have access",
 )
+
+# 向后兼容旧名（模块内原先用带下划线前缀的私有名）。
+_CONTEXT_MARKERS = CONTEXT_MARKERS
+_MODEL_MARKERS = MODEL_MARKERS
 
 
 def parse_retry_after(value: str | None) -> float | None:

@@ -85,6 +85,15 @@ class TestIsContextLimit:
         assert _is_context_limit(RuntimeError("input token limit reached"))
         assert _is_context_limit(RuntimeError("context_length_exceeded"))
 
+    def test_superset_markers_from_llm_errors(self):
+        """P2-5③ 收敛回归：errors.py 独有的标记在裸异常路径也必须命中。
+
+        旧实现 retry.py 私有表缺这 3 条，第三方 SDK 冒出的裸异常会漏判。
+        """
+        assert _is_context_limit(RuntimeError("Your prompt is too long for this model"))
+        assert _is_context_limit(RuntimeError("request too large"))
+        assert _is_context_limit(RuntimeError("This exceeds the maximum context size"))
+
     def test_negative(self):
         assert not _is_context_limit(RuntimeError("connection error"))
 
@@ -93,6 +102,12 @@ class TestIsModelError:
     def test_positive(self):
         assert _is_model_error(RuntimeError("not supported model: fake-model"))
         assert _is_model_error(RuntimeError("model not found"))
+
+    def test_superset_markers_from_llm_errors(self):
+        """P2-5③ 收敛回归：errors.py 独有的标记在裸异常路径也必须命中。"""
+        assert _is_model_error(
+            RuntimeError("The model `gpt-x` does not exist or you do not have access to it.")
+        )
 
     def test_negative(self):
         assert not _is_model_error(RuntimeError("timeout"))

@@ -138,8 +138,8 @@ chatStore 有完整的 `scheduleReconnect` 指数退避，taskStore **完全没�
 
 | 重复物 | 位置 A | 位置 B | 漂移情况 |
 |---|---|---|---|
-| 错误标记表 | `retry.py:144-160` `_CONTEXT_LIMIT_MESSAGES`(6 条) | `llm/errors.py:132-150` `_CONTEXT_MARKERS`(9 条) | B 多 `prompt is too long`/`request too large`/`exceeds the maximum` |
-| 模型错误标记 | `retry.py` `_MODEL_ERROR_MESSAGES`(4) | `llm/errors.py` `_MODEL_MARKERS`(5) | B 多 `does not exist or you do not have access` |
+| 错误标记表 | ~~`retry.py:144-160` `_CONTEXT_LIMIT_MESSAGES`(6 条)~~ **已收敛（2026-08-31）**：retry.py 删私有表，改引用 `llm/errors.py` 导出的公开常量 `CONTEXT_MARKERS`/`MODEL_MARKERS` | `llm/errors.py` `CONTEXT_MARKERS`(9 条) | ✅ 已消除 |
+| 模型错误标记 | 同上收敛 | `llm/errors.py` `MODEL_MARKERS`(5 条) | ✅ 已消除 |
 | → 后果：同一条 400 报文，经 `classify_response` 判为 ContextLimitError，经 `_is_context_limit`（裸异常路径）判为非超限，**是否重试、UI 提示取决于 provider 走了哪条路** | | | |
 | `AgentResult` | `agent.py:52-64` | `orchestrator.py:68-77` | **字段完全不同**，`pipeline/runner.py:25` 不得不用 `as LoopResult` 别名规避 |
 | `.env` 加载 | `core.py:60-70` `ensure_dotenv_loaded`（模块级 `_dotenv_loaded` 布尔短路，`override` 默认 False） | `config.py:90-107` `load_project_env`（`override=True`） | **语义相反**；后者被 `api.py:115` 每次生成任务调用 → Web 多工作区并发下构成跨请求配置竞态 |

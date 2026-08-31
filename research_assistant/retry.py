@@ -33,6 +33,8 @@ from .constants import (
     DEFAULT_RETRY_BASE_DELAY,
 )
 from .llm.errors import (  # noqa: F401  (re-exported for backward compatibility)
+    CONTEXT_MARKERS,
+    MODEL_MARKERS,
     ContextLimitError,
     HeartbeatTimeoutError,
     LLMError,
@@ -140,24 +142,11 @@ _RETRYABLE_MESSAGE_PATTERN = re.compile(
     re.IGNORECASE,
 )
 
-# Substrings that identify non-retryable API errors that should surface clearly.
-_CONTEXT_LIMIT_MESSAGES = (
-    "input token limit",
-    "context length",
-    "context_length_exceeded",
-    "maximum context",
-    "token limit exceeded",
-    "tokens exceed",
-)
-
-# Substrings that identify non-retryable model configuration errors (HTTP 400).
-# These will NEVER succeed on retry — the model name itself is wrong.
-_MODEL_ERROR_MESSAGES = (
-    "not supported model",
-    "model not found",
-    "invalid model",
-    "model_not_found",
-)
+# 上下文上限 / 模型配置的标记表已收敛到 llm/errors.py（P2-5③ 单一来源），
+# 此处直接引用其公开常量 CONTEXT_MARKERS / MODEL_MARKERS（超集，含
+# "prompt is too long" 等 4 条旧表缺失的标记）。两表原先在两个文件里
+# 各自维护，errors.py 侧已多出 4 条而 retry.py 没跟上——裸异常路径会
+# 漏判这些不可重试错误，见 docs/CODE_REVIEW_2026-08-31.md P2-5③。
 
 
 # ContextLimitError / ModelConfigError / HeartbeatTimeoutError are imported
@@ -167,13 +156,13 @@ _MODEL_ERROR_MESSAGES = (
 def _is_context_limit(exc: BaseException) -> bool:
     """Return True if the exception is a non-retryable context/token limit error."""
     msg = str(exc).lower()
-    return any(kw in msg for kw in _CONTEXT_LIMIT_MESSAGES)
+    return any(kw in msg for kw in CONTEXT_MARKERS)
 
 
 def _is_model_error(exc: BaseException) -> bool:
     """Return True if the exception is a non-retryable model configuration error (HTTP 400)."""
     msg = str(exc).lower()
-    return any(kw in msg for kw in _MODEL_ERROR_MESSAGES)
+    return any(kw in msg for kw in MODEL_MARKERS)
 
 
 def _is_retryable(exc: BaseException) -> bool:
