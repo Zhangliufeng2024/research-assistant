@@ -2,7 +2,6 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { AnimatePresence, motion } from "framer-motion";
 import { ConfirmDialog } from "@/components/common/ConfirmDialog";
 import { formatRelative, sessionTitle } from "@/lib/format";
-import { loadDockCollapsed, saveDockCollapsed } from "@/lib/artifacts";
 import { api } from "@/lib/api";
 import {
   RUN_STATUS_LABEL,
@@ -15,6 +14,7 @@ import {
   type RunSummary,
 } from "@/stores/taskStore";
 import { toast } from "@/stores/toastStore";
+import { useUiStore } from "@/stores/uiStore";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
@@ -272,13 +272,14 @@ export function TasksView() {
     );
   }, [runs]);
 
-  const [dockCollapsed, setDockCollapsed] = useState<boolean>(loadDockCollapsed);
+  // P2-9：dock 折叠偏好收敛到 uiStore.inspectorOpen 单一来源。
+  // 此前本视图持有独立的 dockCollapsed 本地 state，却与 ChatView 的
+  // ArtifactsPanel 写**同一个** localStorage 键——任务页折叠后，会话页
+  // 的 dock 不同步（两处各读各的，各写各的）。现在读写都走 uiStore。
+  const inspectorOpen = useUiStore((s) => s.inspectorOpen);
+  const dockCollapsed = !inspectorOpen;
   const toggleDock = useCallback(() => {
-    setDockCollapsed((prev) => {
-      const next = !prev;
-      saveDockCollapsed(next);
-      return next;
-    });
+    useUiStore.getState().toggleInspector();
   }, []);
 
   // 回合结束（离开 running）→ 刷新信号 + 拉取历史（新运行入列、状态徽标更新）

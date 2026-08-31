@@ -20,6 +20,19 @@ def safe_resolve(path: Path, sandbox: Path) -> Path:
     Raises ``ValueError`` if the resolved path escapes the sandbox.
     Both *path* and *sandbox* are resolved before comparison so symlinks
     and ``..`` segments cannot escape.
+
+    围栏覆盖边界（P1-7，必须与 README 的安全说明一致）：
+
+    - **覆盖**：``file_ops`` 全部五个工具（read/write/edit/glob/grep）与
+      ``apply_patch`` —— 它们的路径参数都经 ``safe_resolve`` 或
+      ``_reject_windows_hazard`` 校验；
+    - **不覆盖**：``bash`` 与 ``run_python``。这两个执行工具只校验 ``cwd``
+      落点（registry.py 的 ``_execute_via_provider``），命令/代码文本本身
+      不经围栏——模型一条 ``cmd /c echo x > C:\\...`` 即可写到围栏外。这是
+      设计取舍（研究助手必须能跑脚本），**不是疏漏**；真正的隔离手段是
+      沙箱化（容器/受限进程），见 docs/plans §8 的 deferred 项。对其余
+      危险性用 ``RA_PERMISSION_MODE=deny_dangerous`` 的黑名单缓解
+      （tools/permissions.py），不要在本函数里试图补救。
     """
     resolved = path.resolve()
     sandbox_resolved = sandbox.resolve()
@@ -58,7 +71,14 @@ def atomic_write_text(
 
 
 def ensure_dotenv_loaded() -> None:
-    """Load .env once on first call. No-op on subsequent calls."""
+    """Load .env once on first call. No-op on subsequent calls.
+
+    语义边界（P2-5 交叉标注，**与 ``config.load_project_env`` 不同**）：
+    本函数面向 **CLI 入口**，只加载 ``cwd`` 向上搜索到的 ``.env``，且
+    ``override=False``——shell 里显式导出的变量优先于文件。不要在 Web 请求
+    路径上用它：Web 的权威口径是 ``config.load_project_env``（全局配置先行、
+    工作区覆盖、托管键终局裁决），由 ``api._load_env_for`` 按工作区缓存调用。
+    """
     global _dotenv_loaded
     if _dotenv_loaded:
         return

@@ -14,7 +14,90 @@ from research_assistant.runtime.analysis import (
     snapshot_input_files,
 )
 from research_assistant.runtime.platform_store import PROJECT_OS_VERSION, SCHEMA_VERSION
+from research_assistant.web import routes as routes_mod
 from research_assistant.web.routes import router
+
+
+class TestImportDecompressionGuard:
+    """P0-6 回归：研究包导入必须限制解压后体积（zip bomb 防护）。
+
+    修复前只校验压缩包**原始**体积 ≤1GB，随后逐条解压写盘却从不检查解压后
+    体积——一个 1MB 的 zip bomb 就足以打满磁盘，且该端点无认证、无限流。
+
+    测试手法：把上限常量 monkeypatch 成极小值，用普通小包驱动真实代码路径
+    （无需真的构造 GB 级压缩包，也能精确命中两条判断分支）。
+    """
+
+    @staticmethod
+    def _app(tmp_path, store, project):
+        app = FastAPI()
+        app.include_router(router, prefix="/api")
+        app.state.platform_store = store
+        app.state.project = project
+        app.state.cwd = tmp_path
+        app.state.output_folder = tmp_path / "writing_outputs"
+        return TestClient(app)
+
+    @staticmethod
+    def _package(name: str = "note.md", body: bytes = b"x" * 4096) -> bytes:
+        import io
+        import zipfile
+
+        buf = io.BytesIO()
+        with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
+            zf.writestr(f"workspace/{name}", body)
+        return buf.getvalue()
+
+    def test_total_uncompressed_limit_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(routes_mod, "MAX_IMPORT_UNCOMPRESSED_BYTES", 64)
+        store = PlatformStore(tmp_path / ".ra" / "platform.sqlite3")
+        project = store.ensure_project(tmp_path)
+
+        with self._app(tmp_path, store, project) as client:
+            resp = client.post(
+                "/api/project/import",
+                content=self._package(),
+                headers={"content-type": "application/zip"},
+            )
+
+        assert resp.status_code == 413
+        # 精确锁定**预检层**：写盘前那道复核的文案是「导入已中止」，
+        # 而预检文案带「未写入任何文件」——只拦在预检层才不会留残骸。
+        assert "未写入任何文件" in resp.json()["detail"]
+        assert not (tmp_path / "note.md").exists()
+
+    def test_single_file_limit_rejected(self, tmp_path, monkeypatch):
+        monkeypatch.setattr(routes_mod, "MAX_IMPORT_SINGLE_FILE_BYTES", 32)
+        store = PlatformStore(tmp_path / ".ra" / "platform.sqlite3")
+        project = store.ensure_project(tmp_path)
+
+        with self._app(tmp_path, store, project) as client:
+            resp = client.post(
+                "/api/project/import",
+                content=self._package(),
+                headers={"content-type": "application/zip"},
+            )
+
+        assert resp.status_code == 413
+        # 同样锁定预检层（写盘前复核的文案是「实际 N 字节」）
+        detail = resp.json()["detail"]
+        assert "note.md" in detail and "GB" in detail
+        assert not (tmp_path / "note.md").exists()
+
+    def test_normal_package_still_imports(self, tmp_path):
+        """对照组：放宽上限后正常包必须照常导入（防护不得误伤）。"""
+        store = PlatformStore(tmp_path / ".ra" / "platform.sqlite3")
+        project = store.ensure_project(tmp_path)
+
+        with self._app(tmp_path, store, project) as client:
+            resp = client.post(
+                "/api/project/import",
+                content=self._package(body=b"hello"),
+                headers={"content-type": "application/zip"},
+            )
+
+        assert resp.status_code == 200, resp.text
+        assert (tmp_path / "note.md").read_bytes() == b"hello"
 
 
 def test_v4_database_migrates_idempotently(tmp_path):

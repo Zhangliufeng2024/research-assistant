@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import uuid
 from typing import Any
 
@@ -11,6 +12,8 @@ from ..constants import DEFAULT_OPENAI_MODEL, HTTP_CONNECT_TIMEOUT_SECONDS, HTTP
 from ..models import TokenUsage
 from .base import LLMClient, LLMResponse, OnChunkCallback, ToolCall
 from .errors import LLMError, classify_response
+
+LOG = logging.getLogger(__name__)
 
 OPENAI_DEFAULT_BASE_URL = "https://api.openai.com"
 
@@ -225,15 +228,28 @@ class OpenAICompatClient(LLMClient):
         含该字样）——自动去掉该字段重发**一次**，只降一级，防死循环。
         """
         current_body = body
+        # 已吐出的正文量：重发会从头再生成一次，若此前已向调用方发布过
+        # 增量，重发就会造成内容重复（且不可撤回）。因此只在「尚未发布任何
+        # 增量」时才允许那一次降级重发——与 fallback.py 的降级口径一致。
+        published: list[bool] = [False]
+
+        async def tracked_chunk(delta: str) -> None:
+            if delta:
+                published[0] = True
+            result = on_chunk(delta)
+            if result is not None:
+                await result
+
         for _ in range(2):  # 首发最多 + 一次去 stream_options 的降级重发
             try:
                 return await self._chat_stream_once(
-                    url, headers, current_body, on_chunk, on_activity, on_thought,
+                    url, headers, current_body, tracked_chunk, on_activity, on_thought,
                 )
             except LLMError as exc:
                 already_degraded = current_body is not body
                 if (
                     not already_degraded
+                    and not published[0]
                     and getattr(exc, "status_code", None) == 400
                     and "stream_options" in str(exc).lower()
                 ):
@@ -241,6 +257,16 @@ class OpenAICompatClient(LLMClient):
                         k: v for k, v in body.items() if k != "stream_options"
                     }
                     continue
+                if (
+                    not already_degraded
+                    and published[0]
+                    and getattr(exc, "status_code", None) == 400
+                    and "stream_options" in str(exc).lower()
+                ):
+                    LOG.warning(
+                        "端点不支持 stream_options，但本次请求已输出正文："
+                        "放弃降级重发（避免内容重复），异常原样上抛",
+                    )
                 raise
         raise LLMError("unreachable: streaming retry loop exited")
 

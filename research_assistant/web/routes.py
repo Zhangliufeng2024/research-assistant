@@ -306,6 +306,17 @@ async def export_project(request: Request):
     return Response(content=payload, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{name}.research.zip"'})
 
 
+#: 研究包导入的解压上限（P0-6：zip bomb 防护）。
+#:
+#: 此前只校验**压缩包原始体积** ≤1GB，随后逐条解压写盘却从不检查解压后
+#: 体积——一个 1MB 的 zip bomb 足以打满磁盘。两道闸：
+#:   1. 解压前按 ZipInfo.file_size 预检（主闸，此时尚未落盘，不会留残骸）；
+#:   2. 写盘前按实际读出的字节数复核（兜底，防 file_size 字段撒谎）。
+#: 不做中途回滚：冲突策略可能是 overwrite，回滚删除会误伤用户既有文件。
+MAX_IMPORT_UNCOMPRESSED_BYTES = 2 * 1024**3  # 解压后总量 2GB
+MAX_IMPORT_SINGLE_FILE_BYTES = 1024**3       # 单文件 1GB
+
+
 @router.post("/project/import")
 async def import_project(request: Request, overwrite: bool | None = None, conflict: str = "skip"):
     """Merge a package with explicit skip/overwrite/rename conflict semantics."""
@@ -326,6 +337,7 @@ async def import_project(request: Request, overwrite: bool | None = None, confli
     excluded = {".ra", ".git", "__pycache__", "node_modules", "build", "dist"}
     try:
         safe_entries: list[tuple[zipfile.ZipInfo, Path]] = []
+        total_uncompressed = 0
         for info in archive.infolist():
             name = info.filename.replace("\\", "/")
             if not name.startswith("workspace/") or name.endswith("/"):
@@ -333,6 +345,21 @@ async def import_project(request: Request, overwrite: bool | None = None, confli
             rel = Path(name.removeprefix("workspace/"))
             if rel.is_absolute() or ".." in rel.parts or any(part in excluded or part.startswith(".") for part in rel.parts):
                 raise HTTPException(status_code=422, detail="研究包包含不安全路径")
+            # 解压前预检：此刻一个字节都还没落盘，超限即整包拒绝
+            if info.file_size > MAX_IMPORT_SINGLE_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"单个文件解压后超过 {MAX_IMPORT_SINGLE_FILE_BYTES // 1024**3}GB：{rel.as_posix()}",
+                )
+            total_uncompressed += info.file_size
+            if total_uncompressed > MAX_IMPORT_UNCOMPRESSED_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=(
+                        f"研究包解压后总量超过 {MAX_IMPORT_UNCOMPRESSED_BYTES // 1024**3}GB"
+                        "（疑似压缩包炸弹），已拒绝导入且未写入任何文件"
+                    ),
+                )
             safe_entries.append((info, rel))
         manifest: dict = {}
         try:
@@ -345,6 +372,7 @@ async def import_project(request: Request, overwrite: bool | None = None, confli
             request.app.state.platform_store.import_project_manifest,
             request.app.state.project["id"], manifest,
         ) if manifest else {}
+        written_uncompressed = 0
         for info, rel in safe_entries:
             target = safe_resolve(root / rel, root)
             if target.exists():
@@ -358,7 +386,20 @@ async def import_project(request: Request, overwrite: bool | None = None, confli
                         target = target.with_name(f"{stem}.import-{index}{suffix}")
                         index += 1
             target.parent.mkdir(parents=True, exist_ok=True)
-            target.write_bytes(archive.read(info))
+            # 写盘前按实际字节数复核：file_size 来自 zip 元数据，可以被伪造
+            data = archive.read(info)
+            if len(data) > MAX_IMPORT_SINGLE_FILE_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail=f"单个文件解压后超过上限（实际 {len(data)} 字节）：{rel.as_posix()}",
+                )
+            written_uncompressed += len(data)
+            if written_uncompressed > MAX_IMPORT_UNCOMPRESSED_BYTES:
+                raise HTTPException(
+                    status_code=413,
+                    detail="研究包解压后总量超过上限（疑似压缩包炸弹），导入已中止",
+                )
+            target.write_bytes(data)
             imported.append(rel.as_posix())
     finally:
         archive.close()

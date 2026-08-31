@@ -14,7 +14,12 @@ from research_assistant.tools.file_ops import (
     read_file,
     write_file,
 )
-from research_assistant.tools.registry import TOOL_DEFINITIONS, ToolRegistry
+from research_assistant.tools.registry import (
+    TOOL_DEFINITIONS,
+    ToolExtension,
+    ToolRegistry,
+    get_tool_schemas,
+)
 
 
 class TestReadFile:
@@ -74,6 +79,39 @@ class TestEditFile:
     async def test_edit_nonexistent_file(self):
         result = await edit_file("/nonexistent.txt", "a", "b")
         assert "Error" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_rejects_windows_reserved_name(self, tmp_path):
+        """P1-4：edit 通道此前漏了 hazard 校验——write_file 与 apply_patch
+        都拦 CON/NUL，模型可以用 edit 绕过写设备文件（内容被吞，静默丢失）。
+
+        注意必须拦在 resolve/existence 检查之前：CON 即便不存在也会被判为
+        「File does not exist」从而放过校验。
+        """
+        result = await edit_file(str(tmp_path / "CON.txt"), "a", "b")
+        assert "保留设备名" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_rejects_ntfs_ads_path(self, tmp_path):
+        """盘符之外的冒号（file:stream）在 edit 通道同样必须拒绝。"""
+        result = await edit_file(str(tmp_path / "file:hidden"), "a", "b")
+        assert "备用数据流" in result
+
+    @pytest.mark.asyncio
+    async def test_edit_hazard_checked_before_existence(self, tmp_path):
+        """顺序锁：不存在但名字危险的文件也要拦（而非先报 File does not exist）。"""
+        result = await edit_file(str(tmp_path / "AUX.md"), "a", "b")
+        assert "保留设备名" in result
+        assert "does not exist" not in result
+
+    @pytest.mark.asyncio
+    async def test_edit_normal_path_unaffected(self, tmp_path):
+        """反向断言：正常文件编辑不受新增校验影响。"""
+        f = tmp_path / "normal.txt"
+        f.write_text("hello")
+        result = await edit_file(str(f), "hello", "world")
+        assert "Successfully" in result
+        assert f.read_text() == "world"
 
     @pytest.mark.asyncio
     async def test_edit_string_not_found(self, tmp_path):
@@ -160,6 +198,72 @@ class TestRunBash:
     async def test_command_failure(self, tmp_path):
         result = await run_bash("exit 1", cwd=str(tmp_path))
         assert "Exit code: 1" in result
+
+
+class TestToolRegistrySchemaIsolation:
+    """P0-1 回归锁：get_schemas() 绝不能污染模块级 TOOL_DEFINITIONS。
+
+    修复前 ``get_schemas()`` 在 ``allowed_tools is None`` 时直接取全局列表再
+    ``append`` 扩展定义——注册 1 个扩展后连调两次，全局表从 14 涨到 16，且
+    **新建的、从未注册扩展的** registry 也会看到那 2 份重复 schema。长会话下
+    每次 run_agent 都调用一次，重复 schema 每回合重复发给模型，token 成本
+    持续上升且不可收敛。
+    """
+
+    @staticmethod
+    def _ext(name: str) -> ToolExtension:
+        # handler 是 register_extension 的硬性前置条件（registry.py:542）
+        return ToolExtension(
+            name=name,
+            description=f"{name} desc",
+            handler=lambda **_kw: "ok",
+        )
+
+    def test_extension_does_not_leak_into_global_table(self):
+        baseline = len(TOOL_DEFINITIONS)
+        registry = ToolRegistry()
+        registry.register_extension(self._ext("leaky_probe"))
+        registry.get_schemas()
+        registry.get_schemas()
+        assert len(TOOL_DEFINITIONS) == baseline
+
+    def test_fresh_registry_sees_only_builtins(self):
+        baseline = len(TOOL_DEFINITIONS)
+        r1 = ToolRegistry()
+        r1.register_extension(self._ext("only_in_r1"))
+        r1.get_schemas()
+        # 新建、从未注册任何扩展的 registry 不得看到 r1 的扩展
+        r2 = ToolRegistry()
+        assert len(r2.get_schemas()) == baseline
+
+    def test_repeated_calls_are_idempotent(self):
+        registry = ToolRegistry()
+        registry.register_extension(self._ext("stable_probe"))
+        first = registry.get_schemas()
+        second = registry.get_schemas()
+        assert len(first) == len(second)
+
+    def test_extension_still_visible_to_its_owner(self):
+        registry = ToolRegistry()
+        registry.register_extension(self._ext("visible_probe"))
+        names = {s["name"] for s in registry.get_schemas()}
+        assert "visible_probe" in names
+
+    def test_allowed_tools_filter_path_also_isolated(self):
+        """allowed_tools 分支本就是新建列表，但扩展过滤逻辑共用，一并锁住。"""
+        baseline = len(TOOL_DEFINITIONS)
+        registry = ToolRegistry(allowed_tools={"read_file"})
+        registry.register_extension(self._ext("filtered_probe"))
+        names = {s["name"] for s in registry.get_schemas()}
+        assert names == {"read_file"}  # 不在 allowed_tools 里的扩展不出现
+        assert len(TOOL_DEFINITIONS) == baseline
+
+    def test_public_helper_returns_copy(self):
+        """get_tool_schemas() 同样不得交出可变全局表（公开 API 防御）。"""
+        baseline = len(TOOL_DEFINITIONS)
+        schemas = get_tool_schemas()
+        schemas.append({"name": "mutated_by_caller"})
+        assert len(TOOL_DEFINITIONS) == baseline
 
 
 class TestToolRegistry:
@@ -349,6 +453,56 @@ class TestBashPythonGuardHelpers:
         ]
         for seg in misses:
             assert not _is_python_invocation(seg), seg
+
+    def test_is_python_invocation_p1_wrapper_bypasses(self):
+        """P1-6：非白名单包装器后的 python 调用必须命中。
+
+        旧实现在首个可执行位匹配失败即 return False——wsl/pwsh/bash/conhost/
+        runas 都不在 _CMD_PREFIX_TOKENS 白名单里，其后的 python 全部漏检。
+        """
+        from research_assistant.tools.bash import _is_python_invocation
+
+        hits = [
+            "wsl python a.py",
+            "pwsh -Command python a.py",
+            "bash -c python a.py",
+            "conhost python a.py",
+            "runas /user:x python a.py",
+            "wsl -e python3 -V",
+            "cmd /c wsl python a.py",       # 前缀链 + 未知包装器叠加
+        ]
+        for seg in hits:
+            assert _is_python_invocation(seg), seg
+
+    def test_is_python_invocation_p1_single_quoted_path(self):
+        """P1-6：单引号包裹的带空格路径此前在空格处断开，basename 变成
+        ``Program``，检测失配。"""
+        from research_assistant.tools.bash import _is_python_invocation
+
+        assert _is_python_invocation(
+            r"'C:\Program Files\Python311\python.exe' a.py")
+        assert _is_python_invocation('"C:\\Program Files\\Python311\\python.exe" a.py')
+
+    def test_p1_arg_consumer_positions_still_allowed(self):
+        """误报抑制的回归锁：文本/查找类命令里的 python 字样不算调用。"""
+        from research_assistant.tools.bash import _is_python_invocation
+
+        misses = [
+            "grep -r python .",
+            "where python",
+            "which python3",
+            "findstr python notes.txt",
+            "type python_notes.md",
+            "cat python_intro.txt",
+        ]
+        for seg in misses:
+            assert not _is_python_invocation(seg), seg
+
+    def test_p1_quoted_text_not_flagged(self):
+        """引号内的整句文本是一个 token，basename 不以 python 开头。"""
+        from research_assistant.tools.bash import _is_python_invocation
+
+        assert not _is_python_invocation('echo "learn python today"')
 
 
 class TestBashPythonGuardIntegration:

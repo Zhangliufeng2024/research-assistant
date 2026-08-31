@@ -57,6 +57,23 @@ cache_control breakpoints), `RA_HEARTBEAT_TIMEOUT`, `RA_AUTO_CONTINUE`,
 Wire protocol (run.json / events.jsonl / HookVerdict / approval flow) is
 specified in [`docs/protocol.md`](docs/protocol.md).
 
+**Security boundary (read before extending tools).** The workspace fence
+(`core.safe_resolve`) covers the `file_ops` tools (read/write/edit/glob/grep)
+and `apply_patch` — their path arguments are resolved and verified against the
+sandbox root, and Windows reserved device names / NTFS alternate data streams
+are rejected (`file_ops._reject_windows_hazard`). The fence does **not** cover
+`bash` and `run_python`: these validate only the `cwd` landing spot, not the
+command/code text — a model-emitted `cmd /c echo x > C:\...` can write outside
+the workspace by design, because a research assistant must be able to run real
+scripts. Mitigations are layered, not substituted: `RA_PERMISSION_MODE`
+blocks catastrophic commands on the executable surface (`bash`/`run_python`
+payloads and MCP extension arguments; file *content* is deliberately not
+scanned so that papers about shell commands are not false-positived), the local
+HTTP API requires a one-time startup token (`/api` and `/ws`; static assets are
+exempt), and MCP subprocesses inherit a sanitized environment without API keys.
+True isolation for the execution tools (container / restricted process) remains
+the documented extension point — do not try to fix it inside `safe_resolve`.
+
 ## Quick Start
 
 ### Prerequisites

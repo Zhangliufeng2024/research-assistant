@@ -466,7 +466,9 @@ async def run_orchestrated_generation(
     figures_info = "\n".join(f"- {fg.name}: {fg.description} -> {fg.filename}" for fg in plan.figures)
     bib_files = "\n".join(f"- {r.files_written[0] if r.files_written else 'N/A'}" for r in research_results if r.success)
 
-    output_dir / "drafts" / "v1_draft.tex"  # kept for legacy .tex input detection
+    # P2-10：此处原有一行 `output_dir / "drafts" / "v1_draft.tex"`，注释称
+    # "kept for legacy .tex input detection"——但 Path 拼接无任何副作用且返回值
+    # 被丢弃，是纯死语句，已删除（行为完全一致）。全文件也无 tex_file 变量。
     docx_file = output_dir / "drafts" / "v1_draft.docx"
     bib_file = output_dir / "references" / "references.bib"
 

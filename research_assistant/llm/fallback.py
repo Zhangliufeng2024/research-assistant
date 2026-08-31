@@ -14,6 +14,9 @@
   换 provider 是唯一有信息增量的动作。
 * **最后一个候选的异常原样上抛**：绝不吞错。调用方的错误分类、重试、
   用户提示都依赖真实的异常类型。
+* **取消与中断不参与降级**：``CancelledError`` / ``KeyboardInterrupt`` /
+  ``SystemExit`` 立即上抛，不尝试下一个候选——否则「停止」按钮只是让本端
+  静默换一个模型继续烧钱。只有 ``Exception`` 子类才被视作「该候选不可用」。
 * **流式语义**：若在 *on_chunk 已经吐出文本之后* 才失败，换模型会导致
   前后文风格突变甚至内容重复。因此流式调用只在**尚未发出任何增量**时
   才允许降级；一旦开始输出就让失败上抛，交给上层按"部分输出"处理。
@@ -63,6 +66,23 @@ class FallbackLLMClient(LLMClient):
         last_error: BaseException | None = None
         for index, client in enumerate(self.clients):
             label = self.labels[index] if index < len(self.labels) else type(client).__name__
+            # 已向调用方吐出过正文即禁止降级：换模型会让前后风格突变、内容
+            # 重复，而已发布的增量又无法撤回。包装 on_chunk 只加一道「是否
+            # 已发布」的记账，其余行为原样透传（含 on_chunk 为 None 的情形）。
+            published = False
+            tracked_chunk: OnChunkCallback | None = on_chunk
+            if on_chunk is not None:
+
+                async def _tracked(delta: str) -> None:
+                    nonlocal published
+                    if delta:
+                        published = True
+                    result = on_chunk(delta)
+                    if result is not None:
+                        await result
+
+                tracked_chunk = _tracked
+
             try:
                 response = await client.chat(
                     messages,
@@ -70,7 +90,7 @@ class FallbackLLMClient(LLMClient):
                     tools=tools,
                     temperature=temperature,
                     max_tokens=max_tokens,
-                    on_chunk=on_chunk,
+                    on_chunk=tracked_chunk,
                     on_activity=on_activity,
                     on_thought=on_thought,
                 )
@@ -80,8 +100,25 @@ class FallbackLLMClient(LLMClient):
                     )
                 self.active_index = index
                 return response
-            except BaseException as exc:  # noqa: BLE001 — 链式降级必须覆盖所有异常
+            except BaseException as exc:  # noqa: BLE001 — 需先判定是否可降级
+                # 取消/中断语义绝不能被降级链吞掉：CancelledError（用户点
+                # 「停止」）必须立即上抛，否则本端会继续向下一个候选模型
+                # 发一次完整请求并计费，取消也就形同失效。KeyboardInterrupt
+                # / SystemExit 同理——它们不是「这个 provider 不行」的信号。
+                if not isinstance(exc, Exception):
+                    raise
                 last_error = exc
+                if published:
+                    # 已向调用方吐出过正文 → 不换模型：换会让前后风格突变、
+                    # 内容重复，而已发布的增量又无法撤回。异常上抛交给上层
+                    # 按「部分输出」处理（docstring 的流式语义，此前只写在
+                    # 注释里未落地）。
+                    LOG.warning(
+                        "候选 %s 在已输出正文后失败（%s: %s）："
+                        "不切换备选模型，异常原样上抛",
+                        label, type(exc).__name__, exc,
+                    )
+                    break
                 if index == len(self.clients) - 1:
                     break
                 LOG.warning(

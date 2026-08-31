@@ -73,6 +73,25 @@ class McpServerConnection:
 
     # ---- 连接 / 握手 ---------------------------------------------------
 
+    def _child_env(self) -> dict[str, str]:
+        """子进程环境：净化过的基底 + 用户显式声明的键。
+
+        P1-2：此前 ``env=self.env`` 在未配置时传 None，``create_subprocess_exec``
+        收到 None 即**继承完整 os.environ**——含 ``LLM_API_KEY`` 在内的一切。
+        模型生成的代码跑在 bash/run_python 里时早已走
+        ``sanitized_exec_env()`` 净化过（exec_provider.py），MCP 这条路径是
+        唯一的漏网之地，等于把密钥净化整体绕过。
+
+        语义：基底取净化后的环境（PATH / HOME 等照常保留），用户为**该服务器
+        显式声明**的键覆盖基底——显式配置优先，但默认不继承任何密钥。
+        """
+        from .tools.exec_provider import sanitized_exec_env
+
+        child = sanitized_exec_env()
+        if self.env:
+            child.update(self.env)
+        return child
+
     async def connect(self) -> "McpServerConnection":
         """启动子进程并完成 initialize 握手。
 
@@ -85,7 +104,7 @@ class McpServerConnection:
                 stdin=asyncio.subprocess.PIPE,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.DEVNULL,
-                env=self.env,
+                env=self._child_env(),
             )
         except (OSError, ValueError) as e:
             raise McpServerError(
@@ -341,7 +360,26 @@ async def connect_mcp_servers(
         args = spec.get("args") or []
         if not isinstance(args, list):
             args = [str(arg) for arg in args if arg is not None]
-        conn = McpServerConnection(name, command, [str(arg) for arg in args])
+        # env 字段此前被解析却从未传入（配置项静默失效）。只接受扁平的
+        # 字符串映射，其余形态丢弃并告警——避免把 dict 塞进子进程环境。
+        raw_env = spec.get("env")
+        env: dict[str, str] | None = None
+        if isinstance(raw_env, dict) and raw_env:
+            env = {
+                str(k): str(v)
+                for k, v in raw_env.items()
+                if isinstance(v, (str, int, float))
+            }
+            dropped = len(raw_env) - len(env)
+            if dropped:
+                logger.warning(
+                    "MCP 服务器 %s 的 env 中有 %d 项不是标量，已忽略", name, dropped,
+                )
+        elif raw_env:
+            logger.warning("MCP 服务器 %s 的 env 不是对象，已忽略", name)
+        conn = McpServerConnection(
+            name, command, [str(arg) for arg in args], env=env,
+        )
         try:
             await conn.connect()
             tools = await conn.list_tools()

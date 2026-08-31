@@ -10,12 +10,19 @@ type SendResult = "ok" | "empty" | "offline" | void;
 /** 附加结果串（与 chatStore.attachFiles 对齐）。 */
 type AttachResult = "ok" | "empty" | "offline" | "limit" | void;
 
+/** 提示词增强结果：ok 带回扩写文本，否则带中文失败原因（原文一律不动）。 */
+export type EnhanceOutcome =
+  | { ok: true; text: string }
+  | { ok: false; error: string };
+
 /** 输入区：Enter 发送 / Shift+Enter 换行；运行中占位符切换为引导语义。
  * focusSignal 自增时把焦点拉回输入框（草稿入列点击聚焦，R12 P4）。
  * R13-B：onSend 返回非 ok 状态串时恢复草稿——发送失败还清空输入框，
  * 用户只能眼睁睁看着写好的话消失。
  * R16 附件：📎 选择 / 拖拽文件到输入区 / 粘贴截图均可加入待发附件，
- * 上传即时走 REST（chips 展示），随下一条消息一并发送。 */
+ * 上传即时走 REST（chips 展示），随下一条消息一并发送。
+ * R18 增强提示词：✨ 调模型把粗略指令扩写成结构化提示词，结果回填输入框
+ * 由用户确认后再发送——失败保持原文不动。 */
 export function Composer({
   running,
   disabled,
@@ -26,6 +33,7 @@ export function Composer({
   onSend,
   onAttach,
   onRemoveAttachment,
+  onEnhance,
 }: {
   running: boolean;
   disabled?: boolean;
@@ -40,6 +48,8 @@ export function Composer({
   onSend: (text: string) => SendResult | Promise<SendResult>;
   onAttach: (files: File[]) => AttachResult | Promise<AttachResult>;
   onRemoveAttachment: (path: string) => void;
+  /** 提示词增强（可选）：未传则不渲染 ✨ 按钮，其它宿主零影响。 */
+  onEnhance?: (text: string) => Promise<EnhanceOutcome>;
 }) {
   const [value, setValue] = useState("");
   const [dragOver, setDragOver] = useState(false);
@@ -52,6 +62,9 @@ export function Composer({
   // 拖拽计数：子元素 dragenter/dragleave 成对触发，用计数抵消抖动
   const dragDepth = useRef(0);
   const draftEnabled = draftKey !== undefined;
+  // R18 增强提示词：进行中（按钮转圈禁用）与失败原因（就地提示，原文不动）
+  const [enhancing, setEnhancing] = useState(false);
+  const [enhanceError, setEnhanceError] = useState("");
 
   // ---- 每会话草稿（阶段 4）：draftKey 变化 = 切换会话 → 恢复该会话草稿。
   // 会话区常驻后 Composer 不再重挂，恢复完全依赖这里。
@@ -117,6 +130,36 @@ export function Composer({
     const files = Array.from(list);
     if (files.length === 0) return;
     void Promise.resolve(onAttach(files));
+  }
+
+  /** 把当前输入扩写成结构化提示词并回填输入框。
+   * 只在成功时改动内容——任何失败都保留原文，用户写好的话绝不能丢。 */
+  async function enhance() {
+    const v = value.trim();
+    if (!v || enhancing || disabled || !onEnhance) return;
+    setEnhancing(true);
+    setEnhanceError("");
+    try {
+      const out = await onEnhance(v);
+      if (!out.ok) {
+        setEnhanceError(out.error);
+        return;
+      }
+      setValue(out.text);
+      if (draftEnabled) useSessionStore.getState().setDraft(draftKey ?? null, out.text);
+      // 回填后文本变长，重算自适应高度并把光标交还给用户
+      requestAnimationFrame(() => {
+        if (ref.current) {
+          ref.current.style.height = "auto";
+          ref.current.style.height = `${Math.min(ref.current.scrollHeight, 176)}px`;
+        }
+      });
+      ref.current?.focus();
+    } catch {
+      setEnhanceError("提示词增强失败，请重试（您的原文未改动）");
+    } finally {
+      setEnhancing(false);
+    }
   }
 
   return (
@@ -222,6 +265,30 @@ export function Composer({
               e.target.value = ""; // 允许重复选择同一文件
             }}
           />
+          {/* R18 增强提示词：把粗略指令扩写成结构化研究提示词（回填后可改） */}
+          {onEnhance && (
+            <button
+              type="button"
+              onClick={() => void enhance()}
+              disabled={!value.trim() || disabled || enhancing}
+              aria-label="增强提示词"
+              title="增强提示词：把当前内容扩写成结构化研究指令（结果可再编辑）"
+              className="flex h-9 w-9 shrink-0 items-center justify-center rounded-xl bg-surface-2 text-ink-3 transition-all hover:text-accent disabled:opacity-40"
+            >
+              {enhancing ? (
+                <span
+                  className="h-4 w-4 animate-spin rounded-full border-2 border-ink-3 border-t-transparent"
+                  aria-hidden
+                />
+              ) : (
+                <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"
+                  strokeLinecap="round" strokeLinejoin="round" className="h-4 w-4" aria-hidden>
+                  <path d="M12 3l1.9 4.6L18.5 9.5l-4.6 1.9L12 16l-1.9-4.6L5.5 9.5l4.6-1.9z" />
+                  <path d="M18.5 15.5l.8 2 2 .8-2 .8-.8 2-.8-2-2-.8 2-.8z" />
+                </svg>
+              )}
+            </button>
+          )}
           <button
             type="button"
             onClick={() => fileRef.current?.click()}
@@ -246,6 +313,7 @@ export function Composer({
             onChange={(e) => {
               setValue(e.target.value);
               if (draftEnabled) useSessionStore.getState().setDraft(draftKey ?? null, e.target.value);
+              if (enhanceError) setEnhanceError("");
               setMenuOpen(true);
               setMenuIdx(0);
               e.target.style.height = "auto";
@@ -306,8 +374,17 @@ export function Composer({
             </svg>
           </button>
         </div>
-        <div className="mt-1.5 text-center text-[11px] text-ink-3">
-          Enter 发送 · Shift+Enter 换行{running ? " · 运行中的消息将作为引导注入下一步" : " · 输入 / 唤起命令 · 可拖拽/粘贴附件"}
+        <div
+          className={`mt-1.5 text-center text-[11px] ${
+            enhanceError ? "text-danger" : "text-ink-3"
+          }`}
+        >
+          {enhanceError ||
+            `Enter 发送 · Shift+Enter 换行${
+              running
+                ? " · 运行中的消息将作为引导注入下一步"
+                : " · 输入 / 唤起命令 · 可拖拽/粘贴附件"
+            }`}
         </div>
       </div>
     </div>

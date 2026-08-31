@@ -153,9 +153,22 @@ function discardPendingDeltas(): void {
 
 /* ---- R16 断线处理 ---- */
 
-/** 放弃自动重连：横幅由视图按 conn==="closed" 呈现（含手动重连入口）。 */
+/** 放弃自动重连：横幅由视图按 conn==="closed" 呈现（含手动重连入口）。
+ *
+ * 同时把 phase 置回 idle——这是 P0 修复。重连期间**必须**保持 running
+ * （R16 语义：断连不终止回合，服务端继续跑到终态并落盘），但一旦放弃重连，
+ * 本端再无任何途径得知回合终态：状态点永久脉冲、「停止」按钮常驻、
+ * silentSeconds 无限累加、等待横幅永久挂屏，用户只能重启应用。
+ *
+ * 置 idle 不会说谎：用户点手动「重连」时，若回合仍在跑，attach 的
+ * replay_begin 会把相位翻回 running（见 nudgeReconnectAfterSteerFailure 注释
+ * 里记录的同一条回归路径）。conn 仍是 "closed"，横幅与重连入口不受影响。 */
 function giveUpReconnect(): void {
-  useChatStore.setState({ conn: "closed" });
+  // phase 嵌套在 chat 下（顶层只有 conn），必须保留 chat 其余字段
+  useChatStore.setState((s) => ({
+    conn: "closed",
+    chat: { ...s.chat, phase: "idle" },
+  }));
 }
 
 function scheduleReconnect(): void {

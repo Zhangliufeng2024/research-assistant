@@ -57,6 +57,9 @@ class JanitorConfig:
     #: 审计日志自身的大小上限（MB）与保留代数。此前只 append 不轮转。
     audit_rotate_mb: float = 5.0
     audit_keep: int = 3
+    #: P2-6：DB 保留天数。task_events / notifications 此前只增不删，长期
+    #: 工作区里 platform.sqlite3 单调膨胀（janitor 此前只管文件系统）。
+    db_days: float = 90.0
 
     @classmethod
     def from_env(cls) -> JanitorConfig:
@@ -76,6 +79,7 @@ class JanitorConfig:
             tool_outputs_days=_f("RA_JANITOR_TOOL_OUTPUTS_DAYS", 7.0),
             audit_rotate_mb=_f("RA_JANITOR_AUDIT_ROTATE_MB", 5.0),
             audit_keep=int(_f("RA_JANITOR_AUDIT_KEEP", 3)),
+            db_days=_f("RA_JANITOR_DB_DAYS", 90.0),
         )
 
 
@@ -340,6 +344,20 @@ def _sweep_tmp(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
             continue
 
 
+def _sweep_db(cwd: Path, store: Any, cfg: JanitorConfig, stats: dict) -> None:
+    """P2-6：DB 保留期清理（task_events / notifications）。
+
+    与文件层不同：这里删的是**行**而非文件，审计语义以行数计数记入
+    stats["db_rows_removed"]。store 未注入（测试裸跑）时静默跳过。
+    """
+    if store is None or not hasattr(store, "purge_old_db_events"):
+        return
+    removed = store.purge_old_db_events(cfg.db_days)
+    stats["db_rows_removed"] = int(removed.get("task_events", 0)) + int(
+        removed.get("notifications", 0)
+    )
+
+
 def run_janitor(cwd: Path, store: Any = None, config: JanitorConfig | None = None) -> dict[str, int]:
     """执行一轮分层清理，返回动作计数。异常逐层隔离：单层失败不影响他层。"""
     cfg = config or JanitorConfig.from_env()
@@ -348,12 +366,15 @@ def run_janitor(cwd: Path, store: Any = None, config: JanitorConfig | None = Non
         "archived": 0, "gzipped": 0, "drafts_removed": 0,
         "changes_evicted": 0, "rotated": 0, "tmp_removed": 0,
         "tool_outputs_removed": 0, "audit_rotated": 0,
+        "db_rows_removed": 0,
     }
     # 顺序即安全语义：cold 先于 warm——冷层只处理「上一轮就已归档」的会话，
     # 温层本轮新归档的要等下一轮才可能被压缩/清稿（先观察、后销毁）。
     # tool_outputs 与 audit 放最后：前者是最"可丢"的层；后者必须等其他层
     # 的审计记录都写完再滚动，否则会丢「刚刚删了什么」的证据。
+    # db 层放最前：纯行删除、与文件层无依赖，早删早释放 WAL 空间。
     for name, fn in (
+        ("db", _sweep_db),
         ("cold", _sweep_cold), ("warm", _sweep_warm),
         ("changes", _sweep_changes), ("rotate", _rotate_events),
         ("tmp", _sweep_tmp),
@@ -361,7 +382,7 @@ def run_janitor(cwd: Path, store: Any = None, config: JanitorConfig | None = Non
         ("audit", _rotate_audit),
     ):
         try:
-            fn(cwd, store, cfg, stats) if name in {"warm", "cold"} else fn(cwd, cfg, stats)
+            fn(cwd, store, cfg, stats) if name in {"warm", "cold", "db"} else fn(cwd, cfg, stats)
         except Exception:  # noqa: BLE001 —— 看门狗不许把调度器带崩
             LOG.exception("janitor 层 %s 失败（已跳过）", name)
     if any(stats.values()):

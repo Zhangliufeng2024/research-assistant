@@ -24,9 +24,14 @@ from fastapi.testclient import TestClient  # noqa: E402
 from starlette.websockets import WebSocketDisconnect  # noqa: E402
 
 from research_assistant.web.app import (  # noqa: E402
+    TOKEN_HEADER,
+    TOKEN_QUERY_PARAM,
     OriginGuardMiddleware,
+    TokenInjectingStatic,
+    _extract_token,
     _same_origin,
     _split_host_port,
+    generate_api_token,
 )
 
 #: 测试端口模拟 desktop.py 的「127.0.0.1 + 随机端口」绑定形态。
@@ -230,3 +235,238 @@ class TestSplitHostPortUnit:
 
     def test_empty_header(self):
         assert _split_host_port("") == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# P1-3 本地 API token
+# ---------------------------------------------------------------------------
+
+
+def _make_token_app(tmp_path, token: str | None) -> FastAPI:
+    """裸 app + 生产同款中间件；token 显式注入（不跑 lifespan）。"""
+    app = FastAPI()
+    app.add_middleware(OriginGuardMiddleware)
+    # 显式设置（含空串）——未设属性 = 未启用，正是既有测试的形态
+    if token is not None:
+        app.state.api_token = token
+
+    @app.get("/api/ping")
+    async def ping():
+        return {"ok": True}
+
+    @app.websocket("/ws/chat")
+    async def ws_chat(websocket: WebSocket):
+        await websocket.accept()
+        await websocket.send_json({"type": "connected"})
+        await websocket.close()
+
+    app.mount("/", StaticFiles(directory=str(tmp_path), html=True), name="static")
+    return app
+
+
+class TestApiTokenEnforcement:
+    """token 已配置：/api 与 /ws 必须携带；静态资源免检。"""
+
+    @pytest.fixture()
+    def client(self, tmp_path):
+        token = generate_api_token()
+        with TestClient(
+            _make_token_app(tmp_path, token), base_url=f"http://{HOST_PORT}"
+        ) as c:
+            c.ra_token = token  # type: ignore[attr-defined]
+            yield c
+
+    def test_api_without_token_rejected(self, client):
+        assert client.get("/api/ping").status_code == 401
+
+    def test_api_with_correct_header_allowed(self, client):
+        r = client.get("/api/ping", headers={TOKEN_HEADER: client.ra_token})
+        assert r.status_code == 200
+
+    def test_api_with_bearer_allowed(self, client):
+        r = client.get(
+            "/api/ping", headers={"Authorization": f"Bearer {client.ra_token}"},
+        )
+        assert r.status_code == 200
+
+    def test_api_with_wrong_token_rejected(self, client):
+        r = client.get("/api/ping", headers={TOKEN_HEADER: "not-the-token"})
+        assert r.status_code == 401
+
+    def test_static_path_exempt(self, tmp_path, client):
+        """静态资源必须免检——否则 UI 自身都加载不了。"""
+        (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+        assert client.get("/index.html").status_code == 200
+        assert client.get("/").status_code == 200
+
+    def test_ws_without_token_closed(self, client):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(f"ws://{HOST_PORT}/ws/chat"):
+                pass
+        assert exc_info.value.code == 1008
+
+    def test_ws_with_query_token_allowed(self, client):
+        """浏览器无法给 WS 设自定义头 → 查询串是唯一携带方式。"""
+        with client.websocket_connect(
+            f"ws://{HOST_PORT}/ws/chat?{TOKEN_QUERY_PARAM}={client.ra_token}"
+        ) as ws:
+            assert ws.receive_json() == {"type": "connected"}
+
+    def test_ws_with_wrong_query_token_closed(self, client):
+        with pytest.raises(WebSocketDisconnect) as exc_info:
+            with client.websocket_connect(
+                f"ws://{HOST_PORT}/ws/chat?{TOKEN_QUERY_PARAM}=wrong"
+            ):
+                pass
+        assert exc_info.value.code == 1008
+
+
+class TestApiTokenDisabled:
+    """token 未配置：行为与修复前完全一致（既有测试与开发态的兼容承诺）。"""
+
+    @pytest.fixture()
+    def client(self, tmp_path):
+        with TestClient(
+            _make_token_app(tmp_path, None), base_url=f"http://{HOST_PORT}"
+        ) as c:
+            yield c
+
+    def test_api_allowed_without_token(self, client):
+        assert client.get("/api/ping").status_code == 200
+
+    def test_ws_allowed_without_token(self, client):
+        with client.websocket_connect(f"ws://{HOST_PORT}/ws/chat") as ws:
+            assert ws.receive_json() == {"type": "connected"}
+
+    def test_empty_token_string_disables_enforcement(self, tmp_path):
+        """显式空串 = 未启用（lifespan 在 RA_DISABLE_API_TOKEN 下即如此）。"""
+        with TestClient(
+            _make_token_app(tmp_path, ""), base_url=f"http://{HOST_PORT}"
+        ) as client:
+            assert client.get("/api/ping").status_code == 200
+
+
+class TestApiTokenInjection:
+    """TokenInjectingStatic：token 只随入口 HTML 下发一次。"""
+
+    def _wrap(self, tmp_path, token):
+        static = StaticFiles(directory=str(tmp_path), html=True)
+        return TokenInjectingStatic(static, tmp_path / "index.html")
+
+    def test_index_html_gets_injected(self, tmp_path):
+        (tmp_path / "index.html").write_text(
+            "<html><head></head><body></body></html>", encoding="utf-8"
+        )
+        token = generate_api_token()
+        app = FastAPI()
+        app.state.api_token = token
+        app.mount("/", self._wrap(tmp_path, token))
+        with TestClient(app) as client:
+            html = client.get("/").text
+        assert f'window.__RA_API_TOKEN__="{token}"' in html
+        assert html.index("__RA_API_TOKEN__") < html.index("</head>")
+
+    def test_other_assets_untouched(self, tmp_path):
+        (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+        (tmp_path / "app.js").write_text("console.log(1)", encoding="utf-8")
+        app = FastAPI()
+        app.state.api_token = generate_api_token()
+        app.mount("/", self._wrap(tmp_path, token=app.state.api_token))
+        with TestClient(app) as client:
+            assert client.get("/app.js").text == "console.log(1)"
+
+    def test_injection_failure_falls_back_to_static(self, tmp_path):
+        """入口文件读不到时必须退回静态挂载，绝不能让 UI 打不开。"""
+        missing = tmp_path / "index.html"  # 不创建
+        app = FastAPI()
+        app.state.api_token = generate_api_token()
+        app.mount("/", TokenInjectingStatic(
+            StaticFiles(directory=str(tmp_path), html=True), missing,
+        ))
+        with TestClient(app) as client:
+            # StaticFiles 对缺失 index 返回 404 而非 500——这就是「不因注入失败挂掉」
+            assert client.get("/").status_code == 404
+
+    def test_no_store_cache_header(self, tmp_path):
+        """token 不能落浏览器缓存（缓存的旧页面会带着旧 token）。"""
+        (tmp_path / "index.html").write_text("<html></html>", encoding="utf-8")
+        app = FastAPI()
+        app.state.api_token = generate_api_token()
+        app.mount("/", self._wrap(tmp_path, app.state.api_token))
+        with TestClient(app) as client:
+            assert client.get("/").headers.get("cache-control") == "no-store"
+
+
+class TestApiTokenUnit:
+    def test_token_is_url_safe_and_long(self):
+        token = generate_api_token()
+        assert len(token) >= 32
+        assert all(c.isalnum() or c in "-_" for c in token)
+        assert generate_api_token() != generate_api_token()
+
+    def test_extract_token_header(self):
+        scope = {
+            "type": "http",
+            "headers": [(b"x-ra-token", b"abc123")],
+        }
+        assert _extract_token(scope) == "abc123"
+
+    def test_extract_token_bearer(self):
+        scope = {
+            "type": "http",
+            "headers": [(b"authorization", b"Bearer tok-9")],
+        }
+        assert _extract_token(scope) == "tok-9"
+
+    def test_extract_token_prefers_explicit_header(self):
+        scope = {
+            "type": "http",
+            "headers": [
+                (b"authorization", b"Bearer from-bearer"),
+                (b"x-ra-token", b"from-header"),
+            ],
+        }
+        assert _extract_token(scope) == "from-header"
+
+    def test_extract_token_ws_query(self):
+        scope = {"type": "websocket", "query_string": b"session=a&token=tok-7"}
+        assert _extract_token(scope) == "tok-7"
+
+    def test_extract_token_missing(self):
+        assert _extract_token({"type": "http", "headers": []}) == ""
+        assert _extract_token({"type": "websocket", "query_string": b""}) == ""
+
+
+class TestLifespanTokenGeneration:
+    """lifespan 会生成 token；RA_DISABLE_API_TOKEN 可显式关闭。"""
+
+    def test_lifespan_generates_token(self, tmp_path, monkeypatch, isolated_appdata):
+        from research_assistant.web.app import create_app
+
+        # isolated_appdata 必须有：lifespan 会跑 load_project_env，它把
+        # **真实的全局配置**（%APPDATA%）以 override=True 灌进 os.environ。
+        # 不隔离的话，机器上若设过 RA_PERMISSION_MODE=off，就会泄漏到
+        # 本文件之后的测试（实测让 test_policy_blocks_through_agent_loop
+        # 的策略挂载失效）——这是跨测试状态污染，不是产品缺陷。
+        monkeypatch.chdir(tmp_path)
+        (tmp_path / ".env").write_text("", encoding="utf-8")
+        app = create_app()
+        with TestClient(app):
+            token = getattr(app.state, "api_token", "")
+            assert token, "lifespan 必须生成 token（生产入口依赖它）"
+            assert client_gets_protected(app, token)
+
+    def test_lifespan_disable_env(self, tmp_path, monkeypatch, isolated_appdata):
+        from research_assistant.web.app import create_app
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("RA_DISABLE_API_TOKEN", "1")
+        app = create_app()
+        with TestClient(app):
+            assert getattr(app.state, "api_token", "") == ""
+
+
+def client_gets_protected(app: FastAPI, token: str) -> bool:
+    """辅助断言：生成 token 后 /api 确实被守卫保护。"""
+    client = TestClient(app)
+    return client.get("/api/settings").status_code == 401

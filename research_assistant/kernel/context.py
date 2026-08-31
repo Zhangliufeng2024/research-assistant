@@ -28,38 +28,9 @@ COMPACTION_TRIGGER_FRACTION = 0.7
 KEEP_RECENT_MESSAGES = 12
 MIN_SPAN_MESSAGES = 6
 
-# Conservative context windows (input tokens) keyed by model-name prefix.
-#
-# ⚠️ window_for() 是**首个匹配即返回**（first-match），不是最长前缀匹配。
-# 因此更具体的前缀必须排在更前面，否则会被上面的宽泛条目先截走。
-#
-# 2026-08 核实：Fable 5 / Opus 5 / Sonnet 5 的窗口为 **1,000,000**（默认即
-# 最大值，无 beta header、无长上下文附加费）；Haiku 4.5 为 200,000。
-# 此前把整个 claude-sonnet / claude-opus 族写成 200_000，导致 1M 窗口的模型
-# 在 140k（0.7 × 200k）就触发压缩，**浪费 86% 可用窗口**。
-#
-# 版本号条目在前、家族兜底在后；未知的 Claude 模型仍落到保守的族级值。
-_MODEL_WINDOWS: tuple[tuple[str, int], ...] = (
-    ("claude-fable-5", 1_000_000),
-    ("claude-opus-5", 1_000_000),
-    ("claude-sonnet-5", 1_000_000),
-    ("claude-mythos-5", 1_000_000),
-    ("claude-opus-4", 200_000),
-    ("claude-sonnet-4", 200_000),
-    ("claude-haiku-4", 200_000),
-    ("claude-opus", 200_000),
-    ("claude-sonnet", 200_000),
-    ("claude-haiku", 200_000),
-    ("claude-", 200_000),
-    ("gpt-5", 272_000),
-    ("gpt-4.1", 1_000_000),
-    ("gpt-4o", 128_000),
-    ("gpt-4", 128_000),
-    ("deepseek-reasoner", 128_000),
-    ("deepseek-chat", 128_000),
-    ("qwen", 128_000),
-)
-DEFAULT_CONTEXT_WINDOW = 128_000
+# 窗口数据已收敛到 model_registry（P2-5）：新增/核实模型只改那一处。
+# 匹配语义（first-match）保留在本模块。
+from .model_registry import DEFAULT_CONTEXT_WINDOW, MODEL_WINDOWS  # noqa: E402
 
 
 @dataclass
@@ -72,7 +43,7 @@ class ModelWindow:
 def window_for(model: str) -> int:
     """Return the known context-window size (input tokens) for *model*."""
     low = (model or "").lower()
-    for prefix, size in _MODEL_WINDOWS:
+    for prefix, size in MODEL_WINDOWS:
         if low.startswith(prefix):
             return size
     return DEFAULT_CONTEXT_WINDOW

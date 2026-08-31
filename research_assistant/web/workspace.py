@@ -140,9 +140,26 @@ def _fence(path: str | None, root: Path) -> Path:
         raise HTTPException(status_code=403, detail="路径越界，拒绝访问") from exc
 
 
-#: 预览/下载端点的敏感目标前缀：环境变量文件（.env*）、内部状态库目录
-#（.ra*，含 platform/sources sqlite）与版本库目录（.git*）。
-_PROTECTED_PREFIXES = (".env", ".ra", ".git")
+#: 预览/下载端点的敏感目标前缀（P1-5 扩展）。
+#:
+#: 匹配规则：相对路径**任一段**以下列任一前缀开头即拒绝（startswith，因此
+#: ``.env.local``、``.git-credentials``、``id_rsa.pub`` 一并覆盖）。
+#:
+#: 扩展动机：``switch_workspace_root`` 可把工作区根切到用户家目录，此时
+#: ``GET /api/workspace/file?path=.ssh/id_rsa`` 就是一条现成的私钥读取通道
+#: ——旧清单只有 ``.env/.ra/.git``，``.ssh``/``.aws``/``.netrc`` 全部可读。
+_PROTECTED_PREFIXES = (
+    # 环境变量 / 内部状态 / 版本库（原有三项）
+    ".env", ".ra", ".git",
+    # SSH / GPG 私钥与云凭证目录
+    ".ssh", ".aws", ".gnupg", ".kube", ".docker",
+    # 各类明文凭证文件
+    ".npmrc",          # npm auth token
+    ".netrc",          # 通用 host 凭证
+    ".pypirc",         # PyPI token
+    # 独立的 SSH 私钥文件（可能被复制出 .ssh 目录）
+    "id_rsa", "id_ed25519", "id_ecdsa", "id_dsa",
+)
 
 
 def _is_protected_target(target: Path, root: Path) -> bool:

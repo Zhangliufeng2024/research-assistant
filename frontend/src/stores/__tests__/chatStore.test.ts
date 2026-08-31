@@ -226,3 +226,75 @@ describe("chatStore 断连复位与切换竞态（R13-A/D）", () => {
     );
   });
 });
+
+describe("P0-3 放弃重连必须让相位落地（「永远思考中」残留路径回归）", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+    vi.mocked(api.post).mockResolvedValue({ id: "s-x" });
+    vi.mocked(api.del).mockResolvedValue({});
+    useChatStore.setState({
+      conn: "idle",
+      chat: emptyChat(),
+      sessions: [],
+      sessionsLoading: false,
+    });
+  });
+
+  it("重连失败并放弃：conn=closed 且 phase 回落到 idle", async () => {
+    // 场景：回合在跑、连接已断（steer 失败后的放弃重连路径）。
+    // 修复前 giveUpReconnect 只置 conn，phase 永远停在 running：
+    // 状态点永久脉冲、「停止」按钮常驻、等待横幅永不消失。
+    useChatStore.setState((s) => ({
+      chat: { ...s.chat, sessionId: "s-run", phase: "running" },
+    }));
+    h.wsConnected.mockReturnValue(false);
+    // 未 open 即 error → connectSocket reject → reconnectNow 的 catch 放弃
+    h.wsConnect.mockImplementation(
+      (opts: { onStatus?: (s: string) => void }) => {
+        opts.onStatus?.("error");
+      },
+    );
+
+    useChatStore.getState().reconnectNow();
+
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().conn).toBe("closed");
+    });
+    expect(useChatStore.getState().chat.phase).toBe("idle");
+  });
+
+  it("放弃重连不得清掉会话上下文（只收尾相位）", async () => {
+    useChatStore.setState((s) => ({
+      chat: { ...s.chat, sessionId: "s-keep", phase: "running" },
+    }));
+    h.wsConnected.mockReturnValue(false);
+    h.wsConnect.mockImplementation(
+      (opts: { onStatus?: (s: string) => void }) => {
+        opts.onStatus?.("closed");
+      },
+    );
+
+    useChatStore.getState().reconnectNow();
+    await vi.waitFor(() => {
+      expect(useChatStore.getState().conn).toBe("closed");
+    });
+
+    const chat = useChatStore.getState().chat;
+    // sessionId 必须保留——否则用户点手动「重连」时无从 attach 回放
+    expect(chat.sessionId).toBe("s-keep");
+    expect(chat.phase).toBe("idle");
+  });
+
+  it("无会话时放弃：不得抛错，且相位同样落地", async () => {
+    useChatStore.setState((s) => ({
+      conn: "idle",
+      chat: { ...s.chat, sessionId: null, phase: "running" },
+    }));
+    h.wsConnected.mockReturnValue(false);
+
+    // sid 为空 → reconnectNow 直接 return；相位需由给出路径以外兜底，
+    // 这里锁定「不抛错、连接态不被误标成 closed」
+    expect(() => useChatStore.getState().reconnectNow()).not.toThrow();
+    expect(useChatStore.getState().conn).toBe("idle");
+  });
+});

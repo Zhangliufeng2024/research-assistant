@@ -40,6 +40,21 @@ from .utils import (
     scan_paper_directory,
 )
 
+#: P2-5：记住上次加载配置的工作区。``load_project_env`` 以 ``override=True``
+#: 改写 ``os.environ``；此前**每个生成任务**都调一次，Web 多工作区并发时后到
+#: 的任务会把先到任务刚读好的环境变量改写掉——跨请求配置竞态（同一 cwd 只
+#: 需加载一次；切换工作区时才重载。设置页保存走 settings._apply_environ，
+#: 不经过这里，不受缓存影响）。
+_LAST_ENV_CWD: Path | None = None
+
+
+def _load_env_for(work_dir: Path) -> None:
+    global _LAST_ENV_CWD
+    if _LAST_ENV_CWD == work_dir:
+        return
+    load_project_env(work_dir)
+    _LAST_ENV_CWD = work_dir
+
 #: Interval in seconds between budget usage frames pushed to stream consumers.
 USAGE_TICK_INTERVAL = 1.0
 
@@ -112,7 +127,7 @@ async def generate_paper(
     start_time = time.time()
 
     work_dir = Path(cwd).resolve() if cwd else Path.cwd().resolve()
-    load_project_env(work_dir)
+    _load_env_for(work_dir)
 
     model = resolve_model(model)
 

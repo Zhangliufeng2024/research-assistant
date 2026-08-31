@@ -250,6 +250,9 @@ HIDDEN_IMPORTS = [
     "dotenv", "docx", "docx.opc", "docx.opc.constants",
     "research_assistant", "research_assistant.web",
     "research_assistant.web.app", "research_assistant.web.routes", "research_assistant.web.ws",
+    # R18 提示词增强端点。web/prompt.py 已由 app.py 静态导入（PyInstaller 能自动
+    # 收集），显式声明只为与 settings/workspace 等 web 子模块保持同一口径。
+    "research_assistant.web.prompt",
     "research_assistant.api", "research_assistant.agent", "research_assistant.cli",
     "research_assistant.config", "research_assistant.core", "research_assistant.constants",
     "research_assistant.models", "research_assistant.docgen", "research_assistant.orchestrator",

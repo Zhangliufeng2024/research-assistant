@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useMemo, useState } from "react";
 import { diffLines, diffStats, type DiffRow } from "@/lib/diff";
 import type { ToolCard as ToolCardData } from "@/lib/types";
 import { selectDebug, usePrefsStore } from "@/stores/prefsStore";
@@ -155,6 +155,11 @@ export function ToolCardView({
   const [open, setOpen] = useState(false);
   const debug = usePrefsStore(selectDebug);
   const summary = argsSummary(card);
+  // P2-7：diff 的 LCS 是 O(n·m)（上限 2000×2000 ≈ 16MB DP 表）。此前在
+  // render 内联调用——卡片展开期间，ChatView 的 1s nowTick 每次触发都会
+  // 对同一 card 重算一遍，展开一张大 apply_patch 卡即主线程长阻塞。
+  // useMemo 按引用缓存：card 内容不变就绝不重算。
+  const diffInputs = useMemo(() => diffInputsFor(card), [card]);
 
   return (
     <div className="overflow-hidden rounded-xl border border-edge bg-surface">
@@ -180,7 +185,7 @@ export function ToolCardView({
 
       {open && (
         <div className="space-y-2 border-t border-edge px-3.5 py-3">
-          {diffInputsFor(card).map((d, i) => (
+          {diffInputs.map((d, i) => (
             <DiffBlock key={`${d.path}-${i}`} path={d.path} rows={d.rows} />
           ))}
           {debug && Object.keys(card.args).length > 0 && (

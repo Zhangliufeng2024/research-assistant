@@ -100,6 +100,14 @@ def _reject_windows_hazard(file_path: str) -> str | None:
       系统重定向到设备吞掉内容（静默数据丢失），必须拒绝；
     - 盘符之外的冒号：NTFS 备用数据流（ADS）形态（file:stream），不属于
       普通文件语义，拒绝以防绕过版本跟踪与审阅。
+
+    调用面（P1-4 收敛说明，**全部三处都在本文件这一个实现上**）：
+    - ``write_file`` / ``edit_file`` / ``apply_patch`` —— 工具入口，命中即
+      **拒绝**（返回 Error 文案给模型）；
+    - ``web/chat.py:_safe_upload_name`` —— 附件文件名消毒，命中则**降级**
+      （名字加 ``_`` 前缀）而非拒绝：上传是用户主动操作，降级体验更好。
+    跨模块 import 私有名是因为两者需要**同一套判定规则**；这里的语义差异
+    （拒绝 vs 降级）是调用方的策略，不该复制成两份实现。
     """
     raw = Path(_unquote_path(file_path))
     name = raw.name
@@ -201,6 +209,13 @@ async def edit_file(
             （共享文件编辑兼容）；绝对路径行为完全不变。
     """
     raw = Path(_unquote_path(file_path))
+    # P1-4：edit 通道此前漏了 Windows 危险名校验——write_file 与 apply_patch
+    # 都在入口处拦（CON/NUL 等保留设备名、NTFS ADS 冒号路径），唯独 edit_file
+    # 没有，模型可以用 edit 绕过这两个通道的校验写设备文件。必须在 resolve
+    # 之前拦：保留设备名即便带扩展名也会被系统重定向吞掉内容。
+    hazard = _reject_windows_hazard(file_path)
+    if hazard is not None:
+        return hazard
     relative = not raw.is_absolute()
     p: Path
     if sandbox:

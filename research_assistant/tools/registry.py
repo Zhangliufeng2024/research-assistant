@@ -289,8 +289,13 @@ TOOL_DEFINITIONS: list[dict[str, Any]] = [
 
 
 def get_tool_schemas() -> list[dict[str, Any]]:
-    """Return tool definitions in the unified format (works for both providers)."""
-    return TOOL_DEFINITIONS
+    """Return tool definitions in the unified format (works for both providers).
+
+    返回拷贝而非全局表本身：调用方拿到后通常会 append 自定义工具，直接给
+    TOOL_DEFINITIONS 会让改动永久留在模块级状态里（同 ``get_schemas`` 的
+    教训）。当前项目内无调用点，但这是公开 API，防御性地返回副本。
+    """
+    return list(TOOL_DEFINITIONS)
 
 
 _TOOL_HANDLERS: dict[str, Callable[..., Awaitable[str]]] = {
@@ -516,9 +521,13 @@ class ToolRegistry:
             )
 
     def get_schemas(self) -> list[dict[str, Any]]:
+        # 必须是拷贝：下方要向 base 追加扩展定义，而 allowed_tools is None 时
+        # 直接拿 TOOL_DEFINITIONS 会让 append 写进模块级列表——那会永久污染
+        # 全局工具表（连新建的、从未注册扩展的 registry 也会看到别人家的
+        # 扩展），且每次调用都膨胀，重复 schema 每回合重复发给模型。
         base: list[dict[str, Any]]
         if self.allowed_tools is None:
-            base = TOOL_DEFINITIONS
+            base = list(TOOL_DEFINITIONS)
         else:
             base = [schema for schema in TOOL_DEFINITIONS if schema.get("name") in self.allowed_tools]
         # Merge declarative extensions into the visible tool surface.

@@ -447,17 +447,25 @@ async def list_sessions(request: Request):
     """
     root = _sessions_root(_cwd_of(request))
     _sweep_zero_turn_sessions(root, _outputs_root(_cwd_of(request)))
-    items: list[dict] = []
-    if root.is_dir():
-        for child in sorted(root.iterdir()):
-            if not child.is_dir() or child.name.startswith("."):
-                continue
-            if _load_run_state(child) is None:
-                continue  # 无 run.json 的杂散目录不算会话
-            try:
-                items.append(_session_summary(child))
-            except OSError:
-                continue  # 并发删除等竞态：跳过即可
+
+    def _scan() -> list[dict]:
+        # P2-3：目录遍历 + 逐会话读 run.json 必须离开事件循环——会话上百时
+        # 这是每次列表刷新都会触发的同步 IO，会把所有 /ws/chat、/ws/generate
+        # 的流式帧卡住。flags/counts 此前已经走 to_thread，这里对齐口径。
+        items: list[dict] = []
+        if root.is_dir():
+            for child in sorted(root.iterdir()):
+                if not child.is_dir() or child.name.startswith("."):
+                    continue
+                if _load_run_state(child) is None:
+                    continue  # 无 run.json 的杂散目录不算会话
+                try:
+                    items.append(_session_summary(child))
+                except OSError:
+                    continue  # 并发删除等竞态：跳过即可
+        return items
+
+    items = await asyncio.to_thread(_scan)
     store = getattr(request.app.state, "platform_store", None)
     if store is not None and items:
         ids = [str(item["id"]) for item in items]
@@ -1696,7 +1704,13 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
     outbox_dropped: list[int] = [0]
     sid = ""
     #: 本连接在 _SINKS 里的登记凭证（finally 按引用比对注销）。
-    sink_fn: Any = None
+    #:
+    #: 必须**只绑定一次**并全程复用同一对象：``outbox.put_nowait`` 每次属性
+    #: 访问都产生一个新的绑定方法对象，登记与注销各取一次的话 ``is`` 比对
+    #: 恒为假。修复前这个变量从未被赋值（C-3 重构引入 ``_register_connection``
+    #: 后漏接），导致 finally 的注销分支永远不成立，``_SINKS`` 按会话数无界
+    #: 增长——断连后条目仍指向死信箱，回合帧持续投递进永不被消费的队列。
+    sink_fn: Any = outbox.put_nowait
     #: 本连接正在观察的回合句柄：finally 时逐个释放名额——归零且回合仍在
     #: 跑则在那里武装孤儿看门狗。同一连接至多观察一个活动回合。
     watching: list[_TurnHandle] = []
@@ -1857,7 +1871,9 @@ async def ws_chat(websocket: WebSocket, session: str | None = None):
         #
         # 修复要点是让「读 previous → 写 _LIVE/_SINKS」落在**无 await 的
         # 原子段**内，把真正需要 await 的 close 挪出去用后台任务做。
-        previous = _register_connection(sid, websocket, outbox.put_nowait)
+        # 传 sink_fn（本连接一次性绑定的方法对象）而不是现场取
+        # outbox.put_nowait——后者是新对象，finally 的 `is` 比对会失配。
+        previous = _register_connection(sid, websocket, sink_fn)
         if previous is not None and previous is not websocket:
             # 被踢连接在自己的 finally 里释放观察者名额——若它正观察着活动
             # 回合且无新连接接替，孤儿看门狗会在那里武装。

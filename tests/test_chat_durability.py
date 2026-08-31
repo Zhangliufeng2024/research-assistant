@@ -620,3 +620,75 @@ class TestStructuredFieldsSurviveRewrite:
             {"name": "说明.txt", "path": str(att_file)}
         ], f"attachments 被历史写回清洗：{msgs[0]}"
         assert msgs[-1]["role"] == "assistant"
+
+
+class TestSinkDeregistration:
+    """P0-2 回归锁：连接断开必须从 _SINKS 摘除自己的信箱。
+
+    修复前 ``ws_chat`` 里的 ``sink_fn`` 声明为 None 却**从未赋值**（C-3 重构
+    引入 ``_register_connection`` 后漏接），finally 的
+    ``if sink_fn is not None and _SINKS.get(sid) is sink_fn`` 恒为假——
+    ``_SINKS[sid]`` 永不移除：进程生命期内按会话数无界增长，断连后条目仍
+    指向死信箱，回合帧持续投递进永不被消费的 asyncio.Queue（满后丢帧）。
+
+    同步约束：``outbox.put_nowait`` 每次属性访问都产生新的绑定方法对象，
+    因此登记与注销必须复用**同一引用**——这也是修复要一次性绑定 sink_fn
+    的原因（见 chat.py 内注释）。
+    """
+
+    SID = "dura-sink-x"
+
+    @pytest.fixture(autouse=True)
+    def _cleanup(self):
+        try:
+            yield
+        finally:
+            chat_mod._SINKS.pop(self.SID, None)
+            chat_mod._LIVE.pop(self.SID, None)
+
+    def test_sink_registered_then_removed(self, tmp_path, monkeypatch):
+        _install_fakes(monkeypatch, _happy_behavior)
+        sid = self.SID
+        with TestClient(_make_app(tmp_path)) as client:
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                assert ws.receive_json()["type"] == "connected"
+                assert sid in chat_mod._SINKS, "连接建立后未登记信箱"
+                assert sid in chat_mod._LIVE
+            # with 块退出 = 断开；登记表必须清空，否则按会话数泄漏
+            assert _wait_until(lambda: sid not in chat_mod._SINKS), (
+                f"断连后 _SINKS 仍残留 {sid}（注销分支未生效）"
+            )
+            assert _wait_until(lambda: sid not in chat_mod._LIVE)
+
+    def test_reconnect_replaces_sink_without_leak(self, tmp_path, monkeypatch):
+        """两条连接先后接手同一会话：登记表只保留后到者，且不残留。"""
+        _install_fakes(monkeypatch, _happy_behavior)
+        sid = self.SID
+        with TestClient(_make_app(tmp_path)) as client:
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws1:
+                ws1.receive_json()
+                first_sink = chat_mod._SINKS[sid]
+            assert _wait_until(lambda: sid not in chat_mod._SINKS)
+
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws2:
+                ws2.receive_json()
+                second_sink = chat_mod._SINKS[sid]
+                # 新连接拿到的是自己的信箱，不是上一条的尸体
+                assert second_sink is not first_sink
+            assert _wait_until(lambda: sid not in chat_mod._SINKS)
+
+    def test_sink_binding_is_stable(self, tmp_path, monkeypatch):
+        """结构性锁：登记进 _SINKS 的对象必须能在 finally 里按 is 比对命中。
+
+        若哪天有人改回现场取 ``outbox.put_nowait``，identity 比对会静默失配
+        并重新引入泄漏——这条断言把「必须复用同一绑定方法对象」固定下来。
+        """
+        _install_fakes(monkeypatch, _happy_behavior)
+        sid = self.SID
+        with TestClient(_make_app(tmp_path)) as client:
+            with client.websocket_connect(f"/ws/chat?session={sid}") as ws:
+                ws.receive_json()
+                sink = chat_mod._SINKS[sid]
+                # 绑定方法对象：__self__ 必须指向该队列，且可重复调用
+                assert sink.__self__ is not None
+                sink({"type": "noop"})  # 入箱成功即证明是活信箱

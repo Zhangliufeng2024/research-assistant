@@ -8,6 +8,7 @@
  * （移植自旧前端 ws.js；socket 登记表为模块级，路由切换不断连。）
  */
 import type { ConnStatus, ServerFrame, WsChannel } from "./types";
+import { apiToken } from "./apiToken";
 
 const PATHS: Record<WsChannel, string> = { task: "/ws/generate", chat: "/ws/chat" };
 
@@ -55,7 +56,12 @@ export function wsConnect({
   onStatus?: (status: ConnStatus) => void;
 }): WebSocket {
   wsClose(channel);
-  const path = (PATHS[channel] ?? channel) + (query ? `?${query}` : "");
+  // P1-3：浏览器 API 无法给 WebSocket 设自定义请求头，token 只能走查询串。
+  // 后端在守卫中间件里同时接受头（REST）与查询串（WS）两种携带方式。
+  const token = apiToken();
+  const sep = query ? "&" : "?";
+  const auth = token ? `${sep}token=${encodeURIComponent(token)}` : "";
+  const path = (PATHS[channel] ?? channel) + (query ? `?${query}` : "") + auth;
   onStatus?.("connecting");
 
   const proto = location.protocol === "https:" ? "wss:" : "ws:";

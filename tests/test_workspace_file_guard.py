@@ -65,6 +65,58 @@ class TestProtectedTargets:
         assert _get(client, ".env.production").status_code == 403
 
 
+class TestProtectedTargetsP1Extended:
+    """P1-5：``switch_workspace_root`` 可把根切到家目录，此时 ``.ssh/id_rsa``
+    就是一条现成的私钥读取通道——旧清单只有 .env/.ra/.git 三项。
+
+    用例在 fixture 根下补建各类凭证样本并逐一断言 403；且**不存在的**敏感
+    路径同样 403（不能借 404 探测）。
+    """
+
+    @pytest.fixture(autouse=True)
+    def _seed_credentials(self, tmp_path, client):
+        # 依赖 client：保证根目录已由 client fixture 创建
+        root = tmp_path / "ws"
+        ssh = root / ".ssh"
+        ssh.mkdir(exist_ok=True)
+        (ssh / "id_rsa").write_text("PRIVATE KEY", encoding="utf-8")
+        aws = root / ".aws"
+        aws.mkdir(exist_ok=True)
+        (aws / "credentials").write_text("[default]", encoding="utf-8")
+        (root / ".npmrc").write_text("//x/:_authToken=t", encoding="utf-8")
+        (root / ".netrc").write_text("machine x login u", encoding="utf-8")
+
+    @pytest.mark.parametrize("path", [
+        ".ssh/id_rsa",
+        ".ssh/id_ed25519",
+        ".ssh/known_hosts",
+        ".aws/credentials",
+        ".gnupg/private-keys-v1.d/x.key",
+        ".kube/config",
+        ".docker/config.json",
+        ".npmrc",
+        ".netrc",
+        ".pypirc",
+        "backups/id_rsa",          # 被复制出 .ssh 的私钥
+        "deep/nested/.aws/config",  # 任意深度任一段命中
+    ])
+    def test_credential_paths_rejected(self, client, path):
+        assert _get(client, path).status_code == 403, path
+
+    @pytest.mark.parametrize("path", [
+        ".ssh/missing_key",
+        ".aws/nonexistent",
+        "id_ed25519.backup",
+    ])
+    def test_missing_credential_paths_still_rejected(self, client, path):
+        """不能借 404 探测凭证文件是否存在（与 .env 行为对齐）。"""
+        assert _get(client, path).status_code == 403, path
+
+    def test_normal_files_still_readable(self, client):
+        assert _get(client, "notes.md").status_code == 200
+        assert _get(client, "docs/readme.txt").status_code == 200
+
+
 class TestNormalFilesUnaffected:
     def test_markdown_preview(self, client):
         resp = _get(client, "notes.md")

@@ -31,6 +31,17 @@ _SEG_SPLIT_RE = re.compile(r"&&|\|\||[|&;\r\n]")
 _CMD_PREFIX_TOKENS = frozenset({"call", "start", "cmd", "cmd.exe"})
 _PREFIX_MAX_DEPTH = 4  # call cmd /c python … 的前缀链防御性深度上限
 
+#: P1-6：这些命令的**后续参数**是文本/文件路径而非可执行名——其中出现
+#: ``python`` 字样不算调用（``grep python notes.txt``、``where python``）。
+#: 仅比对紧邻前一个 token：前缀链外的包装器（wsl/pwsh/conhost/…）不在表里，
+#: 其后的 python 正常命中。
+_ARG_CONSUMERS = frozenset({
+    "grep", "egrep", "fgrep", "findstr", "find", "echo", "type", "cat",
+    "less", "more", "head", "tail", "wc", "sort", "uniq", "man", "help",
+    "where", "which", "dir", "tree", "fc", "comp", "curl", "wget",
+    "code", "notepad", "git",
+})
+
 _QUOTE_CHARS = "\"'"
 
 # Windows 下抑制子进程控制台窗（Bug B）：getattr 兼容非 Windows 平台导入。
@@ -43,12 +54,18 @@ def _segments(command: str) -> list[str]:
 
 
 def _tokens(segment: str) -> list[str]:
-    """按空白切分但尊重双引号——引号内空格不分段（带空格路径是一个 token）。"""
+    """按空白切分但尊重引号——引号内空格不分段（带空格路径是一个 token）。
+
+    P1-6：此前只识别双引号，单引号包裹的带空格路径
+    （``'C:\\Program Files\\Python311\\python.exe' a.py``）会在空格处断开，
+    basename 变成 ``Program``，python 检测随之失配。单双引号都按翻转处理
+    （尽力而为的分词器，不是完整 shell 解析器）。
+    """
     out: list[str] = []
     buf: list[str] = []
     in_quote = False
     for ch in segment:
-        if ch == '"':
+        if ch in _QUOTE_CHARS:
             in_quote = not in_quote
             buf.append(ch)
         elif ch in " \t" and not in_quote:
@@ -87,6 +104,8 @@ def _is_python_invocation(segment: str) -> bool:
 
     边界声明：%VAR% 间接引用（如 ``%PY% x.py``）**不做**静态展开识别——
     需要运行时环境变量才能解析，属于已知盲区，明确不在本函数处理范围。
+    无引号文本里的 python 字样（``echo run python now``）可能误报——守卫
+    只拒绝执行并提示改用 run_python，无副作用，属可接受残余（P1-6）。
     """
     tokens = _tokens(segment)
     i = 0
@@ -100,8 +119,11 @@ def _is_python_invocation(segment: str) -> bool:
         # 覆盖 python3.12/pythonw 之类写法（但不误伤 ipython 等）
         if exe.startswith("python"):
             return True
+        # 注意不能在这里直接 return False：那会让兜底的全 token 扫描永远
+        # 执行不到（wsl/python 之类未知包装器正是从这里漏掉的），改为 break
+        # 落到 _scan_all_tokens_for_python。
         if exe not in _CMD_PREFIX_TOKENS or depth >= _PREFIX_MAX_DEPTH:
-            return False
+            break
         j = i + 1
         # 跳过以 / 开头的开关参数（cmd /c /d …）
         while j < len(tokens) and tokens[j].startswith("/"):
@@ -117,6 +139,33 @@ def _is_python_invocation(segment: str) -> bool:
                 j += 1
         i = j
         depth += 1
+    return _scan_all_tokens_for_python(tokens)
+
+
+def _scan_all_tokens_for_python(tokens: list[str]) -> bool:
+    """P1-6 兜底：**任意位置**出现 python/pip 可执行名都算调用。
+
+    旧实现只在首个可执行位匹配，遇到未知包装器直接 ``return False``——
+    ``wsl python a.py`` / ``pwsh -Command python a.py`` / ``conhost python a.py``
+    / ``runas /user:x python a.py`` 因此全部漏检。
+
+    误报抑制：一旦本段出现过参数消费型命令（``grep``/``where``/``findstr``,
+    其后续 token 是文本/文件而非可执行名），其后的 python 字样一律跳过。
+    必须看**整段前缀**而非紧邻前驱——``grep -r python .`` 里 python 的前驱
+    是开关 ``-r``，只看紧邻会漏抑制。复合命令经 ``_segments`` 切分后
+    ``python x.py`` 独立成段，不受影响。
+
+    残余盲区照旧声明：无引号的 ``echo run python now`` 会误报——守卫只是
+    拒绝执行并提示改用 run_python，不产生副作用，可接受。
+    """
+    saw_consumer = False
+    for token in tokens:
+        if _exe_basename(token) in _ARG_CONSUMERS:
+            saw_consumer = True
+            continue
+        exe = _exe_basename(token)
+        if not saw_consumer and (exe in _PY_INVOKABLE or exe.startswith("python")):
+            return True
     return False
 
 

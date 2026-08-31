@@ -55,6 +55,24 @@ class _ScriptedClient(LLMClient):
         )
 
 
+class _ChunkThenFail(_ScriptedClient):
+    """先吐若干增量再失败——用于验证「已发布正文则不降级」。"""
+
+    def __init__(self, *, chunks: list[str], **kw):
+        super().__init__(**kw)
+        self.chunks = list(chunks)
+
+    async def chat(self, messages, *, system="", tools=None, temperature=0.7,
+                   max_tokens=16384, on_chunk=None, on_activity=None, on_thought=None):
+        self.calls += 1
+        for delta in self.chunks:
+            if on_chunk is not None:
+                result = on_chunk(delta)
+                if result is not None:
+                    await result
+        raise RuntimeError("吐字后失败")
+
+
 class TestFallbackChain:
     def test_primary_success_no_fallback(self):
         primary = _ScriptedClient(model="primary")
@@ -116,6 +134,107 @@ class TestFallbackChain:
     def test_empty_chain_is_rejected(self):
         with pytest.raises(ValueError):
             FallbackLLMClient([])
+
+    # ---- P0-4：取消/中断语义不得被降级链吞掉 ----------------------------
+
+    def test_cancellation_is_not_swallowed_by_fallback(self):
+        """P0-4 红线：CancelledError 必须立即上抛。
+
+        修复前 ``except BaseException`` 会把取消一并捕获并继续尝试下一个
+        候选——用户点「停止」后本端仍向备选模型发一次完整请求并计费，
+        取消语义彻底失效。
+        """
+        primary = _ScriptedClient(
+            model="primary", fail_times=5, error=asyncio.CancelledError(),
+        )
+        backup = _ScriptedClient(model="backup")
+        chain = FallbackLLMClient([primary, backup], labels=["p", "b"])
+
+        with pytest.raises(asyncio.CancelledError):
+            asyncio.run(chain.chat([{"role": "user", "content": "hi"}]))
+
+        assert backup.calls == 0, "取消后不得再向备选模型发起请求"
+
+    def test_keyboard_interrupt_is_not_swallowed(self):
+        """KeyboardInterrupt / SystemExit 同样不是「该候选不可用」的信号。"""
+        primary = _ScriptedClient(
+            model="primary", fail_times=5, error=KeyboardInterrupt(),
+        )
+        backup = _ScriptedClient(model="backup")
+        chain = FallbackLLMClient([primary, backup])
+
+        with pytest.raises(KeyboardInterrupt):
+            asyncio.run(chain.chat([{"role": "user", "content": "hi"}]))
+
+        assert backup.calls == 0
+
+    # ---- P0-5：已发布正文后禁止降级 -------------------------------------
+
+    def test_no_fallback_after_publishing_chunks(self):
+        """P0-5 红线：吐过正文后失败不得换模型。
+
+        换模型会让前后风格突变、内容重复，而**已发布的增量无法撤回**。
+        这是 fallback.py docstring 早有承诺、但代码从未实现的语义。
+        """
+        primary = _ChunkThenFail(model="primary", chunks=["你好", "，世界"])
+        backup = _ScriptedClient(model="backup")
+        chain = FallbackLLMClient([primary, backup], labels=["p", "b"])
+
+        seen: list[str] = []
+        with pytest.raises(RuntimeError, match="吐字后失败"):
+            asyncio.run(chain.chat(
+                [{"role": "user", "content": "hi"}],
+                on_chunk=seen.append,
+            ))
+
+        assert seen == ["你好", "，世界"], "增量必须完整透传给调用方"
+        assert backup.calls == 0, "已发布正文后不得切换备选模型"
+
+    def test_fallback_allowed_when_nothing_published(self):
+        """对照组：尚未吐出任何增量时才允许降级（docstring 承诺的另一半）。"""
+        primary = _ChunkThenFail(model="primary", chunks=[])
+        backup = _ScriptedClient(model="backup")
+        chain = FallbackLLMClient([primary, backup], labels=["p", "b"])
+
+        out = asyncio.run(chain.chat(
+            [{"role": "user", "content": "hi"}],
+            on_chunk=lambda _d: None,
+        ))
+
+        assert out.content == "from-backup"
+        assert backup.calls == 1
+
+    def test_empty_delta_does_not_count_as_published(self):
+        """空串增量不是「已发布」——心跳/空帧不应误伤降级能力。"""
+        primary = _ChunkThenFail(model="primary", chunks=["", ""])
+        backup = _ScriptedClient(model="backup")
+        chain = FallbackLLMClient([primary, backup])
+
+        out = asyncio.run(chain.chat(
+            [{"role": "user", "content": "hi"}],
+            on_chunk=lambda _d: None,
+        ))
+
+        assert out.content == "from-backup", "空增量不应阻断降级"
+
+    def test_async_on_chunk_callback_is_awaited(self):
+        """回调可能是协程函数（OnChunkCallback 允许返回 awaitable）——
+        包装层必须 await 它，否则调用方的异步记账会静默丢失。"""
+        primary = _ChunkThenFail(model="primary", chunks=["a"])
+        chain = FallbackLLMClient([primary], labels=["p"])
+
+        seen: list[str] = []
+
+        async def slow_sink(delta: str) -> None:
+            await asyncio.sleep(0)
+            seen.append(delta)
+
+        with pytest.raises(RuntimeError):
+            asyncio.run(chain.chat(
+                [{"role": "user", "content": "hi"}], on_chunk=slow_sink,
+            ))
+
+        assert seen == ["a"], "异步回调未被 await"
 
     def test_active_model_reflects_last_success(self):
         primary = _ScriptedClient(model="primary", fail_times=1)

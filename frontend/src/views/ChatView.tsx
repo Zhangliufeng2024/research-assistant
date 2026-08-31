@@ -28,7 +28,7 @@ import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { PlanCard } from "@/components/chat/PlanCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
 import { BudgetBar } from "@/components/chat/BudgetBar";
-import { Composer } from "@/components/chat/Composer";
+import { Composer, type EnhanceOutcome } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
 import { MessageList } from "@/components/chat/MessageList";
 import {
@@ -290,6 +290,26 @@ export function ChatView({ active = true }: { active?: boolean }) {
       return r;
     },
     [send, refreshSessions],
+  );
+
+  /** R18 提示词增强：一次独立的短请求，不进会话历史、不占回合。
+   * 失败一律保留原文并回传原因——绝不静默吞掉，也绝不改动用户写好的话。 */
+  const handleEnhance = useCallback(
+    async (text: string): Promise<EnhanceOutcome> => {
+      try {
+        const r = await api.post<{ ok: boolean; enhanced?: string; error?: string }>(
+          "/api/prompt/enhance",
+          { text },
+          60_000,
+        );
+        if (r.ok && r.enhanced) return { ok: true, text: r.enhanced };
+        return { ok: false, error: r.error || "模型未返回有效内容，请重试" };
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        return { ok: false, error: `提示词增强失败：${msg}` };
+      }
+    },
+    [],
   );
 
   const title = chat.sessionId
@@ -570,6 +590,7 @@ export function ChatView({ active = true }: { active?: boolean }) {
             })
           }
           onRemoveAttachment={removePendingAttachment}
+          onEnhance={handleEnhance}
         />
 
         {/* 工作目录入口（R8 反馈 #1：Claude Desktop 式，对话框下方随时更换） */}

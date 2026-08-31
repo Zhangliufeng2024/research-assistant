@@ -93,6 +93,12 @@ def load_project_env(work_dir: Path) -> None:
     缺陷 G：托管四键以**全局文件为终局裁决**——设置页写入的新值不再被
     工作区残留的旧 Key 压掉（全局文件里非空的托管键强制生效）；非托管键
     行为不变，仍是工作区覆盖层获胜。
+
+    语义边界（P2-5 交叉标注）：本函数 ``override=True``，**会改写调用方
+    已设置的环境变量**——这是 Web 权威口径，但因此**不能**每个请求都调：
+    多工作区并发时后到的会改写先到的。调用方必须走 ``api._load_env_for``
+    的按 cwd 缓存。CLI 入口用的是 ``core.ensure_dotenv_loaded``
+    （override=False，只加载不覆盖），两者语义刻意不同，勿混用。
     """
     global_path = app_config_env_path()
     for env_file in (global_path, work_dir / ".env"):

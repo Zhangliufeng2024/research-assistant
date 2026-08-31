@@ -235,17 +235,17 @@ def count_citations_in_bib(bib_file: str | None) -> int:
 
 
 def extract_citation_style(bib_file: str | None) -> str:
-    """
-    Try to extract citation style from BibTeX file or paper metadata.
+    """返回固定的引用风格常量（**当前是占位实现**）。
 
-    Args:
-        bib_file: Path to the .bib file.
+    ⚠️ 行为如实声明（P2-10 修正：旧 docstring 声称会「尝试提取」，实际从不
+    解析）：本函数无条件返回 ``"BibTeX"``，**不读取** *bib_file* 的任何内容。
+    因此 ``api.generate_paper`` 组装结果里展示给前端的「引用风格」目前是
+    常量占位，不是从文献检测出来的真实风格。
 
-    Returns:
-        Citation style name (default: "BibTeX").
+    若要实现真提取（解析 \\bibliographystyle 命令 / .cls 文件名），属于功能
+    新增，需另行排期——修 docstring 不改变行为是刻意的，避免把功能开发混进
+    修订批次。
     """
-    # This is a simple heuristic - in practice, the style might be
-    # specified in the LaTeX file or progress log
     return "BibTeX"
 
 
