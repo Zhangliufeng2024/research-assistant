@@ -221,39 +221,40 @@ class ArtifactVersionStore:
         }
         total = 0
         count = 0
+        # 工程债：惰性遍历替代 sorted(rglob) 全量物化——巨型目录下不再
+        # 一次性构造全部 Path；max_files 截断兜底，枚举顺序变化不影响集合。
         try:
-            candidates = sorted(directory.rglob("*"))
+            for path in directory.rglob("*"):
+                if count >= max_files:
+                    stats["truncated"] = True
+                    break
+                if not path.is_file():
+                    continue
+                # 排除版本存储自身的目录与执行中间脚本，避免自我索引/噪音
+                if ".ra" in path.parts or path.name.startswith("_ra_"):
+                    continue
+                try:
+                    resolved = safe_resolve(path, self.workspace)
+                    size = resolved.stat().st_size
+                    if size > max_bytes or total + size > max_bytes:
+                        stats["skipped_oversized"] += 1
+                        continue
+                    data = resolved.read_bytes()
+                except (OSError, ValueError):
+                    continue
+                rel = resolved.relative_to(self.workspace).as_posix()
+                if _sha(data) == last_hash.get(rel):
+                    continue        # 内容未变，不重复登记
+                try:
+                    if self.record(resolved, None, data, tool=tool) is not None:
+                        stats["recorded"] += 1
+                        count += 1
+                        total += size
+                        last_hash[rel] = _sha(data)
+                except (OSError, ValueError):
+                    continue
         except OSError:
             return stats
-        for path in candidates:
-            if count >= max_files:
-                stats["truncated"] = True
-                break
-            if not path.is_file():
-                continue
-            # 排除版本存储自身的目录与执行中间脚本，避免自我索引/噪音
-            if ".ra" in path.parts or path.name.startswith("_ra_"):
-                continue
-            try:
-                resolved = safe_resolve(path, self.workspace)
-                size = resolved.stat().st_size
-                if size > max_bytes or total + size > max_bytes:
-                    stats["skipped_oversized"] += 1
-                    continue
-                data = resolved.read_bytes()
-            except (OSError, ValueError):
-                continue
-            rel = resolved.relative_to(self.workspace).as_posix()
-            if _sha(data) == last_hash.get(rel):
-                continue        # 内容未变，不重复登记
-            try:
-                if self.record(resolved, None, data, tool=tool) is not None:
-                    stats["recorded"] += 1
-                    count += 1
-                    total += size
-                    last_hash[rel] = _sha(data)
-            except (OSError, ValueError):
-                continue
         return stats
 
     def diff(self, change_id: str) -> dict[str, Any]:

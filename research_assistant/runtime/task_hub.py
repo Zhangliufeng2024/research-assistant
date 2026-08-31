@@ -61,6 +61,10 @@ class TaskHandle:
     task_id: str
     query: str
     project_id: str
+    #: 工程债（帧级建连合并）：start() 创建线程/回合时即缓存到句柄，
+    #: _drive 逐帧持久化不再 get_task 读 metadata（一帧少一次建连）。
+    thread_id: str | None = None
+    turn_id: str | None = None
     cancel_event: asyncio.Event = field(default_factory=asyncio.Event)
     approvals: asyncio.Queue = field(default_factory=asyncio.Queue)
     steers: asyncio.Queue = field(default_factory=asyncio.Queue)
@@ -118,6 +122,8 @@ class BackgroundTaskHub:
             source_task_id=task_id, metadata={"workflow_id": task_metadata.get("workflow_id"), "legacy_task_id": task_id},
         )
         turn = self.store.create_turn(thread_id=thread["id"], project_id=project_id, user_input=query, metadata={"task_id": task_id})
+        handle.thread_id = thread["id"]
+        handle.turn_id = turn["id"]
         task_metadata["thread_id"] = thread["id"]
         task_metadata["turn_id"] = turn["id"]
         task_metadata["research_run_id"] = research_run["id"]
@@ -134,34 +140,19 @@ class BackgroundTaskHub:
             async for frame in runner_factory(handle):
                 if frame.get("type") == "usage" and isinstance(frame.get("budget"), dict):
                     latest_usage = dict(frame["budget"])
-                    if frame.get("agent_id"):
-                        self.store.update_agent_run(
-                            handle.task_id, str(frame["agent_id"]),
-                            budget=dict(frame["budget"]),
-                        )
-                if frame.get("type") == "agent_status" and frame.get("agent_id"):
-                    self.store.update_agent_run(
-                        handle.task_id, str(frame["agent_id"]),
-                        status=str(frame.get("status") or "pending"),
-                        role=str(frame.get("role") or "") or None,
-                    )
-                if frame.get("type") not in {"usage"}:
-                    task_record = self.store.get_task(handle.task_id) or {}
-                    metadata = task_record.get("metadata") or {}
-                    thread_id = metadata.get("thread_id")
-                    turn_id = metadata.get("turn_id")
-                    if thread_id:
-                        self.store.append_agent_item(
-                            thread_id=str(thread_id), project_id=handle.project_id,
-                            turn_id=str(turn_id) if turn_id else None,
-                            item_type=str(frame.get("type") or "event"),
-                            title=str(frame.get("stage") or frame.get("type") or ""),
-                            content=frame,
-                            status="error" if frame.get("type") == "error" else "complete",
-                        )
                 if frame.get("type") == "result" and frame.get("status") == "failed":
                     handle.status = "failed"
-                await self.publish(handle.task_id, frame)
+                # 工程债：帧级副作用（step 状态/agent_run/thread item/event）
+                # 合并为一次建连一个事务；旧实现一帧最多 4 次建连。
+                seq = await asyncio.to_thread(self._persist_frame_full, handle, frame)
+                message = {**frame, "seq": seq}
+                for queue in tuple(handle.subscribers):
+                    if queue.full():
+                        try:
+                            queue.get_nowait()
+                        except asyncio.QueueEmpty:
+                            pass  # 控制流：腾位与消费方之间的极窄竞态
+                    queue.put_nowait(message)
             if handle.cancel_event.is_set():
                 handle.status = "cancelled"
             elif handle.status != "failed":
@@ -262,6 +253,57 @@ class BackgroundTaskHub:
                 elif step_id in known_steps:
                     _advance_steps(self.store, conn, task_id, step_id)
                     self.store._update_step_conn(conn, task_id, step_id, status="running")
+            return self.store._append_event_conn(conn, task_id, frame)
+
+    def _persist_frame_full(self, handle: TaskHandle, frame: dict[str, Any]) -> int:
+        """一帧一次建连/一个事务：step 状态 + agent_run + thread item + event。
+
+        ``_persist_frame`` 只处理 step + event（供 publish/测试），本方法是
+        _drive 热路径的完整版——把原逐帧分散的 get_task/update_agent_run/
+        append_agent_item/append_event 合并进同一事务。行为与原实现逐分支
+        等价（见 _drive 的旧代码），异常时整体回滚。
+        """
+        task_id = handle.task_id
+        step_id = _step_for_frame(frame)
+        with self.store.transaction() as conn:
+            if step_id:
+                details = frame.get("details")
+                explicit_status = (
+                    details.get("status") if isinstance(details, dict) else None
+                )
+                known_steps = {
+                    step["id"] for step in self.store._list_steps_conn(conn, task_id)
+                }
+                if step_id in known_steps and explicit_status in {
+                    "resumed", "done", "failed", "cancelled", "skipped",
+                }:
+                    self.store._update_step_conn(
+                        conn, task_id, step_id,
+                        status="done" if explicit_status == "resumed" else explicit_status,
+                    )
+                elif step_id in known_steps:
+                    _advance_steps(self.store, conn, task_id, step_id)
+                    self.store._update_step_conn(conn, task_id, step_id, status="running")
+            ftype = frame.get("type")
+            agent_id = frame.get("agent_id")
+            if agent_id and ftype == "usage" and isinstance(frame.get("budget"), dict):
+                self.store._update_agent_run_conn(
+                    conn, task_id, str(agent_id), budget=dict(frame["budget"]),
+                )
+            elif agent_id and ftype == "agent_status":
+                self.store._update_agent_run_conn(
+                    conn, task_id, str(agent_id),
+                    status=str(frame.get("status") or "pending"),
+                    role=str(frame.get("role") or "") or None,
+                )
+            if ftype != "usage" and handle.thread_id:
+                self.store._append_agent_item_conn(
+                    conn, thread_id=handle.thread_id, project_id=handle.project_id,
+                    turn_id=handle.turn_id, item_type=str(ftype or "event"),
+                    title=str(frame.get("stage") or ftype or ""),
+                    content=frame,
+                    status="error" if ftype == "error" else "complete",
+                )
             return self.store._append_event_conn(conn, task_id, frame)
 
     def subscribe(self, task_id: str, after: int = 0) -> asyncio.Queue | None:

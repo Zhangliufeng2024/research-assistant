@@ -62,6 +62,10 @@ class AgentResult:
     #: "completed" | "cancelled" | "budget_exceeded" | "max_turns" | "max_continuations"
     stop_reason: str = "completed"
     budget_snapshot: dict[str, Any] = field(default_factory=dict)
+    #: 子代理身份（P1 统一：orchestrator 曾自建一份字段不同的 AgentResult，
+    #: 现收敛到内核这一份；单代理/CLI 不使用这两个字段，保持默认空串）。
+    agent_id: str = ""
+    agent_role: str = ""
 
 
 OnTextCallback = Callable[[str], Awaitable[None] | None]
@@ -1002,8 +1006,13 @@ async def _execute_tool_batch(
             "content": result_text,
             # Providers surface this to the model (Anthropic sets
             # is_error on the tool_result block).
+            # 修复（工程债）：工具层实际返回的前缀是 "Error executing …" /
+            # "Error reading …" / "Error writing …" 等，旧判定只认 "Error:"
+            # 导致 Anthropic 侧工具失败不标 is_error、模型把报错当正常结果
+            # 继续推理。统一按 "Error" 前缀 + DENIED 标记判定（工具契约：
+            # 一切错误回执都以 Error 开头，见 tools/registry.py、file_ops.py）。
             "is_error": result_text.startswith(
-                ("Error:", "[DENIED by policy]", "[DENIED by approval]")),
+                ("Error", "[DENIED by policy]", "[DENIED by approval]")),
         })
         mirror.log_append(state.messages[-1])
     return False

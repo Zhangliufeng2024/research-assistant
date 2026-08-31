@@ -18,7 +18,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from .agent import run_agent
+from .agent import AgentResult, run_agent
 from .constants import OUTPUT_SUBDIRS
 from .core import execution_contract_addendum
 from .llm.factory import create_llm_client
@@ -63,18 +63,6 @@ class OrchestrationPlan:
     figures: list[FigurePlan] = field(default_factory=list)
     total_estimated_words: int = 0
     citation_target: int = 30
-
-
-@dataclass
-class AgentResult:
-    agent_id: str
-    agent_role: str
-    success: bool
-    text_output: str = ""
-    files_written: list[str] = field(default_factory=list)
-    error: str | None = None
-    duration_seconds: float = 0.0
-    token_usage: TokenUsage | None = None
 
 
 async def _run_sub_agent(  # noqa: PLR0913

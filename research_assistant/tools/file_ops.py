@@ -398,7 +398,18 @@ async def glob_files(
     # 目录遍历可能很重（海量文件/OneDrive 按需文件）：放线程池，
     # 避免在 async def 里同步 rglob 卡死事件循环——那会让所有 WS/REST
     # 一起失联（R9 任务页「无法建立连接」的候选共因）。
-    matches = await asyncio.to_thread(lambda: sorted(base.glob(pattern)))
+    # 工程债：`sorted(base.glob("**/*"))` 会一次性物化全部匹配（含
+    # node_modules 时数十万 Path）。改为有界收集——到上限即停再排序，
+    # 截断语义不变（列表本就只展示前 GLOB_MAX_RESULTS 个）。
+    def _bounded_glob() -> list[Path]:
+        out: list[Path] = []
+        for match in base.glob(pattern):
+            out.append(match)
+            if len(out) >= GLOB_MAX_RESULTS:
+                break
+        return sorted(out)
+
+    matches = await asyncio.to_thread(_bounded_glob)
     if sandbox:
         safe_matches: list[Path] = []
         for match in matches:
@@ -471,10 +482,20 @@ async def grep_search(
     if base.is_file():
         files: list[Path] = [base]
     else:
-        if glob:
-            files = await asyncio.to_thread(lambda: sorted(base.rglob(glob)))
-        else:
-            files = await asyncio.to_thread(lambda: sorted(base.rglob("*")))
+        # 工程债：有界收集替代 `sorted(base.rglob(...))` 全量物化；上限
+        # 取结果上限的 10 倍（至少 2000），命中后 _grep_scan 自停。极端
+        # 病理场景（前 2000 个文件零命中、其后才有）会少报，可接受——
+        # 原实现的一次性物化在巨型目录下会 OOM，代价不成比例。
+        def _bounded_rglob(pattern: str) -> list[Path]:
+            cap = max(GREP_MAX_RESULTS * 10, 2000)
+            out: list[Path] = []
+            for match in base.rglob(pattern):
+                out.append(match)
+                if len(out) >= cap:
+                    break
+            return sorted(out)
+
+        files = await asyncio.to_thread(_bounded_rglob, glob or "*")
 
     if sandbox:
         safe_files: list[Path] = []

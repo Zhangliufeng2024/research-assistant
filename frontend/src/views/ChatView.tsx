@@ -1,29 +1,23 @@
-/* 会话区（阶段 4 / U-4 常驻化）：会话抽屉外置 + 聊天流 + 审批卡 + 输入区
- * + 检查器（宽屏内联 / 窄屏抽屉）。
- *
- * 本组件由 App 布局**常驻挂载**（不再作为路由视图卸载）：路由只决定它的
- * 可见性（CSS display 切换）与 /chat/:sessionId 深链同步。切换会话时
- * 输入草稿经 sessionStore 按会话 id 持久化，滚动锚点同理（离开前保存、
- * 重进时恢复）。
- */
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { Link, useLocation, useNavigate } from "react-router-dom";
+import { useCallback, useEffect, useMemo, useState } from "react";
+import { Link } from "react-router-dom";
 import { AnimatePresence, motion } from "framer-motion";
 import { api } from "@/lib/api";
 import { CHAT_PHASE_LABEL } from "@/lib/protocolChat";
 import { candidatePreviewPaths } from "@/lib/artifacts";
-import { copyText } from "@/lib/clipboard";
 import { sessionTitle } from "@/lib/format";
-import type { MessageOpResult } from "@/lib/messageOps";
 import { shouldShowWaitHint } from "@/lib/waitHint";
-import type { SettingsData, WorkspaceInfo } from "@/lib/types";
 import { useChatStore } from "@/stores/chatStore";
-import { NEW_DRAFT_KEY, useSessionStore } from "@/stores/sessionStore";
-import { useUiStore } from "@/stores/uiStore";
+import { NEW_DRAFT_KEY } from "@/stores/sessionStore";
 import { usePrefsStore, type Verbosity } from "@/stores/prefsStore";
-import { toast } from "@/stores/toastStore";
 import { usePinnedScroll } from "@/hooks/usePinnedScroll";
-import { useMediaQuery } from "@/hooks/useMediaQuery";
+import { useChatBootstrap } from "@/hooks/useChatBootstrap";
+import { useChatDockRefresh } from "@/hooks/useChatDockRefresh";
+import { useChatInspector } from "@/hooks/useChatInspector";
+import { useChatMessageActions } from "@/hooks/useChatMessageActions";
+import { useChatScrollAnchors } from "@/hooks/useChatScrollAnchors";
+import { useChatSessionRouting } from "@/hooks/useChatSessionRouting";
+import { useChatSplitPeer } from "@/hooks/useChatSplitPeer";
+import { useChatWaitWatchdog } from "@/hooks/useChatWaitWatchdog";
 import { ApprovalCard } from "@/components/chat/ApprovalCard";
 import { PlanCard } from "@/components/chat/PlanCard";
 import { ArtifactsPanel } from "@/components/chat/ArtifactsPanel";
@@ -31,13 +25,7 @@ import { BudgetBar } from "@/components/chat/BudgetBar";
 import { Composer, type EnhanceOutcome } from "@/components/chat/Composer";
 import { FilePreviewModal } from "@/components/chat/FilePreviewModal";
 import { MessageList } from "@/components/chat/MessageList";
-import {
-  PeerSessionPanel,
-  loadPeerSessionId,
-  loadSplitOpen,
-  savePeerSessionId,
-  saveSplitOpen,
-} from "@/components/chat/PeerSessionPanel";
+import { PeerSessionPanel } from "@/components/chat/PeerSessionPanel";
 import { WorkspaceModal } from "@/components/chat/WorkspaceModal";
 import { NotificationsButton } from "@/components/layout/WorkspaceSearch";
 
@@ -48,7 +36,8 @@ const PHASE_DOT: Record<string, string> = {
   error: "bg-danger",
 };
 
-/** 会话区：由 App 常驻挂载；active=当前路由处于会话区（控制可见性）。 */
+/** 会话区：由 App 常驻挂载；active=当前路由处于会话区（控制可见性）。
+ * 逻辑已按域拆到 hooks/（useChat*，工程债拆分 2026-08-31），本组件只做组合。 */
 export function ChatView({ active = true }: { active?: boolean }) {
   const {
     conn,
@@ -88,92 +77,36 @@ export function ChatView({ active = true }: { active?: boolean }) {
     debug: "调试",
   };
 
-  const [configured, setConfigured] = useState<boolean | null>(null);
   const [previewPaths, setPreviewPaths] = useState<string[] | null>(null);
-  const [wsInfo, setWsInfo] = useState<WorkspaceInfo | null>(null);
   const [wsOpen, setWsOpen] = useState(false);
   // 与全局 toast（stores/toastStore）并存的历史遗留轻提示：仅承载发送失败等旧文案
   const [legacyToast, setLegacyToast] = useState("");
 
-  // R17 会话路由化：/chat/:sessionId 深链 → 打开对应会话；列表打开会话时
-  // 同步写回 URL（浏览器前进后退/复制链接/通知跳转由此成立）。
-  // 阶段 4 常驻化后本组件不在 Route 之下（useParams 拿不到），
-  // 改为直接解析 location.pathname 的 /chat/:sessionId 段。
-  const { pathname } = useLocation();
-  const navigate = useNavigate();
-  const routeSessionId = /^\/chat\/([^/]+)/.exec(pathname)?.[1];
-  useEffect(() => {
-    if (routeSessionId && decodeURIComponent(routeSessionId) !== chat.sessionId) {
-      void openSession(decodeURIComponent(routeSessionId))
-        .then(() => refreshSessions())
-        .catch(() => setLegacyToast("会话不存在或已被删除"));
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [routeSessionId]);
-  useEffect(() => {
-    if (!routeSessionId && chat.sessionId) {
-      // 列表内打开/新建后补写 URL（replace：不产生多余历史项）
-      navigate(`/chat/${encodeURIComponent(chat.sessionId)}`, { replace: true });
-    }
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [chat.sessionId]);
+  const { configured, wsInfo, setWsInfo } = useChatBootstrap(refreshSessions);
+  useChatSessionRouting(
+    chat.sessionId,
+    openSession,
+    refreshSessions,
+    (message) => setLegacyToast(message),
+  );
 
-  // ---- 检查器（阶段 4）：宽屏 ≥1280px 内联 dock（Ctrl+I 开关，展开态
-  // 记忆迁入 uiStore，仍持久化到原 localStorage 键）；<1280px 变抽屉（U-11）。
-  const isWide = useMediaQuery("(min-width: 1280px)");
-  const inspectorOpen = useUiStore((s) => s.inspectorOpen);
-  const inspectorDrawerOpen = useUiStore((s) => s.inspectorDrawerOpen);
-  const setInspectorDrawerOpen = useUiStore((s) => s.setInspectorDrawerOpen);
-  const toggleInspector = useUiStore((s) => s.toggleInspector);
-  // ---- 草稿入列（R12 P4）：自增信号来自 uiStore（全局 Ctrl+J / 抽屉草稿行共用）
-  const composerFocusTick = useUiStore((s) => s.composerFocusTick);
+  // ---- 检查器（阶段 4）：宽屏 ≥1280px 内联 dock（Ctrl+I 开关）；<1280px 抽屉
+  const {
+    isWide,
+    inspectorOpen,
+    inspectorDrawerOpen,
+    setInspectorDrawerOpen,
+    toggleInspector,
+    composerFocusTick,
+  } = useChatInspector();
 
   // dock 根目录：connected 帧权威，恢复期兜底会话摘要（旧会话两者皆空 → null）
   const activeSummary = sessions.find((s) => s.id === chat.sessionId);
   const dockRoot = chat.outputsDir ?? activeSummary?.outputs_dir ?? null;
-
-  // 回合结束（离开 running）→ 自增刷新信号，dock 免手动重载
-  const [dockRefreshKey, setDockRefreshKey] = useState(0);
-  const prevPhaseRef = useRef(chat.phase);
-  useEffect(() => {
-    if (prevPhaseRef.current === "running" && chat.phase !== "running") {
-      setDockRefreshKey((k) => k + 1);
-    }
-    prevPhaseRef.current = chat.phase;
-  }, [chat.phase]);
-
-  // 等待看门狗（R9）：运行中若长时间没有任何可见输出（文本增量/工具卡），
-  // 给出渐进提示——端点不可达时服务端要经历 超时×重试 才报错，不能让用户
-  // 对着永久「思考中」干等。R13-I：长工具期没有文本增量，只有 cards/budget
-  // 在更新——引用变化同样视为活动，否则误报「已等待 n 秒未见模型输出」。
-  const [nowTick, setNowTick] = useState(() => Date.now());
-  const lastActivityAt = useRef(Date.now());
-  useEffect(() => {
-    if (chat.phase === "running") lastActivityAt.current = Date.now();
-  }, [chat.items, chat.cards, chat.budget]);
-  useEffect(() => {
-    if (chat.phase !== "running") return;
-    const t = setInterval(() => setNowTick(Date.now()), 1000);
-    return () => clearInterval(t);
-  }, [chat.phase]);
-  const silentSeconds = chat.phase === "running" ? Math.floor((nowTick - lastActivityAt.current) / 1000) : 0;
-
-  useEffect(() => {
-    document.title = "研究助手 · 会话";
-    refreshSessions().catch(() => {});
-    api
-      .get<SettingsData>("/api/settings")
-      .then((s) => setConfigured(!!s.configured))
-      .catch(() => setConfigured(null));
-    api
-      .get<WorkspaceInfo>("/api/workspace")
-      .then(setWsInfo)
-      .catch(() => {});
-  }, [refreshSessions]);
+  const dockRefreshKey = useChatDockRefresh(chat);
+  const silentSeconds = useChatWaitWatchdog(chat);
 
   // 智能滚动（R14-N）：贴底跟随 + 解除跟随期间的「回到底部」pill。
-  // contentToken 用 chat.items 引用（store 合帧后逐帧换新）驱动跟随/计数；
-  // 未读只数消息（user/text），工具卡不计入「N 条新消息」。
   const messageCount = useMemo(
     () => chat.items.reduce((n, i) => (i.kind === "tool" ? n : n + 1), 0),
     [chat.items],
@@ -183,95 +116,20 @@ export function ChatView({ active = true }: { active?: boolean }) {
     messageCount,
     sessionKey: chat.sessionId,
   });
-  // 流式进行中隐藏消息操作钮：regenerate/edit 此刻必被 busy 拒绝，藏起来更干净
-  const opsEnabled = chat.phase !== "running";
+  useChatScrollAnchors(active, chat, containerRef, pinned);
 
-  // ---- 滚动锚点（阶段 4 / U-4）：仅非贴底（用户上翻过）时记录 scrollTop，
-  // 切走会话 / 会话区被隐藏（display:none 会清零 scrollTop）前都已随滚动
-  // 持久化；重进会话或重新可见时恢复。贴底跟随态无锚定价值，恢复跟随即可。
-  const sidForAnchor = chat.sessionId;
-  const pinnedRef = useRef(pinned);
-  pinnedRef.current = pinned;
-  useEffect(() => {
-    const el = containerRef.current;
-    if (!el || !sidForAnchor) return;
-    let raf = 0;
-    const onScroll = () => {
-      if (raf) return;
-      raf = requestAnimationFrame(() => {
-        raf = 0;
-        if (!pinnedRef.current && el.scrollTop > 0) {
-          useSessionStore.getState().setAnchor(sidForAnchor, el.scrollTop);
-        }
-      });
-    };
-    el.addEventListener("scroll", onScroll, { passive: true });
-    return () => {
-      el.removeEventListener("scroll", onScroll);
-      if (raf) cancelAnimationFrame(raf);
-    };
-  }, [sidForAnchor, containerRef]);
-
-  // 重新可见（导航离开又回来）：display:none 期间 scrollTop 归零，恢复锚点
-  useEffect(() => {
-    if (!active || !sidForAnchor) return;
-    const el = containerRef.current;
-    const anchor = sidForAnchor ? useSessionStore.getState().getAnchor(sidForAnchor) : 0;
-    if (el && anchor > 0) el.scrollTop = anchor;
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [active]);
-
-  // 会话切换：挂起恢复信号，等历史 items 渲染后再落锚（切会话瞬间内容未加载）
-  const pendingAnchorSidRef = useRef<string | null>(null);
-  useEffect(() => {
-    if (
-      sidForAnchor &&
-      useSessionStore.getState().getAnchor(sidForAnchor) > 0
-    ) {
-      pendingAnchorSidRef.current = sidForAnchor;
-    }
-  }, [sidForAnchor]);
-  useEffect(() => {
-    const pending = pendingAnchorSidRef.current;
-    if (!pending || pending !== chat.sessionId || chat.items.length === 0) return;
-    const el = containerRef.current;
-    if (el) el.scrollTop = useSessionStore.getState().getAnchor(pending);
-    pendingAnchorSidRef.current = null;
-  }, [chat.items, chat.sessionId, containerRef]);
-
-  /* ---- 消息操作三件套（R14-M）：结果码 → 全局 toast ---- */
-  const reportOpResult = useCallback((r: MessageOpResult) => {
-    if (r === "busy") toast.info("助手正在回复中——本回合结束后再试");
-    else if (r === "offline") toast.error("连接不可用，请稍候或新建会话");
-    else if (r === "empty") toast.info("没有找到可操作的消息");
-  }, []);
-
-  const handleRegenerate = useCallback(
-    (idx: number) => {
-      void regenerateMessage(chat.sessionId, idx).then((r) => {
-        reportOpResult(r);
-        if (r === "ok") void refreshSessions();
-      });
-    },
-    [regenerateMessage, chat.sessionId, refreshSessions, reportOpResult],
+  // ---- 消息操作三件套（R14-M）+ 运行期禁用判定 ----
+  const {
+    opsEnabled,
+    handleRegenerate,
+    handleEditSubmit,
+    handleCopyMessage,
+  } = useChatMessageActions(
+    chat,
+    refreshSessions,
+    regenerateMessage,
+    editAndResend,
   );
-
-  const handleEditSubmit = useCallback(
-    async (idx: number, newText: string): Promise<MessageOpResult> => {
-      const r = await editAndResend(chat.sessionId, idx, newText);
-      reportOpResult(r);
-      if (r === "ok") void refreshSessions();
-      return r;
-    },
-    [editAndResend, chat.sessionId, refreshSessions, reportOpResult],
-  );
-
-  const handleCopyMessage = useCallback((text: string) => {
-    void copyText(text).then((okFlag) => {
-      if (okFlag) toast.success("已复制");
-      else toast.error("复制失败——剪贴板不可用，请手动选择文本复制");
-    });
-  }, []);
 
   // 稳定引用是气泡 memo 边界生效的前提（R14-R）：此前内联箭头每帧换新，
   // 会把所有工具卡行的 memo 打穿
@@ -336,30 +194,10 @@ export function ChatView({ active = true }: { active?: boolean }) {
         : null;
 
   // 迭代2：分屏对照——主区交互 + 右侧只读对照会话（纯 UI 偏好入 localStorage）
-  const [splitOpen, setSplitOpen] = useState<boolean>(loadSplitOpen);
-  const [peerSessionId, setPeerSessionId] = useState<string | null>(
-    loadPeerSessionId,
+  const { splitOpen, peerSessionId, toggleSplit, pickPeer } = useChatSplitPeer(
+    sessions,
+    chat.sessionId,
   );
-  const toggleSplit = useCallback(() => {
-    setSplitOpen((prev) => {
-      const next = !prev;
-      saveSplitOpen(next);
-      return next;
-    });
-  }, []);
-  const pickPeer = useCallback((id: string) => {
-    setPeerSessionId(id);
-    savePeerSessionId(id);
-  }, []);
-  // 打开分屏且尚未选对照会话 → 默认取最近一个非当前会话
-  useEffect(() => {
-    if (!splitOpen || peerSessionId || sessions.length === 0) return;
-    const candidate =
-      sessions.find((s) => s.id !== chat.sessionId && !s.archived) ??
-      sessions.find((s) => s.id !== chat.sessionId);
-    if (candidate) pickPeer(candidate.id);
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [splitOpen, peerSessionId, sessions]);
 
   return (
     <div className="flex h-full min-h-0 flex-1">

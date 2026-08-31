@@ -160,3 +160,19 @@ class SessionStore:
             self.state.budget = budget_snapshot
         self.save()
         self.log_event("run_end", {"status": status})
+
+
+def load_run_state(run_dir: Path) -> dict | None:
+    """容错读取 run.json；缺失或损坏返回 ``None``（不抛异常）。
+
+    工程债：``web/chat.py`` 与 ``web/routes.py`` 曾各维护一份逐字相同的
+    ``_load_run_state``，收敛到本模块单一实现，两处经别名引用。
+    """
+    path = Path(run_dir) / SessionStore.RUN_FILE
+    if not path.is_file():
+        return None
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError):
+        return None
+    return data if isinstance(data, dict) else None

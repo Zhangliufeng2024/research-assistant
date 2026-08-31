@@ -345,7 +345,7 @@ def _sweep_tmp(cwd: Path, cfg: JanitorConfig, stats: dict) -> None:
 
 
 def _sweep_db(cwd: Path, store: Any, cfg: JanitorConfig, stats: dict) -> None:
-    """P2-6：DB 保留期清理（task_events / notifications）。
+    """P2-6：DB 保留期清理（task_events / notifications / 终态任务 / 产物索引）。
 
     与文件层不同：这里删的是**行**而非文件，审计语义以行数计数记入
     stats["db_rows_removed"]。store 未注入（测试裸跑）时静默跳过。
@@ -355,7 +355,7 @@ def _sweep_db(cwd: Path, store: Any, cfg: JanitorConfig, stats: dict) -> None:
     removed = store.purge_old_db_events(cfg.db_days)
     stats["db_rows_removed"] = int(removed.get("task_events", 0)) + int(
         removed.get("notifications", 0)
-    )
+    ) + int(removed.get("tasks", 0)) + int(removed.get("artifacts", 0))
 
 
 def run_janitor(cwd: Path, store: Any = None, config: JanitorConfig | None = None) -> dict[str, int]:

@@ -125,6 +125,72 @@ class TestSourceSessionLink:
         counts = store.count_tasks_for_sessions(["sess-1", "sess-2"])
         assert counts == {"sess-1": 3}
 
+
+class TestDbRetention:
+    """工程债：保留期策略扩展到终态任务与产物索引。"""
+
+    def _terminal_old_task(self, store, project_id: str, task_id: str) -> str:
+        store.create_task(task_id=task_id, project_id=project_id, query="q", mode="paper")
+        store.create_steps(task_id, [{"id": "plan", "title": "Plan"}])
+        store.update_task(task_id, status="complete")
+        # 回拨 finished_at，使其落入保留期外
+        with store._connect() as conn:  # noqa: SLF001 - 测试直改时间戳
+            conn.execute(
+                "UPDATE tasks SET finished_at = ? WHERE id = ?",
+                (time.time() - 400 * 86400.0, task_id),
+            )
+        return task_id
+
+    def test_purges_terminal_old_tasks_keeps_running(self, store, project_id):
+        old = self._terminal_old_task(store, project_id, "t" + "0" * 11)
+        running = self._terminal_old_task(store, project_id, "t" + "1" * 11)
+        with store._connect() as conn:  # noqa: SLF001 - 测试直改状态
+            conn.execute(
+                "UPDATE tasks SET status='running', finished_at=NULL WHERE id = ?",
+                (running,),
+            )
+
+        removed = store.purge_old_db_events(0)
+
+        assert removed["tasks"] == 1
+        assert store.get_task(old) is None
+        assert store.get_task(running) is not None
+        # 终态任务删除后子表级联清理（steps 与 events 一并消失）
+        assert store.list_steps(old) == []
+        assert store.read_events(old) == []
+
+    def test_job_task_reference_nulled_on_task_purge(self, store, project_id):
+        task_id = self._terminal_old_task(store, project_id, "t" + "2" * 11)
+        job = store.enqueue_job(project_id=project_id, workflow_id="single")
+        store.attach_job_task(job["id"], task_id)
+
+        store.purge_old_db_events(0)
+
+        refreshed = next(
+            (j for j in store.list_jobs(project_id) if j["id"] == job["id"]), None
+        )
+        assert refreshed is not None
+        assert refreshed.get("task_id") is None  # 无 FK 的悬挂引用被置空
+
+    def test_artifacts_retention_by_mtime(self, store, tmp_path):
+        import os
+
+        old_file = tmp_path / "old.png"
+        old_file.write_bytes(b"x")
+        os.utime(old_file, (time.time() - 400 * 86400.0,) * 2)
+        store.upsert_artifact("s1", old_file, workspace=tmp_path)
+        fresh = tmp_path / "fresh.png"
+        fresh.write_bytes(b"y")
+        store.upsert_artifact("s1", fresh, workspace=tmp_path)
+
+        # days=1：新文件（mtime≈now）在保留期内，旧文件（400 天前）淘汰
+        removed = store.purge_old_db_events(1)
+
+        assert removed["artifacts"] == 1
+        names = {a["name"] for a in store.search_artifacts("", limit=100)}
+        assert "fresh.png" in names
+        assert "old.png" not in names
+
     def test_existing_db_upgraded(self, tmp_path):
         """旧库（无 source_session_id 列）打开后自动 ALTER，任务不丢。"""
         db = tmp_path / ".ra" / "platform.sqlite3"

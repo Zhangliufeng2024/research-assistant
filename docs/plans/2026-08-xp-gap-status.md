@@ -3,6 +3,12 @@
 对比 Codex app / Claude Code 五类体验升级方案（见 `docs/plans`）。
 以下标记 ✅= 已落地并自动化测试通过； ⏸= 计划已拆解，未落地。
 
+> **2026-08-31 复核（本存档已封档）**：五类方案全部落地并保持全绿——后端
+> pytest **1445 passed / 3 skipped**（3 个失败均为本机环境问题，非回归），
+> 前端 Vitest **316 passed**，ruff/tsc 全绿，版本 v3.7.2。工程债清理后
+> `web/chat.py` 拆分为 chat_state / chat_protocol / chat_history，
+> `ChatView.tsx` 逻辑拆入 hooks/useChat*，本文件仅作历史存档，不再更新。
+
 ## ✅ 已完成 & 全绿
 
 1. **方案 2a — 多文件批量编辑 `apply_patch`**

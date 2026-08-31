@@ -288,6 +288,11 @@ class TestFactoryFallbackConfig:
         assert len(chain.labels) == len(chain.clients)
 
     def test_bare_model_name_uses_primary_provider(self, monkeypatch):
+        # 隔离环境：全量回归中前序测试可能经 load_project_env 写入
+        # LLM_PROVIDER/LLM_BASE_URL（.env 残留），会让 provider 探测偏离
+        # "sk-ant- 前缀 → anthropic" 的预期（既有 flake，顺手加固）。
+        monkeypatch.delenv("LLM_PROVIDER", raising=False)
+        monkeypatch.delenv("LLM_BASE_URL", raising=False)
         monkeypatch.setenv("LLM_API_KEY", "sk-ant-test")
         monkeypatch.setenv("RA_MODEL_FALLBACK", "claude-haiku-4-5")
         chain = create_llm_client()

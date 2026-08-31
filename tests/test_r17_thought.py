@@ -20,7 +20,7 @@ import research_assistant.web.chat as chat_mod  # noqa: E402
 from research_assistant.agent import AgentResult  # noqa: E402
 from research_assistant.llm.anthropic import AnthropicClient  # noqa: E402
 from research_assistant.llm.openai_compat import OpenAICompatClient  # noqa: E402
-from research_assistant.web.chat import router, _HistoryClient  # noqa: E402
+from research_assistant.web.chat import router  # noqa: E402
 
 
 def _sse(lines: list[str]) -> httpx.Response:

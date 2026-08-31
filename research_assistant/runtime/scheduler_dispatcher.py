@@ -8,32 +8,20 @@ stopping a scheduled or background run.
 from __future__ import annotations
 
 import asyncio
-import uuid
 from pathlib import Path
 from typing import Any
 
 from ..api import generate_paper
-from ..config import generate_session_dir_name, resolve_model
+from ..config import resolve_model
 from ..core import safe_resolve
 from ..kernel.approval import QueueApprover
 from ..kernel.budget import BudgetLimits
 from ..workflows import get_workflow_registry
 from ..workflows.runner import run_registered_workflow
+from .approval_push import push_platform_approval
+from .output_alloc import allocate_output_dir as _allocate_output_dir
 from .platform_store import PlatformStore
 from .task_hub import BackgroundTaskHub
-
-
-def _allocate_output_dir(cwd: Path, query: str) -> Path:
-    root = cwd / "writing_outputs"
-    root.mkdir(parents=True, exist_ok=True)
-    base = generate_session_dir_name(query)
-    candidate = root / base
-    try:
-        candidate.mkdir()
-    except FileExistsError:
-        candidate = root / f"{base}_{uuid.uuid4().hex[:6]}"
-        candidate.mkdir()
-    return candidate
 
 
 def _safe_output_dir(cwd: Path, value: object) -> Path | None:
@@ -141,22 +129,12 @@ def build_scheduler_dispatcher(*, store: PlatformStore, hub: BackgroundTaskHub,
 
         async def runner(handle):
             def _push_approval(request) -> None:
-                handle.approval_request_id = request.request_id
                 task_record = store.get_task(handle.task_id) or {}
-                task_metadata = task_record.get("metadata") or {}
-                store.create_agent_approval(
-                    project_id=handle.project_id, task_id=handle.task_id,
-                    thread_id=task_metadata.get("thread_id"), turn_id=task_metadata.get("turn_id"),
-                    agent_id=request.agent_id, role=request.agent_role,
-                    tool_name=request.tool_name, arguments=request.arguments, summary=request.summary(),
-                    approval_id=request.request_id,
+                push_platform_approval(
+                    store=store, hub=hub, handle=handle,
+                    project_id=handle.project_id,
+                    task_metadata=task_record.get("metadata"), request=request,
                 )
-                asyncio.get_running_loop().create_task(hub.publish(handle.task_id, {
-                    "type": "approval_request", "id": request.request_id or handle.task_id,
-                    "tool": request.tool_name, "summary": request.summary(),
-                    "agent_id": getattr(request, "agent_id", ""),
-                    "role": getattr(request, "agent_role", ""),
-                }))
 
             approver = QueueApprover(handle.approvals, timeout=120.0, on_request=_push_approval)
             retrieval_block = ""

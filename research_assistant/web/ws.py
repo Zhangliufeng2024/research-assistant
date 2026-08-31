@@ -4,15 +4,16 @@ from __future__ import annotations
 
 import asyncio
 import json
-import uuid
 from pathlib import Path
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from ..api import generate_paper
-from ..config import generate_session_dir_name, resolve_model
+from ..config import resolve_model
 from ..core import safe_resolve
 from ..kernel.budget import BudgetLimits
+from ..runtime.approval_push import push_platform_approval
+from ..runtime.output_alloc import allocate_output_dir as _allocate_output_dir
 from ..workflows import get_workflow_registry
 from ..workflows.runner import run_registered_workflow
 
@@ -49,25 +50,6 @@ def _read_resume_query(run_dir: Path) -> str:
     except (json.JSONDecodeError, OSError):
         state = {}
     return str(state.get("query") or "").strip() if isinstance(state, dict) else ""
-
-
-def _allocate_output_dir(cwd: Path, query: str) -> Path:
-    """Allocate a stable run directory before the generator starts.
-
-    Durable task rows must know their artifact root even if the process dies
-    before the first progress frame.  The short random suffix only handles
-    two launches in the same second; normal UI names remain timestamped.
-    """
-    root = cwd / "writing_outputs"
-    root.mkdir(parents=True, exist_ok=True)
-    base = generate_session_dir_name(query)
-    candidate = root / base
-    try:
-        candidate.mkdir()
-    except FileExistsError:
-        candidate = root / f"{base}_{uuid.uuid4().hex[:6]}"
-        candidate.mkdir()
-    return candidate
 
 
 def _validate_task_output_dir(cwd: Path, value: object) -> Path | None:
@@ -202,22 +184,12 @@ async def ws_generate(websocket: WebSocket):
                 from ..kernel.approval import QueueApprover
 
                 def _push_approval(request) -> None:
-                    handle.approval_request_id = request.request_id
                     task_record = websocket.app.state.platform_store.get_task(handle.task_id) or {}
-                    task_metadata = task_record.get("metadata") or {}
-                    websocket.app.state.platform_store.create_agent_approval(
-                        project_id=handle.project_id, task_id=handle.task_id,
-                        thread_id=task_metadata.get("thread_id"), turn_id=task_metadata.get("turn_id"),
-                        agent_id=request.agent_id, role=request.agent_role,
-                        tool_name=request.tool_name, arguments=request.arguments, summary=request.summary(),
-                        approval_id=request.request_id,
+                    push_platform_approval(
+                        store=websocket.app.state.platform_store, hub=hub,
+                        handle=handle, project_id=handle.project_id,
+                        task_metadata=task_record.get("metadata"), request=request,
                     )
-                    asyncio.get_running_loop().create_task(hub.publish(handle.task_id, {
-                        "type": "approval_request", "id": request.request_id or handle.task_id,
-                        "tool": request.tool_name, "summary": request.summary(),
-                        "agent_id": getattr(request, "agent_id", ""),
-                        "role": getattr(request, "agent_role", ""),
-                    }))
 
                 approver = QueueApprover(
                     handle.approvals, timeout=120.0, on_request=_push_approval,

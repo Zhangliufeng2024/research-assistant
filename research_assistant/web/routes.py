@@ -25,6 +25,7 @@ from ..config import research_os_enabled, resolve_model
 from ..core import get_api_key, safe_resolve
 from ..llm.factory import detect_provider
 from ..runtime.analysis import runtime_environment, schema_changes, snapshot_input_files
+from ..session.store import load_run_state as _load_run_state
 from ..utils import (
     count_citations_in_bib,
     count_words_in_docx,
@@ -1668,18 +1669,6 @@ def _safe_run_dir(output_folder: Path, name: str) -> Path:
             or ":" in name):
         raise ValueError(f"目录名不合法: {name!r}")
     return safe_resolve(output_folder / name, output_folder)
-
-
-def _load_run_state(paper_dir: Path) -> dict | None:
-    """Tolerantly read run.json; ``None`` when missing or corrupt."""
-    path = paper_dir / "run.json"
-    if not path.is_file():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (json.JSONDecodeError, OSError):
-        return None
-    return data if isinstance(data, dict) else None
 
 
 def _run_summary(paper_dir: Path) -> dict:

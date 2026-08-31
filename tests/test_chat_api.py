@@ -944,14 +944,17 @@ class TestHistoryIntegrity:
         """写入必须走 core.atomic_write_text（临时文件 + os.replace）。"""
         run_dir = tmp_path / ".ra" / "sessions" / "s1"
         run_dir.mkdir(parents=True)
-        real_atomic = chat_mod.atomic_write_text
+        # 工程债拆分后 _write_history 位于 chat_state 模块，补丁目标随之迁移
+        from research_assistant.web import chat_state as chat_state_mod
+
+        real_atomic = chat_state_mod.atomic_write_text
         calls: list[tuple] = []
 
         def spy(path, content, **kwargs):
             calls.append((Path(path), content))
             return real_atomic(path, content, **kwargs)
 
-        monkeypatch.setattr(chat_mod, "atomic_write_text", spy)
+        monkeypatch.setattr(chat_state_mod, "atomic_write_text", spy)
 
         msgs = [{"role": "user", "content": "原子吗"}]
         chat_mod._write_history(run_dir, msgs)
