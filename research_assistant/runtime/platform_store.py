@@ -139,7 +139,26 @@ class PlatformStore:
                 metadata={"agent_id": str(step["id"]), "role": str(step.get("role") or "")},
             )
 
-    def update_step(self, task_id: str, step_id: str, *, status: str, error: str = "") -> None:
+    @contextmanager
+    def transaction(self) -> Iterator[sqlite3.Connection]:
+        """把多次写操作合并为**一次建连 + 一个事务**（P2-2）。
+
+        典型调用方是 task_hub._persist_frame：一帧要更新 step + 追加 event，
+        旧实现每个操作各自 `_connect()`，一帧最多 4-5 次建连。现在调用方在
+        本上下文内用 *_conn 系列方法复用同一个连接，退出时统一 commit
+        （_connect 的既有语义），异常统一 rollback。
+
+        锁语义：整个事务期间持有 self._lock（RLock 可重入，嵌套调用安全）。
+        """
+        with self._lock, self._connect() as conn:
+            conn.execute("BEGIN IMMEDIATE")
+            yield conn
+
+    def _update_step_conn(
+        self, conn: sqlite3.Connection, task_id: str, step_id: str, *,
+        status: str, error: str = "",
+    ) -> None:
+        """连接级 update_step：事务归属由调用方（transaction/各公开方法）管理。"""
         if status not in {"pending", "running", "done", "failed", "skipped", "cancelled"}:
             raise ValueError(f"invalid step status: {status}")
         now = time.time()
@@ -152,25 +171,31 @@ class PlatformStore:
             fields.append("finished_at = ?")
             values.append(now)
         values.extend([task_id, step_id])
-        with self._lock, self._connect() as conn:
-            conn.execute(f"UPDATE task_steps SET {', '.join(fields)} WHERE task_id = ? AND id = ?", values)
-            run_status = "complete" if status == "done" else status
-            conn.execute(
-                "UPDATE agent_runs SET status=?, error=?, started_at=CASE WHEN ?='running' THEN COALESCE(started_at, ?) ELSE started_at END, "
-                "finished_at=CASE WHEN ? IN ('complete','failed','cancelled','skipped') THEN ? ELSE finished_at END, updated_at=? "
-                "WHERE task_id=? AND agent_id=?",
-                (run_status, error, status, now, run_status, now, now, task_id, step_id),
-            )
+        conn.execute(f"UPDATE task_steps SET {', '.join(fields)} WHERE task_id = ? AND id = ?", values)
+        run_status = "complete" if status == "done" else status
+        conn.execute(
+            "UPDATE agent_runs SET status=?, error=?, started_at=CASE WHEN ?='running' THEN COALESCE(started_at, ?) ELSE started_at END, "
+            "finished_at=CASE WHEN ? IN ('complete','failed','cancelled','skipped') THEN ? ELSE finished_at END, updated_at=? "
+            "WHERE task_id=? AND agent_id=?",
+            (run_status, error, status, now, run_status, now, now, task_id, step_id),
+        )
 
-    def list_steps(self, task_id: str) -> list[dict[str, Any]]:
+    def update_step(self, task_id: str, step_id: str, *, status: str, error: str = "") -> None:
         with self._lock, self._connect() as conn:
-            rows = conn.execute("SELECT * FROM task_steps WHERE task_id = ? ORDER BY rowid", (task_id,)).fetchall()
+            self._update_step_conn(conn, task_id, step_id, status=status, error=error)
+
+    def _list_steps_conn(self, conn: sqlite3.Connection, task_id: str) -> list[dict[str, Any]]:
+        rows = conn.execute("SELECT * FROM task_steps WHERE task_id = ? ORDER BY rowid", (task_id,)).fetchall()
         result: list[dict[str, Any]] = []
         for row in rows:
             item = dict(row)
             item["depends_on"] = json.loads(item.pop("depends_on_json"))
             result.append(item)
         return result
+
+    def list_steps(self, task_id: str) -> list[dict[str, Any]]:
+        with self._lock, self._connect() as conn:
+            return self._list_steps_conn(conn, task_id)
 
     def list_agent_runs(self, project_id: str, *, task_id: str | None = None, limit: int = 500) -> list[dict[str, Any]]:
         query = "SELECT * FROM agent_runs WHERE project_id = ?"
@@ -447,23 +472,30 @@ class PlatformStore:
         with self._lock, self._connect() as conn:
             conn.execute(f"UPDATE tasks SET {', '.join(fields)} WHERE id = ?", values)
 
+    def _append_event_conn(
+        self, conn: sqlite3.Connection, task_id: str, payload: dict[str, Any],
+    ) -> int:
+        """连接级 append_event：不自带 BEGIN，事务归属调用方管理。"""
+        row = conn.execute(
+            "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM task_events WHERE task_id = ?",
+            (task_id,),
+        ).fetchone()
+        seq = int(row["next_seq"])
+        conn.execute(
+            "INSERT INTO task_events(task_id, seq, ts, type, payload_json) "
+            "VALUES(?, ?, ?, ?, ?)",
+            (
+                task_id, seq, time.time(), str(payload.get("type") or "event"),
+                json.dumps(payload, ensure_ascii=False, default=str),
+            ),
+        )
+        return seq
+
     def append_event(self, task_id: str, payload: dict[str, Any]) -> int:
         with self._lock, self._connect() as conn:
+            # BEGIN IMMEDIATE：先拿写锁再读 MAX(seq)，避免并发追加拿到相同序号。
             conn.execute("BEGIN IMMEDIATE")
-            row = conn.execute(
-                "SELECT COALESCE(MAX(seq), 0) + 1 AS next_seq FROM task_events WHERE task_id = ?",
-                (task_id,),
-            ).fetchone()
-            seq = int(row["next_seq"])
-            conn.execute(
-                "INSERT INTO task_events(task_id, seq, ts, type, payload_json) "
-                "VALUES(?, ?, ?, ?, ?)",
-                (
-                    task_id, seq, time.time(), str(payload.get("type") or "event"),
-                    json.dumps(payload, ensure_ascii=False, default=str),
-                ),
-            )
-            return seq
+            return self._append_event_conn(conn, task_id, payload)
 
     @staticmethod
     def _decode_task(row: sqlite3.Row | None) -> dict[str, Any] | None:

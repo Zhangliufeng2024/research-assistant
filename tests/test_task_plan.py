@@ -47,7 +47,9 @@ def test_parallel_branches_close_when_assembly_starts(tmp_path):
     ])
     store.update_step("t2", "research", status="running")
     store.update_step("t2", "figures", status="running")
-    _advance_steps(store, "t2", "assemble")
+    # P2-2 后 _advance_steps 是连接级操作，需在事务上下文中调用
+    with store.transaction() as conn:
+        _advance_steps(store, conn, "t2", "assemble")
     statuses = {step["id"]: step["status"] for step in store.list_steps("t2")}
     assert statuses == {"plan": "pending", "research": "done", "figures": "done", "assemble": "pending"}
 

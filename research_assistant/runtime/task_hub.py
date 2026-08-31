@@ -36,20 +36,24 @@ def _step_for_frame(frame: dict[str, Any]) -> str | None:
     return stage if stage in {"figures", "gates"} else None
 
 
-def _advance_steps(store: PlatformStore, task_id: str, current: str) -> None:
-    """Close nodes whose phase is complete when the next phase starts."""
+def _advance_steps(store: PlatformStore, conn: Any, task_id: str, current: str) -> None:
+    """Close nodes whose phase is complete when the next phase starts.
+
+    连接级操作（P2-2）：conn 由 _persist_frame 的单事务上下文提供，
+    避免每个 step 更新各自建连。
+    """
     order = ["plan", "research", "figures", "assemble", "gates", "finalize"]
     if current not in order:
         return
     current_index = order.index(current)
-    steps = {s["id"]: s for s in store.list_steps(task_id)}
+    steps = {s["id"]: s for s in store._list_steps_conn(conn, task_id)}
     # Research and figures are parallel branches and both close at assemble.
     close_before = {"assemble": {"research", "figures"}, "gates": {"assemble"}, "finalize": {"gates"}}.get(current)
     if close_before is None:
         close_before = set(order[:current_index])
     for step_id in close_before:
         if steps.get(step_id, {}).get("status") in {"pending", "running"}:
-            store.update_step(task_id, step_id, status="done")
+            store._update_step_conn(conn, task_id, step_id, status="done")
 
 
 @dataclass
@@ -236,23 +240,29 @@ class BackgroundTaskHub:
             queue.put_nowait(message)
 
     def _persist_frame(self, task_id: str, frame: dict[str, Any]) -> int:
-        """Persist one frame off the event loop; callers retain ordering."""
+        """Persist one frame off the event loop; callers retain ordering.
+
+        P2-2：整帧的 step 读取/更新与 event 追加合并为**一次建连、一个事务**
+        （旧实现逐操作 _connect()，一帧最多 4-5 次建连）。退出时统一 commit，
+        任一环节异常则整体回滚——帧持久化要么完整生效、要么不生效。
+        """
         step_id = _step_for_frame(frame)
-        if step_id:
-            details = frame.get("details")
-            explicit_status = details.get("status") if isinstance(details, dict) else None
-            known_steps = {step["id"] for step in self.store.list_steps(task_id)}
-            if step_id in known_steps and explicit_status in {
-                "resumed", "done", "failed", "cancelled", "skipped"
-            }:
-                self.store.update_step(
-                    task_id, step_id,
-                    status="done" if explicit_status == "resumed" else explicit_status,
-                )
-            elif step_id in known_steps:
-                _advance_steps(self.store, task_id, step_id)
-                self.store.update_step(task_id, step_id, status="running")
-        return self.store.append_event(task_id, frame)
+        with self.store.transaction() as conn:
+            if step_id:
+                details = frame.get("details")
+                explicit_status = details.get("status") if isinstance(details, dict) else None
+                known_steps = {step["id"] for step in self.store._list_steps_conn(conn, task_id)}
+                if step_id in known_steps and explicit_status in {
+                    "resumed", "done", "failed", "cancelled", "skipped"
+                }:
+                    self.store._update_step_conn(
+                        conn, task_id, step_id,
+                        status="done" if explicit_status == "resumed" else explicit_status,
+                    )
+                elif step_id in known_steps:
+                    _advance_steps(self.store, conn, task_id, step_id)
+                    self.store._update_step_conn(conn, task_id, step_id, status="running")
+            return self.store._append_event_conn(conn, task_id, frame)
 
     def subscribe(self, task_id: str, after: int = 0) -> asyncio.Queue | None:
         if self.store.get_task(task_id) is None:
